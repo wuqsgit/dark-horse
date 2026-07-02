@@ -20,7 +20,7 @@ from shared.db import (
 )
 from trader.exchange import BinanceFutures
 from trader.execution import ExecutionEngine
-from trader.config import TRADING_CONFIG
+from trader.config import EXCHANGE_CONFIG, TRADING_CONFIG
 from trader.risk import get_symbol_threshold, get_category_config
 
 import warnings, urllib3
@@ -30,6 +30,15 @@ logger = logging.getLogger("trader")
 
 
 async def trading_loop():
+    missing_vars = []
+    if not EXCHANGE_CONFIG.get("api_key"):
+        missing_vars.append("TESTNET_API_KEY" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_KEY")
+    if not EXCHANGE_CONFIG.get("api_secret"):
+        missing_vars.append("TESTNET_API_SECRET" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_SECRET")
+    if missing_vars:
+        logger.error("Binance API credentials missing: %s", ", ".join(missing_vars))
+        return
+
     logger.info("=== 启动实盘交易引擎 (Testnet) ===")
 
     # 初始化
