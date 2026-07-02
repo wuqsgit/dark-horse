@@ -1,7 +1,6 @@
-"""币安合约 API 封装 — 支持 Testnet"""
+# Binance futures API wrapper with testnet support.
 import hashlib
 import hmac
-import json
 import time
 from typing import Optional
 import urllib.parse
@@ -15,6 +14,7 @@ class BinanceFutures:
     def __init__(self):
         import warnings
         import urllib3
+
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         urllib3.disable_warnings()
         cfg = EXCHANGE_CONFIG
@@ -27,7 +27,6 @@ class BinanceFutures:
         self._last_time_sync = 0.0
 
     def _ensure_client(self):
-        """确保 client 可用，关闭则重建"""
         if self.client.is_closed:
             self.client = httpx.Client(timeout=10, verify=False, headers={"X-MBX-APIKEY": self.api_key})
 
@@ -36,7 +35,6 @@ class BinanceFutures:
         return int(time.time() * 1000)
 
     def _sync_time(self, force: bool = False):
-        """Sync request timestamps to Binance server time for signed API calls."""
         now = time.time()
         if not force and now - self._last_time_sync < 60:
             return
@@ -52,7 +50,6 @@ class BinanceFutures:
         return self._local_timestamp_ms() + self.time_offset_ms
 
     def _sign(self, params: dict) -> str:
-        """HMAC-SHA256 签名"""
         query = urllib.parse.urlencode(params)
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
@@ -85,12 +82,7 @@ class BinanceFutures:
             raise Exception(f"API error {resp.status_code}: {resp.text}")
         return resp.json()
 
-    # ---- 账户 ----
-
     def get_balance(self, include_upnl: bool = False) -> float:
-        """获取 USDT 余额
-        include_upnl=True: walletBalance + crossUnPnl (总权益)
-        include_upnl=False: walletBalance 仅钱包余额"""
         data = self._request("GET", "/fapi/v2/account", signed=True)
         for asset in data.get("assets", []):
             if asset["asset"] == "USDT":
@@ -101,7 +93,6 @@ class BinanceFutures:
         return 0.0
 
     def get_margin_balance(self) -> dict:
-        """获取全账户权益明细"""
         data = self._request("GET", "/fapi/v2/account", signed=True)
         usdt_wallet = 0.0
         usdt_cross_upnl = 0.0
@@ -119,90 +110,97 @@ class BinanceFutures:
             "usdt_cross_unpnl": usdt_cross_upnl,
         }
 
-    # ---- 🔧 改进: 持仓改用 /fapi/v2/positionRisk ----
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
 
     def get_positions(self) -> list:
-        """获取所有持仓 — 使用 /fapi/v2/positionRisk (更准确)
+        v2_by_key = {}
+        try:
+            v2_rows = self._request("GET", "/fapi/v2/positionRisk", signed=True)
+            for row in v2_rows:
+                key = (row.get("symbol"), row.get("positionSide", "BOTH"))
+                v2_by_key[key] = row
+        except Exception:
+            v2_rows = []
 
-        🔧 改进：
-        1. 从 positionRisk 获取 markPrice 而非从 notional 推导
-        2. 正确处理 Hedge Mode (positionSide: LONG/SHORT/BOTH)
-        3. 用 abs(amt) < 0.001 替代 amt != 0 避免字符串转换坑
-        """
-        data = self._request("GET", "/fapi/v2/positionRisk", signed=True)
+        try:
+            data = self._request("GET", "/fapi/v3/positionRisk", signed=True)
+            risk_version = "v3"
+        except Exception:
+            data = v2_rows or self._request("GET", "/fapi/v2/positionRisk", signed=True)
+            risk_version = "v2"
+
         positions = []
         for pos in data:
-            amt_str = pos.get("positionAmt", "0")
-            try:
-                amt = float(amt_str)
-            except (ValueError, TypeError):
-                continue
-
-            # 仓位近似为零则跳过（避免 "0.000" 字符串转 float 后 != 0）
+            amt = self._safe_float(pos.get("positionAmt", "0"))
             if abs(amt) < 0.001:
                 continue
 
             symbol = pos["symbol"]
             position_side = pos.get("positionSide", "BOTH")
-            entry_price = float(pos.get("entryPrice", 0))
-            mark_price = float(pos.get("markPrice", 0))
-            unrealized_pnl = round(float(pos.get("unRealizedProfit", 0)), 2)
-            leverage = int(pos.get("leverage", 1))
+            v2_pos = v2_by_key.get((symbol, position_side), {})
+            entry_price = self._safe_float(pos.get("entryPrice"))
+            mark_price = self._safe_float(pos.get("markPrice"))
+            unrealized_pnl = round(self._safe_float(pos.get("unRealizedProfit")), 2)
+            leverage = self._safe_int(pos.get("leverage") or v2_pos.get("leverage"), 0)
+            position_initial_margin = self._safe_float(pos.get("positionInitialMargin"))
+            initial_margin = self._safe_float(pos.get("initialMargin"))
+            margin = position_initial_margin or initial_margin
+            notional = abs(self._safe_float(pos.get("notional") or v2_pos.get("notional")))
 
             positions.append({
                 "symbol": symbol,
-                "positionSide": position_side,  # 保留 Hedge Mode 信息
+                "positionSide": position_side,
                 "side": "LONG" if amt > 0 else "SHORT",
                 "quantity": abs(amt),
                 "entry_price": entry_price,
                 "mark_price": mark_price,
                 "unrealized_pnl": unrealized_pnl,
                 "leverage": leverage,
+                "margin": margin,
+                "initial_margin": initial_margin,
+                "maint_margin": self._safe_float(pos.get("maintMargin")),
+                "position_initial_margin": position_initial_margin,
+                "open_order_initial_margin": self._safe_float(pos.get("openOrderInitialMargin")),
+                "isolated_margin": self._safe_float(pos.get("isolatedMargin")),
+                "notional": notional,
+                "margin_asset": pos.get("marginAsset"),
+                "margin_type": pos.get("marginType") or v2_pos.get("marginType"),
+                "liquidation_price": self._safe_float(pos.get("liquidationPrice")),
+                "break_even_price": self._safe_float(pos.get("breakEvenPrice")),
+                "risk_api_version": risk_version,
             })
         return positions
 
-    # ---- 🔧 改进: Income API 接入 ----
-
     def fetch_income(self, income_type: str = "REALIZED_PNL", limit: int = 1000) -> list:
-        """从币安 Income API 获取历史收益记录
-
-        🔧 改进：作为交易记录的单一真相源
-        - income_type="REALIZED_PNL": 已实现盈亏
-        - income_type="FUNDING_FEE": 资金费用
-        - income_type="COMMISSION": 手续费
-
-        返回：
-        [
-            {
-                "symbol": "BTCUSDT",
-                "incomeType": "REALIZED_PNL",
-                "income": "2.34",
-                "asset": "USDT",
-                "time": 1234567890000,
-                "tradeId": "12345",
-                "info": "..."
-            },
-            ...
-        ]
-        """
         params = {
             "incomeType": income_type,
             "limit": limit,
         }
         try:
-            data = self._request("GET", "/fapi/v1/income", signed=True, params=params)
-            return data
-        except Exception as e:
-            # 测试网可能不支持 income API，返回空
+            return self._request("GET", "/fapi/v1/income", signed=True, params=params)
+        except Exception:
             return []
 
-    # ---- 下单 ----
-
     def get_trading_symbols(self) -> set:
-        """获取所有可交易的 symbol"""
         try:
-            resp = httpx.get(f"{self.base_rest}/fapi/v1/exchangeInfo",
-                            headers={"X-MBX-APIKEY": self.api_key}, verify=False, timeout=5)
+            resp = httpx.get(
+                f"{self.base_rest}/fapi/v1/exchangeInfo",
+                headers={"X-MBX-APIKEY": self.api_key},
+                verify=False,
+                timeout=5,
+            )
             resp.raise_for_status()
             data = resp.json()
             return {s["symbol"] for s in data["symbols"] if s["status"] == "TRADING"}
@@ -210,31 +208,34 @@ class BinanceFutures:
             return set()
 
     def get_symbol_info(self, symbol: str) -> dict:
-        """获取交易对的精度信息"""
         try:
-            resp = httpx.get(f"{self.base_rest}/fapi/v1/exchangeInfo?symbol={symbol}",
-                            headers={"X-MBX-APIKEY": self.api_key}, verify=False, timeout=5)
+            resp = httpx.get(
+                f"{self.base_rest}/fapi/v1/exchangeInfo?symbol={symbol}",
+                headers={"X-MBX-APIKEY": self.api_key},
+                verify=False,
+                timeout=5,
+            )
             resp.raise_for_status()
             data = resp.json()
             for s in data.get("symbols", []):
                 if s["symbol"] == symbol:
                     qty_filter = [f for f in s["filters"] if f["filterType"] == "LOT_SIZE"]
                     if qty_filter:
-                        return {"step_size": float(qty_filter[0]["stepSize"]),
-                                "min_qty": float(qty_filter[0]["minQty"]),
-                                "max_qty": float(qty_filter[0]["maxQty"])}
+                        return {
+                            "step_size": float(qty_filter[0]["stepSize"]),
+                            "min_qty": float(qty_filter[0]["minQty"]),
+                            "max_qty": float(qty_filter[0]["maxQty"]),
+                        }
                     break
         except Exception:
             pass
         return {"step_size": 0.001, "min_qty": 0.001, "max_qty": 99999}
 
     def set_leverage(self, symbol: str, leverage: int = 10):
-        """设置杠杆倍数"""
         params = {"symbol": symbol, "leverage": leverage}
         return self._request("POST", "/fapi/v1/leverage", signed=True, params=params)
 
     def adjust_quantity(self, symbol: str, quantity: float) -> float:
-        """按步长调整数量"""
         info = self.get_symbol_info(symbol)
         step = info["step_size"]
         if step > 0:
@@ -244,11 +245,10 @@ class BinanceFutures:
         return round(quantity, 3)
 
     def place_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False) -> dict:
-        """市价单 (自动调整精度)"""
         qty = self.adjust_quantity(symbol, quantity)
         params = {
             "symbol": symbol,
-            "side": side.upper(),  # BUY / SELL
+            "side": side.upper(),
             "type": "MARKET",
             "quantity": qty,
         }
@@ -257,11 +257,9 @@ class BinanceFutures:
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
     def close_position_market(self, symbol: str, side: str, quantity: float) -> dict:
-        """Close an existing futures position without opening the opposite side."""
         return self.place_market_order(symbol, side, quantity, reduce_only=True)
 
     def place_stop_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
-        """Place a reduce-only stop-market order."""
         qty = self.adjust_quantity(symbol, quantity)
         params = {
             "algoType": "CONDITIONAL",
@@ -276,22 +274,17 @@ class BinanceFutures:
         return self._request("POST", "/fapi/v1/algoOrder", signed=True, params=params)
 
     def place_take_profit_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
-        """止盈 — 测试环境下用 LIMIT reduceOnly (取巧)"""
-        qty = self.adjust_quantity(symbol, quantity)
-        return {"orderId": "testnet_tp_skip", "msg": "testnet跳过止盈挂单，策略引擎平仓代替"}
-
-    # ---- 市场数据 ----
+        self.adjust_quantity(symbol, quantity)
+        return {"orderId": "testnet_tp_skip", "msg": "testnet skip take-profit order"}
 
     def get_mark_price(self, symbol: str) -> float:
         data = self._request("GET", f"/fapi/v1/premiumIndex?symbol={symbol}")
         return float(data["markPrice"])
 
     def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:
-        data = self._request("GET", f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
-        return data
+        return self._request("GET", f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
 
     def get_atr(self, symbol: str, period: int = 14) -> float:
-        """从 4h klines 计算 ATR"""
         klines = self.get_klines(symbol, "4h", period + 10)
         highs = [float(k[2]) for k in klines[-period - 1:]]
         lows = [float(k[3]) for k in klines[-period - 1:]]
@@ -304,13 +297,10 @@ class BinanceFutures:
             tr_values.append(max(hl, hc, lc))
         if len(tr_values) < period:
             return 0.0
-        atr = sum(tr_values[-period:]) / period
-        return atr
+        return sum(tr_values[-period:]) / period
 
     def get_depth(self, symbol: str, limit: int = 20) -> dict:
-        """获取订单簿深度数据"""
-        data = self._request("GET", f"/fapi/v1/depth?symbol={symbol}&limit={limit}")
-        return data
+        return self._request("GET", f"/fapi/v1/depth?symbol={symbol}&limit={limit}")
 
     def close(self):
         self.client.close()

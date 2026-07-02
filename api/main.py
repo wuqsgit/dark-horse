@@ -849,7 +849,7 @@ def _build_local_trading_status(error=None):
                 "unrealized_pnl": unrealized,
                 "leverage": leverage,
                 "margin": round(margin, 2),
-                "margin_ratio": round(100 / leverage, 2) if leverage else 0,
+                "margin_ratio": None,
                 "pnl_pct": round(unrealized / margin * 100, 2) if margin else 0,
                 "invested": round(entry_price * qty, 2),
                 "entry_reason": None,
@@ -930,6 +930,7 @@ async def get_trading_status(user=Depends(get_user)):
     try:
         margin_data = ex.get_margin_balance()
         balance = margin_data["totalWalletBalance"]
+        margin_balance = margin_data.get("totalMarginBalance") or balance
         positions = ex.get_positions()
         conn = get_conn()
         recent_trades = fetch_position_trade_groups(100)
@@ -1058,15 +1059,27 @@ async def get_trading_status(user=Depends(get_user)):
                     "mark_price": p["mark_price"],
                     "unrealized_pnl": p["unrealized_pnl"],
                     "leverage": p["leverage"],
-                    "margin": round(p["entry_price"] * p["quantity"] / p["leverage"], 2) if p["entry_price"] and p["leverage"] else 0,
-                    "margin_ratio": round(100 / p["leverage"], 2) if p["leverage"] else 0,
-                    "pnl_pct": round(p["unrealized_pnl"] / (p["entry_price"] * p["quantity"] / p["leverage"]) * 100, 2) if p["entry_price"] and p["leverage"] else 0,
-                    "invested": round(p["entry_price"] * p["quantity"], 2),
+                    "margin": round(p.get("margin") or 0, 2),
+                    "margin_ratio": round((p.get("maint_margin") or 0) / margin_balance * 100, 4) if margin_balance else 0,
+                    "pnl_pct": round(p["unrealized_pnl"] / p["margin"] * 100, 2) if p.get("margin") else 0,
+                    "invested": round(p.get("notional") or (p["entry_price"] * p["quantity"]), 2),
+                    "initial_margin": round(p.get("initial_margin") or 0, 2),
+                    "maint_margin": round(p.get("maint_margin") or 0, 2),
+                    "position_initial_margin": round(p.get("position_initial_margin") or 0, 2),
+                    "open_order_initial_margin": round(p.get("open_order_initial_margin") or 0, 2),
+                    "isolated_margin": round(p.get("isolated_margin") or 0, 2),
+                    "notional": round(p.get("notional") or 0, 2),
+                    "margin_asset": p.get("margin_asset"),
+                    "margin_type": p.get("margin_type"),
+                    "liquidation_price": p.get("liquidation_price"),
+                    "break_even_price": p.get("break_even_price"),
+                    "risk_api_version": p.get("risk_api_version"),
                     **position_management_fields(p["symbol"]),
                 }
                 for p in positions
             ],
             "recent_trades": recent_trades,
+            "account_margin_balance": round(margin_balance, 2),
             # stats 瀛楁
             "total_pnl": round(balance - INITIAL_CAPITAL, 2) if isinstance(balance, (int, float)) else 0,
             "trades_pnl": round(total_pnl, 2),

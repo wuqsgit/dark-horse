@@ -121,7 +121,9 @@ export default function LiveTrading() {
                   <div className="pos-row"><span className="label">数量</span><span className="value">{p.quantity}</span></div>
                   <div className="pos-row"><span className="label">杠杆</span><span className="value">{p.leverage ? `${p.leverage}x` : '-'}</span></div>
                   <div className="pos-row"><span className="label">保证金</span><span className="value">{fmt(p.margin)}U</span></div>
-                  <div className="pos-row"><span className="label">保证金率</span><span className="value">{p.margin_ratio != null ? `${fmt(p.margin_ratio)}%` : '-'}</span></div>
+                  <div className="pos-row"><span className="label">维持保证金</span><span className="value">{fmt(p.maint_margin)}U</span></div>
+                  <div className="pos-row"><span className="label">保证金率</span><span className="value">{p.margin_ratio != null ? `${fmt(p.margin_ratio, 4)}%` : '-'}</span></div>
+                  <div className="pos-row"><span className="label">保证金类型</span><span className="value">{p.margin_type || '-'}</span></div>
                   <div className="pos-row"><span className="label">入场价</span><span className="value">${fmt(p.entry_price, 4)}</span></div>
                   <div className="pos-row"><span className="label">当前价</span><span className="value">${fmt(p.mark_price, 4)}</span></div>
                   <div className="pos-row"><span className="label">浮动盈亏/保证金</span><span className="value" style={pnlColor(p.unrealized_pnl)}>${fmt(p.unrealized_pnl)} ({fmt(p.pnl_pct)}%)</span></div>
