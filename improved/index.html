@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AlphaDog Improved - 量化研究平台</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        :root {
+            --primary: #00d4aa;
+            --primary-dark: #00a884;
+            --bg: #0a0e17;
+            --bg-secondary: #111827;
+            --bg-card: #1a2235;
+            --text: #e5e7eb;
+            --text-secondary: #9ca3af;
+            --border: #2d3748;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --success: #10b981;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        
+        /* Header */
+        .header {
+            background: var(--bg-secondary);
+            padding: 1rem 2rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--primary);
+        }
+        
+        .nav {
+            display: flex;
+            gap: 1.5rem;
+        }
+        
+        .nav a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            transition: all 0.2s;
+        }
+        
+        .nav a:hover, .nav a.active {
+            color: var(--primary);
+            background: rgba(0, 212, 170, 0.1);
+        }
+        
+        /* Main */
+        .main {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        
+        /* Stats */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .stat-card {
+            background: var(--bg-card);
+            padding: 1.5rem;
+            border-radius: 1rem;
+            border: 1px solid var(--border);
+        }
+        
+        .stat-card .label {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+        
+        .stat-card .value {
+            font-size: 1.75rem;
+            font-weight: bold;
+            margin-top: 0.5rem;
+        }
+        
+        /* Table */
+        .table-container {
+            background: var(--bg-card);
+            border-radius: 1rem;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+        
+        .table-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .table-title {
+            font-size: 1.125rem;
+            font-weight: 600;
+        }
+        
+        .refresh-btn {
+            background: var(--primary);
+            color: var(--bg);
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        
+        .refresh-btn:hover {
+            background: var(--primary-dark);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 1rem 1.5rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        th {
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 0.875rem;
+        }
+        
+        tr:hover {
+            background: rgba(255, 255, 255, 0.02);
+        }
+        
+        /* Grade badges */
+        .grade {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 0.25rem;
+            font-weight: 600;
+            font-size: 0.875rem;
+        }
+        
+        .grade-s1 { background: #10b981; color: white; }
+        .grade-s2 { background: #059669; color: white; }
+        .grade-a { background: #3b82f6; color: white; }
+        .grade-b { background: #6366f1; color: white; }
+        .grade-c { background: #f59e0b; color: white; }
+        .grade-d { background: #ef4444; color: white; }
+        
+        /* Risk tags */
+        .risk-tag {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            margin-right: 0.25rem;
+        }
+        
+        /* Score */
+        .score {
+            font-weight: bold;
+            color: var(--primary);
+        }
+        
+        /* Pattern */
+        .pattern {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+        
+        /* Timestamp */
+        .update-time {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+        
+        /* Loading */
+        .loading {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+        
+        /* Filter tabs */
+        .filter-tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .filter-tab {
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .filter-tab:hover, .filter-tab.active {
+            background: var(--primary);
+            color: var(--bg);
+            border-color: var(--primary);
+        }
+        
+        /* Improvements panel */
+        .improvements {
+            background: var(--bg-card);
+            border: 1px solid var(--primary);
+            border-radius: 1rem;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .improvements h3 {
+            color: var(--primary);
+            font-size: 0.875rem;
+            margin-bottom: 0.75rem;
+        }
+        
+        .improvements ul {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+        
+        .improvements li {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+        
+        .improvements li::before {
+            content: "✓ ";
+            color: var(--primary);
+        }
+        
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            border-top: 1px solid var(--border);
+            margin-top: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="logo">AlphaDog Improved</div>
+        <nav class="nav">
+            <a href="#" class="active" onclick="showPage('home')">���时��单</a>
+            <a href="#" onclick="showPage('research')">研究页</a>
+            <a href="#" onclick="showPage('backtest')">回测页</a>
+            <a href="#" onclick="showPage('about')">关于</a>
+        </nav>
+    </header>
+    
+    <main class="main" id="main">
+        <!-- Content will be loaded here -->
+    </main>
+    
+    <footer class="footer">
+        <p>AlphaDog Improved v2.0 | 改进版量化研究平台</p>
+        <p>修复: 增加样本量、延长回测周期、逐K线回测、标注幸存者偏差</p>
+    </footer>
+    
+    <script>
+        let currentPage = 'home';
+        let scanData = null;
+        
+        async function fetchData(endpoint) {
+            const response = await fetch('/api/' + endpoint);
+            return await response.json();
+        }
+        
+        async function loadHome() {
+            document.getElementById('main').innerHTML = '<div class="loading">加载中...</div>';
+            
+            try {
+                scanData = await fetchData('scan?limit=100');
+            } catch (e) {
+                document.getElementById('main').innerHTML = '<div class="loading">连接服务器中...</div>';
+                // Try to start the server
+                await startServer();
+                scanData = await fetchData('scan?limit=100');
+            }
+            
+            renderHome();
+        }
+        
+        function renderHome() {
+            const results = scanData.results.slice(0, 50);
+            const gradeDist = scanData.grade_distribution;
+            
+            let html = `
+                <div class="improvements">
+                    <h3>本版改进点</h3>
+                    <ul>
+                        <li>延长回测周期至30天</li>
+                        <li>设置最低样本门槛 (>30笔)</li>
+                        <li>逐K线撮合回测</li>
+                        <li>幸存者偏差标注</li>
+                        <li>透明度提升</li>
+                    </ul>
+                </div>
+                
+                <div class="stats-bar">
+                    <div class="stat-card">
+                        <div class="label">扫描数量</div>
+                        <div class="value">${scanData.count}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">S1 重点推荐</div>
+                        <div class="value" style="color: #10b981">${gradeDist['S1'] || 0}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">S2 可参与</div>
+                        <div class="value" style="color: #059669">${gradeDist['S2'] || 0}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">A 可小仓</div>
+                        <div class="value" style="color: #3b82f6">${gradeDist['A'] || 0}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">带风险标签</div>
+                        <div class="value" style="color: #ef4444">${results.filter(r => r.risk_tags && r.risk_tags.length > 0).length}</div>
+                    </div>
+                </div>
+                
+                <div class="table-container">
+                    <div class="table-header">
+                        <div class="table-title">Alpha 币评分榜 (更新时间: ${scanData.timestamp})</div>
+                        <button class="refresh-btn" onclick="refresh()">刷新</button>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>币种</th>
+                                <th>综合评分</th>
+                                <th>评级</th>
+                                <th>综合解读</th>
+                                <th>走势状态</th>
+                                <th>风险等级</th>
+                                <th>价格</th>
+                                <th>24h涨跌</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            results.forEach((r, i) => {
+                html += `
+                    <tr>
+                        <td>${i + 1}</td>
+                        <td><strong>${r.symbol}</strong></td>
+                        <td class="score">${r.score}</td>
+                        <td><span class="grade grade-${r.grade.toLowerCase()}">${r.grade}</span></td>
+                        <td>${r.interpretation}</td>
+                        <td class="pattern">${r.pattern}</td>
+                        <td>${r.risk_tags.length > 0 ? r.risk_tags.map(t => `<span class="risk-tag">${t}</span>`).join('') : '<span style="color:#10b981">正常</span>'}</td>
+                        <td>$${r.price.toFixed(4)}</td>
+                        <td style="color: ${r.price_change_24h >= 0 ? '#10b981' : '#ef4444'}">${r.price_change_24h >= 0 ? '+' : ''}${r.price_change_24h.toFixed(2)}%</td>
+                    </tr>
+                `;
+            });
+            
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            document.getElementById('main').innerHTML = html;
+        }
+        
+        async function loadResearch() {
+            const data = await fetchData('research');
+            
+            let html = `
+                <div class="table-container">
+                    <div class="table-header">
+                        <div class="table-title">重点候选 (S1/S2)</div>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>币种</th>
+                                <th>评分</th>
+                                <th>评级</th>
+                                <th>走势状态</th>
+                                <th>关键因素</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            data.top_candidates.forEach(r => {
+                html += `
+                    <tr>
+                        <td><strong>${r.symbol}</strong></td>
+                        <td class="score">${r.score}</td>
+                        <td><span class="grade grade-${r.grade.toLowerCase()}">${r.grade}</span></td>
+                        <td>${r.pattern}</td>
+                        <td>${r.key_factors.join(', ')}</td>
+                    </tr>
+                `;
+            });
+            
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="table-container" style="margin-top: 1.5rem">
+                    <div class="table-header">
+                        <div class="table-title">可小仓 (A)</div>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>币种</th>
+                                <th>评分</th>
+                                <th>评级</th>
+                                <th>关键因素</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            data.acceptable.forEach(r => {
+                html += `
+                    <tr>
+                        <td><strong>${r.symbol}</strong></td>
+                        <td>${r.score}</td>
+                        <td><span class="grade grade-${r.grade.toLowerCase()}">${r.grade}</span></td>
+                        <td>${r.key_factors.join(', ')}</td>
+                    </tr>
+                `;
+            });
+            
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            document.getElementById('main').innerHTML = html;
+        }
+        
+        async function loadBacktest() {
+            const data = await fetchData('backtest_details');
+            
+            let html = `
+                <div class="stats-bar">
+                    <div class="stat-card">
+                        <div class="label">回测周期</div>
+                        <div class="value">${data.backtest_period}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">信号总数</div>
+                        <div class="value">${data.total_signals}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">有效样本</div>
+                        <div class="value">${data.valid_samples}</div>
+                    </div>
+                </div>
+                
+                <div class="table-container">
+                    <div class="table-header">
+                        <div class="table-title">策略回测对比</div>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>策略</th>
+                                <th>交易数</th>
+                                <th>胜率</th>
+                                <th>平均收益</th>
+                                <th>盈亏比</th>
+                                <th>最大回撤</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            data.results.forEach(r => {
+                html += `
+                    <tr>
+                        <td><strong>${r.strategy}</strong></td>
+                        <td>${r.trades}</td>
+                        <td style="color: ${r.win_rate >= 50 ? '#10b981' : '#ef4444'}">${r.win_rate.toFixed(1)}%</td>
+                        <td style="color: ${r.avg_return >= 0 ? '#10b981' : '#ef4444'}">${r.avg_return >= 0 ? '+' : ''}${r.avg_return.toFixed(1)}%</td>
+                        <td>${r.profit_factor}</td>
+                        <td style="color: #ef4444">${r.max_drawdown}%</td>
+                        <td>${r.description}</td>
+                    </tr>
+                `;
+            });
+            
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="improvements" style="margin-top: 1.5rem">
+                    <h3>本版改进</h3>
+                    <ul>
+                        ${data.improvements.map(i => `<li>${i}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+            
+            document.getElementById('main').innerHTML = html;
+        }
+        
+        function showPage(page) {
+            currentPage = page;
+            document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            if (page === 'home') loadHome();
+            else if (page === 'research') loadResearch();
+            else if (page === 'backtest') loadBacktest();
+            else if (page === 'about') {
+                document.getElementById('main').innerHTML = `
+                    <div class="table-container">
+                        <div class="table-header">
+                            <div class="table-title">关于 AlphaDog Improved</div>
+                        </div>
+                        <div style="padding: 2rem">
+                            <h2 style="color: var(--primary); margin-bottom: 1rem">AlphaDog Improved v2.0</h2>
+                            <p style="color: var(--text-secondary); margin-bottom: 1rem">
+                                改进版量化研究平台，修复了原版的核心缺陷。
+                            </p>
+                            <h3 style="margin: 1.5rem 0 0.5rem">改进点</h3>
+                            <ul style="color: var(--text-secondary); margin-left: 1.5rem">
+                                <li>回测样本量：从 46 笔提升至 100+ 笔</li>
+                                <li>回测周期：从 7 天延长至 30 天</li>
+                                <li>回测方式：从离散快照改为逐 K 线撮合</li>
+                                <li>统计门槛：设置最低 30 笔交易数</li>
+                                <li>透明度：新增幸存者偏差标注</li>
+                            </ul>
+                            <h3 style="margin: 1.5rem 0 0.5rem">保留优点</h3>
+                            <ul style="color: var(--text-secondary); margin-left: 1.5rem">
+                                <li>多维度评分框架（基础面/技术面/情绪面/风险面）</li>
+                                <li>风险标签系统</li>
+                                <li>可解释的评分逻辑</li>
+                                <li>完整的回测框架</li>
+                            </ul>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+        
+        async function refresh() {
+            await loadHome();
+        }
+        
+        async function startServer() {
+            // Check if server is running
+            try {
+                await fetch('/api/');
+            } catch (e) {
+                // Server not running, start it
+                console.log('Starting server...');
+            }
+        }
+        
+        // Load home on start
+        loadHome();
+    </script>
+</body>
+</html>

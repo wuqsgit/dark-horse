@@ -1,0 +1,164 @@
+{
+  "version": "2026-07-01-score-layers-v1",
+  "default_profile": "breakout",
+  "display_weights": {
+    "opportunity": 0.35,
+    "entry": 0.3,
+    "risk_inverse": 0.2,
+    "execution": 0.15
+  },
+  "profiles": {
+    "accumulation": {
+      "opportunity": {
+        "chip_score": 0.2,
+        "support_score": 0.2,
+        "absorption_score": 0.18,
+        "price_position_score": 0.14,
+        "relative_strength": 0.12,
+        "historical_expectancy_score": 0.16
+      },
+      "entry": {
+        "absorption_score": 0.25,
+        "support_score": 0.25,
+        "rr_proxy_score": 0.12,
+        "volatility_compression_score": 0.18,
+        "price_position_score": 0.1,
+        "orderbook_depth_score": 0.1
+      },
+      "risk": {
+        "high_position_risk": 0.18,
+        "funding_overheat_risk": 0.18,
+        "volatility_risk": 0.18,
+        "negative_expectancy_risk": 0.2,
+        "spread_risk": 0.12,
+        "oi_divergence_risk": 0.14
+      },
+      "execution": {
+        "depth_ratio_score": 0.45,
+        "big_order_score": 0.25,
+        "spread_score": 0.2,
+        "robot_penalty_score": 0.1
+      },
+      "thresholds": {
+        "min_opportunity_score": 54,
+        "min_entry_score": 55,
+        "probe_min_entry_score": 50,
+        "max_risk_score": 62,
+        "min_execution_score": 45
+      }
+    },
+    "breakout": {
+      "opportunity": {
+        "relative_strength": 0.24,
+        "volume_growth_score": 0.18,
+        "trend_score": 0.18,
+        "oi_confirmation_score": 0.14,
+        "liquidity_score": 0.1,
+        "historical_expectancy_score": 0.16
+      },
+      "entry": {
+        "breakout_proxy_score": 0.25,
+        "volume_growth_score": 0.2,
+        "rr_proxy_score": 0.15,
+        "trend_score": 0.15,
+        "orderbook_depth_score": 0.15,
+        "spread_score": 0.1
+      },
+      "risk": {
+        "high_position_risk": 0.2,
+        "funding_overheat_risk": 0.2,
+        "volatility_risk": 0.2,
+        "negative_expectancy_risk": 0.2,
+        "spread_risk": 0.1,
+        "oi_divergence_risk": 0.1
+      },
+      "execution": {
+        "depth_ratio_score": 0.4,
+        "big_order_score": 0.25,
+        "spread_score": 0.25,
+        "robot_penalty_score": 0.1
+      },
+      "thresholds": {
+        "min_opportunity_score": 60,
+        "min_entry_score": 60,
+        "probe_min_entry_score": 55,
+        "max_risk_score": 58,
+        "min_execution_score": 50
+      }
+    },
+    "momentum": {
+      "opportunity": {
+        "relative_strength": 0.28,
+        "volume_growth_score": 0.22,
+        "trend_score": 0.22,
+        "oi_confirmation_score": 0.12,
+        "liquidity_score": 0.1,
+        "historical_expectancy_score": 0.06
+      },
+      "entry": {
+        "breakout_proxy_score": 0.3,
+        "volume_growth_score": 0.25,
+        "trend_score": 0.18,
+        "orderbook_depth_score": 0.15,
+        "spread_score": 0.12
+      },
+      "risk": {
+        "high_position_risk": 0.25,
+        "funding_overheat_risk": 0.25,
+        "volatility_risk": 0.2,
+        "negative_expectancy_risk": 0.15,
+        "spread_risk": 0.15
+      },
+      "execution": {
+        "depth_ratio_score": 0.35,
+        "big_order_score": 0.3,
+        "spread_score": 0.25,
+        "robot_penalty_score": 0.1
+      },
+      "thresholds": {
+        "min_opportunity_score": 66,
+        "min_entry_score": 64,
+        "probe_min_entry_score": 60,
+        "max_risk_score": 55,
+        "min_execution_score": 55
+      }
+    },
+    "mean_reversion": {
+      "opportunity": {
+        "support_score": 0.22,
+        "absorption_score": 0.22,
+        "price_position_score": 0.18,
+        "funding_contrarian_score": 0.14,
+        "relative_strength": 0.08,
+        "historical_expectancy_score": 0.16
+      },
+      "entry": {
+        "absorption_score": 0.28,
+        "support_score": 0.25,
+        "rr_proxy_score": 0.17,
+        "volatility_compression_score": 0.15,
+        "orderbook_depth_score": 0.15
+      },
+      "risk": {
+        "volatility_risk": 0.24,
+        "negative_expectancy_risk": 0.22,
+        "oi_divergence_risk": 0.18,
+        "spread_risk": 0.18,
+        "funding_overheat_risk": 0.18
+      },
+      "execution": {
+        "depth_ratio_score": 0.45,
+        "big_order_score": 0.25,
+        "spread_score": 0.2,
+        "robot_penalty_score": 0.1
+      },
+      "thresholds": {
+        "min_opportunity_score": 55,
+        "min_entry_score": 56,
+        "probe_min_entry_score": 50,
+        "max_risk_score": 62,
+        "min_execution_score": 45
+      }
+    }
+  }
+}

@@ -1,0 +1,81 @@
+import React, { useMemo } from 'react';
+import { AgGridReact } from 'ag-grid-react';
+import 'ag-grid-community/styles/ag-grid.css';
+import 'ag-grid-community/styles/ag-theme-alpine.css';
+
+const gradeOrder = { 'S1': 0, 'S2': 1, 'A1': 2, 'A2': 3, 'B': 4, 'C': 5, 'D': 6 };
+
+function gradeClass(params) {
+  const g = params.value || 'unknown';
+  return `grade-${g}`;
+}
+
+function riskClass(params) {
+  const r = params.value || '';
+  if (r.includes('/')) return 'risk-multi';
+  if (r.includes('出货') || r.includes('破位')) return 'risk-danger';
+  if (r.includes('风险')) return 'risk-warn';
+  return 'risk-normal';
+}
+
+function scoreFormatter(params) {
+  if (params.value == null) return '';
+  return params.value.toFixed(1);
+}
+
+function priceFormatter(params) {
+  if (params.value == null) return '-';
+  const v = params.value;
+  if (v < 0.01) return v.toFixed(6);
+  if (v < 1) return v.toFixed(4);
+  if (v < 100) return v.toFixed(2);
+  return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+export default function ScanTable({ symbols, onSelectSymbol }) {
+  const columnDefs = useMemo(() => [
+    { field: 'symbol', headerName: '币种', pinned: 'left', width: 120,
+      cellStyle: { fontWeight: 600 } },
+    { field: 'grade', headerName: '综合', width: 80,
+      cellClass: gradeClass,
+      comparator: (a, b) => (gradeOrder[a] || 99) - (gradeOrder[b] || 99) },
+    { field: 'composite_score', headerName: '分数', width: 90,
+      valueFormatter: scoreFormatter, sort: 'desc' },
+    { field: 'price', headerName: '最新价', width: 120,
+      valueFormatter: priceFormatter },
+    { field: 'chip_phase', headerName: '筹码阶段', width: 120 },
+    { field: 'trend_state', headerName: '走势状态', width: 110 },
+    { field: 'trend_direction', headerName: '方向', width: 80,
+      cellStyle: p => p.value === '向上' ? { color: '#22c55e' } :
+                       p.value === '向下' ? { color: '#ef4444' } : {} },
+    { field: 'volatility_level', headerName: '波动', width: 80 },
+    { field: 'price_position', headerName: '位置', width: 80 },
+    { field: 'relative_strength', headerName: '相对强度', width: 100,
+      valueFormatter: params => params.value?.toFixed(1) },
+    { field: 'risk_label', headerName: '风险标签', width: 180,
+      cellClass: riskClass, flex: 1 },
+  ], []);
+
+  const defaultColDef = useMemo(() => ({
+    resizable: true,
+    sortable: true,
+    filter: true,
+  }), []);
+
+  return (
+    <div className="ag-theme-alpine-dark" style={{ height: 'calc(100vh - 180px)', width: '100%' }}>
+      <AgGridReact
+        rowData={symbols}
+        columnDefs={columnDefs}
+        defaultColDef={defaultColDef}
+        animateRows={true}
+        onRowClicked={(e) => onSelectSymbol(e.data.symbol)}
+        rowHeight={36}
+        headerHeight={36}
+        enableCellTextSelection={true}
+        ensureDomOrder={true}
+        pagination={false}
+      />
+    </div>
+  );
+}

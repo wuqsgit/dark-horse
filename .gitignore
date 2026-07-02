@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+node_modules/
+
+# Local runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+logs/
+.runtime_logs/
+server.log
+*.log
+
+# Local IDE / OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent/runtime metadata
+.agents/
+.codex/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Exports and generated artifacts
+exports/

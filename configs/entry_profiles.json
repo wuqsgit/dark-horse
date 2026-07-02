@@ -1,0 +1,183 @@
+{
+  "version": "2026-07-02-auto-profile-v1",
+  "default_template": "breakout",
+  "auto_classification": true,
+  "templates": {
+    "breakout": {
+      "name": "突破型",
+      "description": "适合强势突破追涨。必须突破前高，并且量能和盈亏比一起确认。",
+      "breakout_label": "突破前高",
+      "breakout_required_text": "本模板强制要求突破前高。",
+      "focus": ["突破前高", "成交量放大", "盘口承接", "结构 R:R"],
+      "min_score": 62,
+      "min_entry_alpha": 62,
+      "require_breakout": true,
+      "volume_multiplier": 1.5,
+      "min_rr": 1.8,
+      "rr_method": "structure",
+      "max_atr_ratio": 0.08,
+      "allow_observe_only": false,
+      "position_size_factor": 0.8
+    },
+    "accumulation": {
+      "name": "低位蓄力型",
+      "description": "适合低位吸筹和蓄力。突破不是硬条件，重点看低位、承接、OI、R:R。",
+      "breakout_label": "突破前高",
+      "breakout_required_text": "本模板不强制突破前高；未突破只影响正常仓，不影响观察或小仓试探。",
+      "focus": ["低位", "支撑质量", "结构 R:R", "盘口承接", "OI 是否止跌", "温和放量"],
+      "min_score": 54,
+      "min_entry_alpha": 58,
+      "require_breakout": false,
+      "volume_multiplier": 1.2,
+      "min_rr": 1.4,
+      "rr_method": "structure",
+      "max_atr_ratio": 0.05,
+      "require_low_position": true,
+      "require_rs": 60,
+      "allow_observe_only": true,
+      "allow_probe": true,
+      "probe_min_rr": 1.0,
+      "probe_position_size_factor": 0.3,
+      "confirmations_required_for_full_entry": 2,
+      "position_size_factor": 1.0
+    },
+    "pullback": {
+      "name": "回调承接型",
+      "description": "适合强势币回调到支撑后重新接回。重点看支撑、跌幅释放、资金费率和 R:R。",
+      "breakout_label": "反弹突破",
+      "breakout_required_text": "本模板不强制突破前高；重点看回踩支撑后的承接质量。",
+      "focus": ["回踩支撑", "跌幅释放", "资金费率不过热", "结构 R:R", "量能恢复"],
+      "min_score": 56,
+      "min_entry_alpha": 58,
+      "require_breakout": false,
+      "volume_multiplier": 1.1,
+      "min_rr": 1.3,
+      "rr_method": "structure",
+      "max_24h_drop": -0.04,
+      "max_funding_rate": 0.0008,
+      "allow_observe_only": true,
+      "allow_probe": true,
+      "probe_min_rr": 1.0,
+      "probe_position_size_factor": 0.25,
+      "confirmations_required_for_full_entry": 2,
+      "position_size_factor": 0.7
+    },
+    "momentum": {
+      "name": "高波动进攻型",
+      "description": "适合强动量币。必须有突破和明显放量，但仓位更小。",
+      "breakout_label": "动量突破",
+      "breakout_required_text": "本模板强制要求突破确认，避免追弱动量。",
+      "focus": ["动量突破", "明显放量", "高 Entry Alpha", "结构 R:R", "波动可控", "价差不能太宽"],
+      "min_score": 68,
+      "min_entry_alpha": 66,
+      "require_breakout": true,
+      "volume_multiplier": 2.0,
+      "min_rr": 2.2,
+      "rr_method": "structure",
+      "max_atr_ratio": 0.12,
+      "cooldown_multiplier": 1.5,
+      "allow_observe_only": false,
+      "position_size_factor": 0.4
+    },
+    "short_breakdown": {
+      "name": "跌破做空型",
+      "description": "适合跌破结构支撑后的顺势做空。看跌破、反抽失败、卖压和 R:R，不看突破前高。",
+      "breakout_label": "跌破支撑",
+      "breakout_required_text": "做空模板不看突破前高，重点看跌破支撑和卖盘压制。",
+      "focus": ["跌破支撑", "反抽失败", "盘口卖压", "OI 配合", "结构 R:R"],
+      "min_score": 58,
+      "min_entry_alpha": 58,
+      "require_breakout": false,
+      "require_downtrend": true,
+      "volume_multiplier": 1.1,
+      "min_rr": 1.5,
+      "rr_method": "structure",
+      "max_funding_rate": 0.0012,
+      "allow_observe_only": true,
+      "allow_probe": true,
+      "probe_min_rr": 1.0,
+      "probe_position_size_factor": 0.25,
+      "confirmations_required_for_full_entry": 2,
+      "position_size_factor": 0.6
+    },
+    "weak_short": {
+      "name": "弱势延续做空型",
+      "description": "适合持续弱势、反弹失败的标的。重点看趋势弱、位置偏高、卖压和风险收益比。",
+      "breakout_label": "反弹失败",
+      "breakout_required_text": "本模板不看突破前高，重点看弱势延续和反弹失败。",
+      "focus": ["持续弱势", "反弹失败", "位置偏高", "卖压增强", "结构 R:R"],
+      "min_score": 56,
+      "min_entry_alpha": 56,
+      "require_breakout": false,
+      "require_downtrend": true,
+      "require_weak_rs": 45,
+      "volume_multiplier": 1.0,
+      "min_rr": 1.4,
+      "rr_method": "structure",
+      "allow_observe_only": true,
+      "allow_probe": true,
+      "probe_min_rr": 1.0,
+      "probe_position_size_factor": 0.2,
+      "confirmations_required_for_full_entry": 2,
+      "position_size_factor": 0.5
+    }
+  },
+  "symbols": {
+    "AAVEUSDT": {
+      "template": "accumulation",
+      "template_locked": true,
+      "min_score": 54,
+      "min_entry_alpha": 58,
+      "min_rr": 1.4
+    },
+    "LINKUSDT": {
+      "template": "accumulation",
+      "template_locked": true
+    },
+    "UNIUSDT": {
+      "template": "accumulation",
+      "template_locked": true
+    },
+    "ARBUSDT": {
+      "template": "accumulation",
+      "template_locked": true
+    },
+    "OPUSDT": {
+      "template": "accumulation",
+      "template_locked": true
+    },
+    "LDOUSDT": {
+      "template": "accumulation",
+      "template_locked": true
+    },
+    "JTOUSDT": {
+      "template": "breakout",
+      "template_locked": true,
+      "min_score": 62,
+      "volume_multiplier": 1.6,
+      "min_rr": 2.0
+    },
+    "JUPUSDT": {
+      "template": "breakout",
+      "template_locked": true,
+      "min_score": 62,
+      "volume_multiplier": 1.6,
+      "min_rr": 2.0
+    },
+    "PEPEUSDT": {
+      "template": "momentum",
+      "template_locked": true,
+      "min_score": 68,
+      "volume_multiplier": 2.0,
+      "position_size_factor": 0.4
+    },
+    "WIFUSDT": {
+      "template": "momentum",
+      "template_locked": true
+    },
+    "BONKUSDT": {
+      "template": "momentum",
+      "template_locked": true
+    }
+  }
+}

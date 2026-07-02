@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "custom_factors": {
+    "composite_score": {
+      "weight": 5,
+      "source": "composite_score",
+      "mapping": "thresholds",
+      "default": 50,
+      "thresholds": [
+        {
+          "max": 30,
+          "score": 80
+        },
+        {
+          "max": 50,
+          "score": 65
+        },
+        {
+          "max": 70,
+          "score": 50
+        },
+        {
+          "max": 85,
+          "score": 35
+        },
+        {
+          "max": 999,
+          "score": 20
+        }
+      ],
+      "description": "composite_score 的 60-69 桶明显优于 50-59 桶"
+    }
+  },
+  "sub_weights": {
+    "vol_quality": 0.18,
+    "chip": 0.2,
+    "absorption": 0.12,
+    "position": 0.1,
+    "rsi": 0.12,
+    "atr": 0.08,
+    "vol_ratio": 0.1,
+    "depth_ratio": 0.05,
+    "big_order_density": 0.05
+  },
+  "category_weights": {
+    "technical": 0.5,
+    "futures": 0.25,
+    "onchain": 0.15,
+    "heat": 0.1
+  }
+}
