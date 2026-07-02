@@ -925,9 +925,14 @@ async def get_trading_status(user=Depends(get_user)):
     # Return an explicit unavailable state when Binance keys are missing.
     import os
     from trader.config import EXCHANGE_CONFIG
-    if not os.getenv("BINANCE_API_KEY") and not EXCHANGE_CONFIG.get("api_key"):
+    missing_binance_vars = []
+    if not EXCHANGE_CONFIG.get("api_key"):
+        missing_binance_vars.append("BINANCE_API_KEY")
+    if not EXCHANGE_CONFIG.get("api_secret"):
+        missing_binance_vars.append("BINANCE_API_SECRET")
+    if missing_binance_vars:
         return {
-            "error": "missing Binance API key",
+            "error": "missing " + ", ".join(missing_binance_vars),
             "data_source": "binance_live",
             "balance": 0,
             "positions": [],

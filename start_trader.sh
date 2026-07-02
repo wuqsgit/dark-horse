@@ -4,6 +4,7 @@
 export BINANCE_TESTNET="${BINANCE_TESTNET:-true}"
 
 cd "$(dirname "$0")"
+source .env 2>/dev/null
 
 echo "🐎 DarkHorse Starting (含实盘 Testnet)..."
 echo ""
