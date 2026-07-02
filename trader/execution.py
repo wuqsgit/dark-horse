@@ -13,6 +13,7 @@ from trader.config import EXCHANGE_CONFIG, TRADING_CONFIG
 from trader.cooldown_manager import is_in_cooldown, record_stop, record_profit
 from trader.market_regime import detect_current_regime, adjust_strategy_for_regime, get_regime_adjustment_message
 from trader.selection import CandidateSelector  # V5: 鍊欓夐夋嫨鍣?
+from alpha_engine.volume_price import evaluate_alpha_volume_price
 logger = logging.getLogger("execution")
 
 
@@ -146,6 +147,133 @@ def _signal_age_minutes(row):
     if not dt:
         return None
     return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60)
+
+
+def _alpha_cfg():
+    return TRADING_CONFIG.get("alpha_trading") or {}
+
+
+def _runtime_controls():
+    try:
+        from shared.db import get_trading_runtime_controls
+
+        return get_trading_runtime_controls()
+    except Exception as e:
+        logger.warning(f"trading runtime controls unavailable: {e}")
+        return {"normal_trading_enabled": True, "alpha_trading_enabled": False}
+
+
+def _json_or_empty(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _grade_from_score(score):
+    score = float(score or 0)
+    if score >= 80:
+        return "S"
+    if score >= 70:
+        return "A"
+    if score >= 60:
+        return "B"
+    if score >= 50:
+        return "C"
+    return "D"
+
+
+def _adapter_quality(row):
+    raw = _json_or_empty(row.get("raw_features"))
+    missing = []
+    quality = 95.0
+    for section in ("technical", "futures", "depth", "score_layers"):
+        if not raw.get(section):
+            missing.append(section)
+            quality -= 12.0
+    technical = raw.get("technical") or {}
+    futures = raw.get("futures") or {}
+    for field in ("current_price", "atr", "volume_change_pct", "return_6h", "return_24h"):
+        if technical.get(field) is None:
+            missing.append(f"technical.{field}")
+            quality -= 3.0
+    for field in ("oi_change_pct", "funding_rate"):
+        if futures.get(field) is None:
+            missing.append(f"futures.{field}")
+            quality -= 4.0
+    return max(0.0, min(100.0, quality)), missing
+
+
+def _adapt_alpha_to_normal_row(alpha_row):
+    raw_alpha = _raw_features(alpha_row)
+    returns = raw_alpha.get("returns") or {}
+    volume = raw_alpha.get("volume") or {}
+    depth = raw_alpha.get("depth") or {}
+    price = float(alpha_row.get("market_price") or 0)
+    discovery = float(alpha_row.get("alpha_score") or alpha_row.get("discovery_score") or 0)
+    alpha_bonus = max(0.0, min(5.0, (discovery - 60.0) / 8.0))
+    ret_6h = float(returns.get("ret_6h") or 0) / 100
+    pct_24h = float(returns.get("pct_24h") or 0) / 100
+    volume_growth = float(volume.get("volume_growth_6h") or 1.0)
+    volume_change_pct = max(-0.5, min(1.5, volume_growth - 1.0))
+    conservative_score = max(40.0, min(58.0, 50.0 + alpha_bonus + max(-4.0, min(4.0, ret_6h * 40))))
+    technical = {
+        "current_price": price,
+        "atr": price * 0.03 if price > 0 else 0,
+        "return_6h": ret_6h,
+        "return_24h": pct_24h,
+        "price_change_24h": pct_24h,
+        "volume_change_pct": volume_change_pct,
+        "vol_quality_score": 50,
+    }
+    futures = {
+        "oi_change_pct": 0,
+        "funding_rate": 0,
+        "open_interest": 0,
+    }
+    normal_raw = {
+        "alpha_context": {
+            "alpha_symbol": alpha_row.get("alpha_symbol"),
+            "alpha_profile": alpha_row.get("alpha_profile"),
+            "discovery_score": discovery,
+            "source": "alpha_adapter_fallback",
+        },
+        "technical": technical,
+        "futures": futures,
+        "depth": {
+            "depth_ratio_score": 50,
+            "big_order_score": 50,
+            "spread_pct": float(depth.get("spread_pct") or 99),
+        },
+        "score_layers": {
+            "display_score": conservative_score,
+            "source": "alpha_adapter_fallback_conservative",
+        },
+    }
+    return {
+        "symbol": alpha_row.get("futures_symbol"),
+        "time": alpha_row.get("time"),
+        "scan_id": alpha_row.get("scan_id"),
+        "composite_score": conservative_score,
+        "composite_summary": _grade_from_score(conservative_score),
+        "risk_label": "alpha_adapter_conservative",
+        "chip_phase": "未知",
+        "trend_state": "alpha候选",
+        "trend_direction": "横盘",
+        "volatility_level": "偏高",
+        "price_position": "未知",
+        "relative_strength": 50,
+        "market_price": price,
+        "entry_alpha": min(58.0, conservative_score),
+        "hold_alpha": min(58.0, conservative_score),
+        "raw_features": normal_raw,
+        "adapter_fallback": True,
+    }
 
 
 class ExecutionEngine:
@@ -391,11 +519,357 @@ class ExecutionEngine:
             return False, f"live depth against SHORT: ask/bid={ask_bid_ratio:.2f}", info
         return True, "OK", info
 
+    def _build_alpha_open_actions(
+        self,
+        current_positions: list,
+        balance: float,
+        avail: int,
+        run_id: str | None = None,
+    ) -> list:
+        cfg = _alpha_cfg()
+        if not cfg.get("enabled", False):
+            return []
+        if cfg.get("testnet_only", True) and not EXCHANGE_CONFIG.get("testnet"):
+            logger.info("Alpha trading disabled outside testnet")
+            return []
+        if avail <= 0:
+            return []
+
+        try:
+            from shared.db import (
+                fetch_latest_alpha_scan,
+                fetch_latest_score_for_symbol,
+                get_alpha_cooldown,
+                get_position_history,
+                upsert_alpha_trade_candidate,
+            )
+        except Exception as e:
+            logger.warning(f"Alpha trading db import failed: {e}")
+            return []
+
+        scan, rows = fetch_latest_alpha_scan()
+        if not scan or not rows:
+            return []
+
+        trading = self._get_trading_symbols()
+        pos_symbols = {p["symbol"] for p in current_positions}
+        alpha_position_count = 0
+        for p in current_positions:
+            hist = get_position_history(p["symbol"]) or {}
+            if hist.get("strategy_source") == "alpha":
+                alpha_position_count += 1
+
+        max_alpha_positions = int(cfg.get("max_positions", 3))
+        remaining_alpha_slots = max(0, max_alpha_positions - alpha_position_count)
+        remaining_slots = min(avail, remaining_alpha_slots)
+        if remaining_slots <= 0:
+            return []
+
+        blocked_profiles = set(cfg.get("blocked_profiles") or ("high_risk_watch",))
+        ttl = float(cfg.get("signal_ttl_minutes", 15))
+        vp_ttl = float(cfg.get("volume_price_ttl_minutes", 20))
+        min_score = float(cfg.get("min_score", 68))
+        actions = []
+
+        candidates = sorted(
+            [dict(r) for r in rows],
+            key=lambda r: (
+                2 if (_raw_features(r).get("volume_price") or {}).get("action") == "normal_review" else 1 if (_raw_features(r).get("volume_price") or {}).get("action") == "normal_review_probe" else 0,
+                float(r.get("alpha_score") or 0),
+                float(r.get("liquidity_score") or 0),
+                float(r.get("risk_score") or 0),
+            ),
+            reverse=True,
+        )
+
+        for row in candidates:
+            alpha_symbol = row.get("alpha_symbol")
+            symbol = row.get("futures_symbol")
+            profile = row.get("alpha_profile")
+            discovery_score = float(row.get("alpha_score") or row.get("discovery_score") or 0)
+            raw_alpha = _raw_features(row)
+            side = None
+            normal_row = None
+            adapter_quality = 100.0
+            missing_fields = []
+            entry_profile = {}
+            volume_price = raw_alpha.get("volume_price") or evaluate_alpha_volume_price(
+                raw_alpha,
+                row.get("market_price") or 0,
+            )
+
+            def record_candidate(reason=None, status="filtered"):
+                try:
+                    upsert_alpha_trade_candidate(
+                        scan_id=row.get("scan_id"),
+                        time=row.get("time"),
+                        alpha_symbol=alpha_symbol,
+                        futures_symbol=symbol,
+                        base_asset=row.get("base_asset"),
+                        alpha_discovery_score=discovery_score,
+                        alpha_profile=profile,
+                        alpha_reason=row.get("decision"),
+                        raw_alpha=raw_alpha,
+                        normal_score=(normal_row or {}).get("composite_score"),
+                        normal_grade=(normal_row or {}).get("composite_summary") or (normal_row or {}).get("grade"),
+                        normal_side=side,
+                        entry_profile=entry_profile,
+                        entry_status=status,
+                        block_reason=reason,
+                        adapter_quality=adapter_quality,
+                        missing_fields=missing_fields,
+                        volume_price=volume_price,
+                    )
+                except Exception as e:
+                    logger.warning(f"Alpha candidate write failed: {e}")
+
+            def reject(reason, risk_params=None):
+                record_candidate(reason, status="filtered")
+                self._record_decision(
+                    {
+                        "symbol": symbol or alpha_symbol,
+                        "scan_id": row.get("scan_id"),
+                        "time": row.get("time"),
+                        "composite_score": (normal_row or {}).get("composite_score", discovery_score),
+                        "grade": row.get("grade"),
+                        "raw_features": (normal_row or {}).get("raw_features", raw_alpha),
+                    },
+                    run_id=run_id,
+                    side=side,
+                    mode="alpha_live",
+                    decision_stage="alpha_candidate_filter",
+                    decision_result="filtered",
+                    filter_reason=reason,
+                    risk_params={
+                        "alpha_symbol": alpha_symbol,
+                        "alpha_profile": profile,
+                        "alpha_discovery_score": discovery_score,
+                        "adapter_quality": adapter_quality,
+                        "missing_fields": missing_fields,
+                        **(risk_params or {}),
+                    },
+                    reason={"decision": row.get("decision")},
+                )
+                logger.info(f"  Alpha {alpha_symbol}: {reason}")
+
+            age = _signal_age_minutes(row)
+            if ttl and age is not None and age > ttl:
+                reject(f"stale alpha signal age={age:.1f}m > {ttl:.0f}m")
+                continue
+            if vp_ttl and age is not None and age > vp_ttl:
+                reject(f"stale volume-price state age={age:.1f}m > {vp_ttl:.0f}m")
+                continue
+            if profile in blocked_profiles:
+                reject(f"blocked alpha profile: {profile}")
+                continue
+            if discovery_score < min_score:
+                reject(f"alpha_discovery_score {discovery_score:.1f} < {min_score:.1f}")
+                continue
+            if not symbol:
+                reject("missing futures_symbol")
+                continue
+            if symbol not in trading:
+                reject("not tradable on Binance Futures")
+                continue
+            if symbol in pos_symbols:
+                reject("already in position")
+                continue
+            if any(a.get("symbol") == symbol for a in actions):
+                reject("already planned this loop")
+                continue
+
+            cooldown = get_alpha_cooldown(symbol) or get_alpha_cooldown("*")
+            if cooldown:
+                reject(f"alpha cooldown active: {cooldown.get('reason')} until {cooldown.get('cooldown_until')}")
+                continue
+
+            vp_action = volume_price.get("action")
+            if vp_action == "cooldown":
+                try:
+                    from shared.db import set_alpha_cooldown
+                    set_alpha_cooldown(
+                        symbol,
+                        "volume_price_overheated",
+                        "; ".join(volume_price.get("reasons") or ["alpha volume-price overheated"]),
+                        int(volume_price.get("cooldown_minutes") or 60),
+                    )
+                except Exception:
+                    pass
+                reject("量价过热冷静：" + "；".join(volume_price.get("reasons") or []), {"volume_price": volume_price})
+                continue
+            if vp_action == "observe":
+                reject("量价中性观察：" + "；".join(volume_price.get("reasons") or []), {"volume_price": volume_price})
+                continue
+            fast_returns = (raw_alpha.get("returns") or {})
+            if float(fast_returns.get("ret_15m") or 0) > 8 or float(fast_returns.get("ret_1h") or 0) > 15:
+                try:
+                    from shared.db import set_alpha_cooldown
+                    set_alpha_cooldown(symbol, "chase_guard", "alpha short-term pump too hot", 45)
+                except Exception:
+                    pass
+                reject("alpha追涨冷静：15m/1h 涨幅过大，等待回踩")
+                continue
+
+            if volume_price.get("allow_short") and not volume_price.get("allow_long"):
+                side = "SHORT"
+            elif volume_price.get("allow_long") and not volume_price.get("allow_short"):
+                side = "LONG"
+            else:
+                reject(f"volume_price has no executable side: {volume_price.get('state')}", {"volume_price": volume_price})
+                continue
+            if side == "LONG" and not volume_price.get("allow_long"):
+                reject(f"volume_price blocks LONG: {volume_price.get('state')}", {"volume_price": volume_price})
+                continue
+            if side == "SHORT" and not volume_price.get("allow_short"):
+                reject(f"volume_price blocks SHORT: {volume_price.get('state')}", {"volume_price": volume_price})
+                continue
+            if side == "SHORT" and not cfg.get("allow_short", False):
+                reject("alpha SHORT disabled by config")
+                continue
+            action_side = "BUY" if side == "LONG" else "SELL"
+
+            vp_factor = max(0.0, min(1.0, float(volume_price.get("max_position_factor") or 0)))
+            entry_status = "probe" if vp_action in ("normal_review_probe", "short_review_only") or vp_factor <= 0.25 else "pass"
+            entry_profile = {
+                "status": entry_status,
+                "template": f"alpha_{volume_price.get('state') or 'volume_price'}",
+                "reason": "alpha volume-price gate passed; normal trading review skipped",
+                "thresholds": {
+                    "position_size_factor": 1.0,
+                    "probe_position_size_factor": 1.0,
+                },
+                "volume_price_state": volume_price.get("state"),
+                "volume_price_action": vp_action,
+            }
+            normal_row = _adapt_alpha_to_normal_row(row)
+            normal_row["composite_score"] = round(max(0.0, min(100.0, discovery_score)), 1)
+            normal_row["composite_summary"] = row.get("grade") or _grade_from_score(discovery_score)
+
+            try:
+                ob_ok, ob_reason, ob_info = self._check_live_orderbook(symbol, side, entry_profile)
+            except Exception as e:
+                ob_ok, ob_reason, ob_info = False, f"binance depth error: {e}", {}
+            if not ob_ok:
+                try:
+                    from shared.db import set_alpha_cooldown
+                    set_alpha_cooldown(symbol, "orderbook_reject", ob_reason, 20)
+                except Exception:
+                    pass
+                reject(ob_reason, ob_info)
+                continue
+
+            price = float(normal_row.get("market_price") or row.get("market_price") or 0)
+            try:
+                mark_price = float(self.ex.get_mark_price(symbol) or 0)
+                if mark_price > 0:
+                    price = mark_price
+            except Exception:
+                pass
+            if price <= 0:
+                reject("invalid alpha price")
+                continue
+
+            alpha_execution_score = float(discovery_score or 0)
+            pos_info = calculate_position(self.ex, symbol, price, balance, alpha_execution_score)
+            lev = min(int(pos_info.get("leverage") or self.cfg.get("leverage_max", 3)), 3)
+            source_factor = 0.25 if entry_profile.get("status") == "probe" else 0.50
+            quality_factor = 1.0
+            qty = float(pos_info.get("quantity") or 0) * source_factor * quality_factor * vp_factor
+            qty = self.ex.adjust_quantity(symbol, qty)
+            if ob_info.get("spread_degraded"):
+                qty = self.ex.adjust_quantity(symbol, qty * 0.5)
+            if qty <= 0:
+                reject("quantity <= 0", {"pos_info": pos_info, "source_factor": source_factor, "quality_factor": quality_factor, "volume_price_factor": vp_factor})
+                continue
+
+            atr = float(pos_info.get("atr_value") or 0)
+            if atr <= 0:
+                atr = price * 0.02
+            stop_price = (price * 0.95) if side == "LONG" else (price * 1.05)
+            tp_levels = calc_tp_levels(price, side, atr)
+            invested = round(price * qty, 2)
+
+            reason = f"alpha_volume_price->{entry_profile.get('template')} alpha_score={alpha_execution_score:.1f} {side}"
+            action = {
+                "action": "open",
+                "symbol": symbol,
+                "side": action_side,
+                "position_side": side,
+                "quantity": qty,
+                "entry_price": price,
+                "stop_loss": stop_price,
+                "leverage": lev,
+                "tp1_price": tp_levels["tp1_price"],
+                "tp2_price": tp_levels["tp2_price"],
+                "tp1_qty_pct": tp_levels["tp1_qty_pct"],
+                "tp2_qty_pct": tp_levels["tp2_qty_pct"],
+                "atr_value": atr,
+                "reason": reason,
+                "grade": normal_row.get("composite_summary") or normal_row.get("grade", ""),
+                "score": alpha_execution_score,
+                "invested": invested,
+                "run_id": run_id,
+                "scan_id": row.get("scan_id"),
+                "entry_mode": entry_profile.get("status"),
+                "strategy_source": "alpha",
+                "signal_source": profile,
+                "alpha_symbol": alpha_symbol,
+                "alpha_profile": profile,
+                "alpha_entry_level": entry_profile.get("status"),
+                "alpha_score": discovery_score,
+                "alpha_suggested_position_pct": source_factor * quality_factor * vp_factor,
+            }
+            actions.append(action)
+            record_candidate(None, status="planned_open")
+            self._record_decision(
+                {
+                    "symbol": symbol,
+                    "scan_id": row.get("scan_id"),
+                    "time": row.get("time"),
+                    "composite_score": alpha_execution_score,
+                    "grade": normal_row.get("composite_summary") or row.get("grade"),
+                    "raw_features": normal_row.get("raw_features"),
+                },
+                run_id=run_id,
+                side=side,
+                mode="alpha_live",
+                decision_stage="alpha_open_decision",
+                decision_result="planned_open",
+                quantity=qty,
+                entry_price=price,
+                risk_params={
+                    "strategy_source": "alpha",
+                    "alpha_symbol": alpha_symbol,
+                    "alpha_profile": profile,
+                    "alpha_discovery_score": discovery_score,
+                    "adapter_quality": adapter_quality,
+                    "missing_fields": missing_fields,
+                    "entry_profile": entry_profile,
+                    "source_factor": source_factor,
+                    "quality_factor": quality_factor,
+                    "volume_price_factor": vp_factor,
+                    "volume_price": volume_price,
+                    "leverage": lev,
+                    "stop_loss": stop_price,
+                    "tp1_price": tp_levels["tp1_price"],
+                    "tp2_price": tp_levels["tp2_price"],
+                    "orderbook": ob_info,
+                },
+                reason={"reason": reason},
+            )
+            if len(actions) >= remaining_slots:
+                break
+
+        return actions
+
     def decide(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
         """Build open, close and partial-close actions."""
         actions = []
         pos_symbols = {p["symbol"] for p in current_positions}
         balance = self.get_balance()
+        controls = _runtime_controls()
+        normal_enabled = bool(controls.get("normal_trading_enabled", True))
+        alpha_enabled = bool(controls.get("alpha_trading_enabled", False))
 
         self._sync_tracker(current_positions)
         actions.extend(self._build_position_actions(top_symbols, current_positions))
@@ -529,7 +1003,7 @@ class ExecutionEngine:
         )
 
         # === V5: 浣跨敤鍊欓夐夋嫨鍣?===
-        if avail > 0:
+        if avail > 0 and normal_enabled:
             selector = CandidateSelector()
             candidates = selector.select_candidates(
                 top_symbols, current_positions, max_positions=avail
@@ -787,6 +1261,22 @@ class ExecutionEngine:
                 )
                 if len([a for a in actions if a.get("action") == "open"]) >= adj_max_pos:
                     break
+        elif avail > 0:
+            logger.info("  normal trading runtime switch is OFF; skip normal open candidates")
+
+        open_count = len([a for a in actions if a.get("action") == "open"])
+        alpha_avail = max(0, adj_max_pos - open_count)
+        if alpha_avail > 0 and alpha_enabled:
+            alpha_actions = self._build_alpha_open_actions(
+                current_positions,
+                balance,
+                alpha_avail,
+                run_id=run_id,
+            )
+            if alpha_actions:
+                actions.extend(alpha_actions)
+        elif alpha_avail > 0:
+            logger.info("  alpha trading runtime switch is OFF; skip alpha open candidates")
 
         return actions
 
@@ -840,7 +1330,32 @@ class ExecutionEngine:
     def _execute_open(self, act, results):
         logger.info(f"  寮浠?{act['position_side']} {act['symbol']} x{act['quantity']} @${act['entry_price']:.4f} 鎶曞叆${act.get('invested',0):.2f}")
         self.ex.set_leverage(act["symbol"], act.get("leverage", 3))
+        try:
+            from shared.db import new_position_id
+            act["position_id"] = act.get("position_id") or new_position_id(act["symbol"], act["position_side"])
+        except Exception:
+            pass
         order = self.ex.place_market_order(act["symbol"], act["side"], act["quantity"])
+        try:
+            from shared.db import insert_order
+            insert_order(
+                act["symbol"],
+                act["side"],
+                "MARKET",
+                act["quantity"],
+                act["entry_price"],
+                status="submitted",
+                reason=act.get("reason"),
+                strategy_source=act.get("strategy_source", "normal"),
+                signal_source=act.get("signal_source"),
+                alpha_symbol=act.get("alpha_symbol"),
+                alpha_profile=act.get("alpha_profile"),
+                alpha_entry_level=act.get("alpha_entry_level"),
+                alpha_score=act.get("alpha_score"),
+                alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
+            )
+        except Exception as e:
+            logger.warning(f"    local order write failed: {e}")
         self._record_decision(
             act["symbol"],
             run_id=act.get("run_id"),
@@ -865,6 +1380,27 @@ class ExecutionEngine:
         # 鎸傛鎹熷崟
         stop_side = "SELL" if act["position_side"] == "LONG" else "BUY"
         stop_order = self.ex.place_stop_order(act["symbol"], stop_side, act["quantity"], act["stop_loss"])
+        try:
+            from shared.db import insert_order
+            insert_order(
+                act["symbol"],
+                stop_side,
+                "STOP_MARKET",
+                act["quantity"],
+                act["stop_loss"],
+                status="submitted",
+                reason="stop_loss",
+                position_id=act.get("position_id"),
+                strategy_source=act.get("strategy_source", "normal"),
+                signal_source=act.get("signal_source"),
+                alpha_symbol=act.get("alpha_symbol"),
+                alpha_profile=act.get("alpha_profile"),
+                alpha_entry_level=act.get("alpha_entry_level"),
+                alpha_score=act.get("alpha_score"),
+                alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
+            )
+        except Exception as e:
+            logger.warning(f"    local stop order write failed: {e}")
         logger.info(f"    姝㈡崯鎸傚崟 @${act['stop_loss']:.4f}: {stop_order.get('orderId')}")
 
         # 璁板綍寮浠撳喎鍗?30鍒嗛挓)
@@ -882,6 +1418,13 @@ class ExecutionEngine:
                 act.get("tp2_price", 0),
                 act.get("atr_value", 0),
                 position_id=position_id,
+                strategy_source=act.get("strategy_source", "normal"),
+                signal_source=act.get("signal_source"),
+                alpha_symbol=act.get("alpha_symbol"),
+                alpha_profile=act.get("alpha_profile"),
+                alpha_entry_level=act.get("alpha_entry_level"),
+                alpha_score=act.get("alpha_score"),
+                alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
             )
             act["position_id"] = position_id
         except Exception as e:
@@ -916,7 +1459,20 @@ class ExecutionEngine:
             grade=act.get("grade", ""), score=act.get("score", 0),
             entry_reason=hist.get("entry_reason"),
             position_id=hist.get("position_id"),
+            strategy_source=hist.get("strategy_source") or act.get("strategy_source", "normal"),
+            signal_source=hist.get("signal_source") or act.get("signal_source"),
+            alpha_symbol=hist.get("alpha_symbol") or act.get("alpha_symbol"),
+            alpha_profile=hist.get("alpha_profile") or act.get("alpha_profile"),
+            alpha_entry_level=hist.get("alpha_entry_level") or act.get("alpha_entry_level"),
+            alpha_score=hist.get("alpha_score") or act.get("alpha_score"),
+            alpha_suggested_position_pct=hist.get("alpha_suggested_position_pct") or act.get("alpha_suggested_position_pct"),
         )
+        if (hist.get("strategy_source") or act.get("strategy_source")) == "alpha" and pnl < 0:
+            try:
+                from shared.db import set_alpha_cooldown
+                set_alpha_cooldown(act["symbol"], "loss", f"alpha loss pnl={pnl:.2f}", 120, loss_count=1)
+            except Exception as e:
+                logger.warning(f"    alpha cooldown write failed: {e}")
         self._record_decision(
             act["symbol"],
             run_id=act.get("run_id"),
@@ -967,6 +1523,13 @@ class ExecutionEngine:
             grade=act.get("grade", ""), score=act.get("score", 0),
             entry_reason=hist.get("entry_reason"),
             position_id=hist.get("position_id"),
+            strategy_source=hist.get("strategy_source") or act.get("strategy_source", "normal"),
+            signal_source=hist.get("signal_source") or act.get("signal_source"),
+            alpha_symbol=hist.get("alpha_symbol") or act.get("alpha_symbol"),
+            alpha_profile=hist.get("alpha_profile") or act.get("alpha_profile"),
+            alpha_entry_level=hist.get("alpha_entry_level") or act.get("alpha_entry_level"),
+            alpha_score=hist.get("alpha_score") or act.get("alpha_score"),
+            alpha_suggested_position_pct=hist.get("alpha_suggested_position_pct") or act.get("alpha_suggested_position_pct"),
         )
         self._record_decision(
             act["symbol"],

@@ -4,7 +4,23 @@ from fastapi import FastAPI, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from shared.db import fetch_latest_scan, fetch_symbol_detail, fetch_score_history, fetch_backtest_summary, fetch_recent_signals, fetch_factor_performance, fetch_signal_outcome_summary, init_db
+from shared.db import (
+    fetch_alpha_score_history,
+    fetch_alpha_symbol_detail,
+    fetch_latest_alpha_scan,
+    fetch_latest_alpha_trade_candidates,
+    fetch_active_alpha_cooldowns,
+    fetch_latest_scan,
+    fetch_symbol_detail,
+    fetch_score_history,
+    fetch_backtest_summary,
+    fetch_recent_signals,
+    fetch_factor_performance,
+    fetch_signal_outcome_summary,
+    get_trading_runtime_controls,
+    set_trading_runtime_control,
+    init_db,
+)
 
 def plain_reason(reason):
     text = str(reason or "")
@@ -126,10 +142,9 @@ _BACKTEST_CACHE_TTL = 300
 _TRADING_CACHE_TTL = 10
 _FAST_CACHE_PATHS = {
     "/api/scan/latest",
+    "/api/alpha/scan/latest",
     "/api/scan/details",
-    "/api/backtest/review",
     "/api/backtest/summary",
-    "/api/backtest/factor_analysis",
     "/api/backtest/recent",
     "/api/backtest/signals",
     "/api/backtest/factor_weights",
@@ -228,6 +243,8 @@ async def fast_path_cache(request, call_next):
         ttl = _TRADING_CACHE_TTL
     elif request.url.path.startswith("/api/scan/"):
         ttl = _SCAN_CACHE_TTL
+    elif request.url.path in {"/api/backtest/review", "/api/backtest/factor_analysis"}:
+        ttl = 5
     else:
         ttl = _BACKTEST_CACHE_TTL
     if item and time.time() - item["time"] < ttl:
@@ -278,21 +295,6 @@ async def startup():
             }
             for r in rows
         ])
-        from shared.db import get_conn
-        conn = get_conn()
-        review = conn.execute("SELECT run_time, review_json FROM backtest_review ORDER BY run_time DESC LIMIT 1").fetchone()
-        if review and review["review_json"]:
-            data = json.loads(review["review_json"])
-            data["_run_time"] = review["run_time"]
-        else:
-            data = {"error": "鏆傛棤澶嶇洏鏁版嵁锛岃杩愯鍥炴祴"}
-        seed_response_cache("/api/backtest/review", data)
-        factor = conn.execute("SELECT result FROM factor_analysis ORDER BY rowid DESC LIMIT 1").fetchone()
-        seed_response_cache(
-            "/api/backtest/factor_analysis",
-            json.loads(factor["result"]) if factor and factor["result"] else {"error": "no analysis data", "recommendations": [], "candidate_recommendations": []},
-        )
-        conn.close()
         weights_path = os.path.join(os.path.dirname(__file__), "..", "engine", "factor_weights.json")
         with open(weights_path, encoding="utf-8") as f:
             seed_response_cache("/api/backtest/factor_weights", json.load(f))
@@ -366,6 +368,379 @@ async def get_latest_scan(user=Depends(get_user)):
 @app.get("/api/scan/details")
 async def get_scan_details(user=Depends(get_user)):
     return await get_latest_scan(user)
+
+
+def _parse_json(value, default=None):
+    if not value:
+        return default if default is not None else {}
+    try:
+        return json.loads(value)
+    except Exception:
+        return default if default is not None else {}
+
+
+@app.get("/api/alpha/scan/latest")
+async def get_latest_alpha_scan(user=Depends(get_user)):
+    scan, rows = fetch_latest_alpha_scan()
+    if not scan:
+        return {"scan_time": None, "count": 0, "symbols": []}
+    candidate_rows = fetch_latest_alpha_trade_candidates(500)
+    candidate_by_alpha = {}
+    for c in candidate_rows:
+        if c.get("alpha_symbol") not in candidate_by_alpha:
+            candidate_by_alpha[c.get("alpha_symbol")] = c
+    cooldowns = fetch_active_alpha_cooldowns(100)
+    symbols = []
+    for r in rows:
+        raw = _parse_json(r["raw_features"])
+        candidate = candidate_by_alpha.get(r["alpha_symbol"]) or {}
+        volume_price = raw.get("volume_price") or {}
+        symbols.append({
+            "alpha_symbol": r["alpha_symbol"],
+            "base_asset": r["base_asset"],
+            "name": r["alpha_name"],
+            "futures_symbol": r["futures_symbol"],
+            "tradeability": r["tradeability"],
+            "status": r["status"],
+            "price": float(r["market_price"] or 0),
+            "alpha_score": float(r["alpha_score"] or 0),
+            "discovery_score": float(r["discovery_score"] or 0),
+            "momentum_score": float(r["momentum_score"] or 0),
+            "liquidity_score": float(r["liquidity_score"] or 0),
+            "risk_score": float(r["risk_score"] or 0),
+            "tradeability_score": float(r["tradeability_score"] or 0),
+            "grade": r["grade"],
+            "decision": r["decision"],
+            "alpha_profile": r["alpha_profile"],
+            "entry_level": r["entry_level"],
+            "suggested_position_pct": float(r["suggested_position_pct"] or 0),
+            "block_reasons": _parse_json(r["block_reasons"], []),
+            "profile_thresholds": _parse_json(r["profile_thresholds"], {}),
+            "volume_24h": float(r["volume_24h"] or 0),
+            "liquidity": float(r["liquidity"] or 0),
+            "percent_change_24h": float(r["percent_change_24h"] or 0),
+            "spread_pct": (raw.get("depth") or {}).get("spread_pct"),
+            "volume_growth_6h": (raw.get("volume") or {}).get("volume_growth_6h"),
+            "volume_price": volume_price,
+            "normal_review": {
+                "normal_score": candidate.get("normal_score"),
+                "normal_grade": candidate.get("normal_grade"),
+                "normal_side": candidate.get("normal_side"),
+                "entry_profile": _parse_json(candidate.get("entry_profile"), {}),
+                "entry_status": candidate.get("entry_status"),
+                "block_reason": candidate.get("block_reason"),
+                "adapter_quality": candidate.get("adapter_quality"),
+                "missing_fields": _parse_json(candidate.get("missing_fields_json"), []),
+                "volume_price": {
+                    "state": candidate.get("volume_price_state"),
+                    "action": candidate.get("volume_price_action"),
+                    "reasons": _parse_json(candidate.get("volume_price_reasons_json"), []),
+                    "metrics": _parse_json(candidate.get("volume_price_metrics_json"), {}),
+                    "max_position_factor": candidate.get("volume_price_max_position_factor"),
+                },
+                "updated_at": candidate.get("updated_at"),
+            } if candidate else None,
+        })
+    return {"scan_time": scan["time"], "count": len(symbols), "symbols": symbols, "cooldowns": cooldowns}
+
+
+@app.get("/api/alpha/scan/by_symbol/{alpha_symbol}")
+async def get_alpha_symbol_detail(alpha_symbol: str, user=Depends(get_user)):
+    row = fetch_alpha_symbol_detail(alpha_symbol.upper())
+    if not row:
+        return {"error": "Not found", "symbol": alpha_symbol}
+    raw = _parse_json(row["raw_features"])
+    symbol_raw = _parse_json(row["symbol_raw_json"])
+    candidate = next(
+        (c for c in fetch_latest_alpha_trade_candidates(500) if c.get("alpha_symbol") == row["alpha_symbol"]),
+        None,
+    )
+    history = [
+        {
+            "time": r["time"],
+            "score": float(r["alpha_score"] or 0),
+            "grade": r["grade"],
+            "price": float(r["market_price"] or 0),
+        }
+        for r in fetch_alpha_score_history(row["alpha_symbol"], 100)
+    ]
+    return {
+        "alpha_symbol": row["alpha_symbol"],
+        "base_asset": row["base_asset"],
+        "name": row["alpha_name"],
+        "token_id": row["token_id"],
+        "futures_symbol": row["futures_symbol"],
+        "tradeability": row["tradeability"],
+        "status": row["status"],
+        "time": row["time"],
+        "price": float(row["market_price"] or 0),
+        "alpha_score": float(row["alpha_score"] or 0),
+        "grade": row["grade"],
+        "decision": row["decision"],
+        "profile": {
+            "name": row["alpha_profile"],
+            "entry_level": row["entry_level"],
+            "suggested_position_pct": float(row["suggested_position_pct"] or 0),
+            "block_reasons": _parse_json(row["block_reasons"], []),
+            "thresholds": _parse_json(row["profile_thresholds"], {}),
+        },
+        "scores": {
+            "discovery": float(row["discovery_score"] or 0),
+            "momentum": float(row["momentum_score"] or 0),
+            "liquidity": float(row["liquidity_score"] or 0),
+            "risk": float(row["risk_score"] or 0),
+            "tradeability": float(row["tradeability_score"] or 0),
+        },
+        "volume_24h": float(row["volume_24h"] or 0),
+        "liquidity": float(row["liquidity"] or 0),
+        "percent_change_24h": float(row["percent_change_24h"] or 0),
+        "raw_features": raw,
+        "symbol_raw": symbol_raw,
+        "history": history,
+        "volume_price": raw.get("volume_price") or {},
+        "normal_review": {
+            "normal_score": candidate.get("normal_score"),
+            "normal_grade": candidate.get("normal_grade"),
+            "normal_side": candidate.get("normal_side"),
+            "entry_profile": _parse_json(candidate.get("entry_profile"), {}),
+            "entry_status": candidate.get("entry_status"),
+            "block_reason": candidate.get("block_reason"),
+            "adapter_quality": candidate.get("adapter_quality"),
+            "missing_fields": _parse_json(candidate.get("missing_fields_json"), []),
+            "volume_price": {
+                "state": candidate.get("volume_price_state"),
+                "action": candidate.get("volume_price_action"),
+                "reasons": _parse_json(candidate.get("volume_price_reasons_json"), []),
+                "metrics": _parse_json(candidate.get("volume_price_metrics_json"), {}),
+                "max_position_factor": candidate.get("volume_price_max_position_factor"),
+            },
+            "updated_at": candidate.get("updated_at"),
+        } if candidate else None,
+    }
+
+
+def _build_factor_analysis_from_performance(conn):
+    run_row = conn.execute(
+        "SELECT DISTINCT run_time FROM factor_performance ORDER BY run_time DESC LIMIT 1"
+    ).fetchone()
+    if not run_row:
+        return {"error": "no analysis data", "recommendations": [], "candidate_recommendations": []}
+    run_time = run_row["run_time"]
+    rows = conn.execute(
+        """SELECT factor_name, bucket, samples, win_rate, avg_return,
+                  avg_drawdown, ev, ic, ir
+           FROM factor_performance
+           WHERE run_time = ?
+           ORDER BY factor_name, bucket""",
+        (run_time,),
+    ).fetchall()
+    by_factor = {}
+    for row in rows:
+        by_factor.setdefault(row["factor_name"], []).append(dict(row))
+
+    current_factors = []
+    recommendations = []
+    category_stats = {}
+    for name, buckets in by_factor.items():
+        usable = [b for b in buckets if int(b.get("samples") or 0) >= 3 and b.get("win_rate") is not None]
+        category_stats[name] = {
+            "buckets": buckets,
+            "samples": sum(int(b.get("samples") or 0) for b in buckets),
+        }
+        if not usable:
+            continue
+        high = max(usable, key=lambda b: (float(b.get("win_rate") or 0), float(b.get("avg_return") or 0)))
+        low = min(usable, key=lambda b: (float(b.get("win_rate") or 0), float(b.get("avg_return") or 0)))
+        discrimination = (float(high["win_rate"] or 0) - float(low["win_rate"] or 0)) * 100
+        factor_item = {
+            "name": name,
+            "discrimination": round(discrimination, 1),
+            "high_bucket": high["bucket"],
+            "low_bucket": low["bucket"],
+            "high_win_rate": round(float(high["win_rate"] or 0) * 100, 1),
+            "low_win_rate": round(float(low["win_rate"] or 0) * 100, 1),
+            "high_avg_return": round(float(high.get("avg_return") or 0) * 100, 2),
+            "low_avg_return": round(float(low.get("avg_return") or 0) * 100, 2),
+            "samples": sum(int(b.get("samples") or 0) for b in usable),
+        }
+        current_factors.append(factor_item)
+        if abs(discrimination) >= 3:
+            recommendations.append({
+                "factor": name,
+                "description": f"{name} 的 {high['bucket']} 桶胜率 {factor_item['high_win_rate']}%，明显优于 {low['bucket']} 桶 {factor_item['low_win_rate']}%",
+                "correlation": high.get("ev"),
+                "discrimination": round(discrimination, 1),
+                "suggestion": f"优先提高 {name}={high['bucket']} 的权重，降低 {low['bucket']} 的开仓优先级。",
+            })
+
+    current_factors.sort(key=lambda x: abs(x["discrimination"]), reverse=True)
+    recommendations.sort(key=lambda x: abs(x["discrimination"]), reverse=True)
+    high_scores = [x["high_win_rate"] for x in current_factors]
+    low_scores = [x["low_win_rate"] for x in current_factors]
+    overall = (sum(high_scores) / len(high_scores) - sum(low_scores) / len(low_scores)) if high_scores and low_scores else 0
+    return {
+        "run_time": run_time,
+        "source": "factor_performance_fallback",
+        "total_signals": sum(int(r["samples"] or 0) for r in rows),
+        "current_factors": current_factors,
+        "recommendations": recommendations[:10],
+        "candidate_recommendations": recommendations[:10],
+        "category_stats": category_stats,
+        "overall_discrimination": round(overall, 1),
+    }
+
+
+def _enrich_backtest_review(conn, review):
+    review = review or {}
+    rows = conn.execute(
+        """SELECT symbol, grade, grade_score, grade_time, max_drawdown,
+                  return_6h, return_12h, return_24h, return_48h, win_12h, win_24h
+           FROM backtest_results
+           WHERE datetime(substr(replace(grade_time, 'T', ' '), 1, 19)) >= datetime('now', '-1 day')
+           ORDER BY datetime(substr(replace(grade_time, 'T', ' '), 1, 19)) DESC
+           LIMIT 5000"""
+    ).fetchall()
+    trades = conn.execute(
+        """SELECT symbol, side, pnl_pct, pnl, exit_reason, entry_time, exit_time,
+                  grade_at_entry, score_at_entry
+           FROM trades
+           WHERE datetime(substr(replace(exit_time, 'T', ' '), 1, 19)) >= datetime('now', '-1 day')
+           ORDER BY datetime(substr(replace(exit_time, 'T', ' '), 1, 19)) DESC
+           LIMIT 200"""
+    ).fetchall()
+    entry_issues = []
+    exit_issues = []
+    good_exits = []
+    for r in rows:
+        returns = [float(v) for v in (r["return_6h"], r["return_12h"], r["return_24h"], r["return_48h"]) if v is not None]
+        if not returns:
+            continue
+        max_gain = max(returns)
+        final_ret = next((float(v) for v in (r["return_24h"], r["return_12h"], r["return_6h"]) if v is not None), returns[-1])
+        max_dd = float(r["max_drawdown"] or 0)
+        item = {
+            "symbol": r["symbol"],
+            "grade": r["grade"],
+            "score": round(float(r["grade_score"] or 0), 1),
+            "grade_time": r["grade_time"],
+            "max_gain_pct": round(max_gain * 100, 2),
+            "max_dd_pct": round(max_dd * 100, 2),
+            "ret_6h_pct": round(float(r["return_6h"] or 0) * 100, 2),
+            "ret_24h_pct": round(final_ret * 100, 2),
+        }
+        if max_gain < 0.015 or final_ret < -0.02 or max_dd <= -0.035:
+            severity = abs(min(final_ret, 0)) * 100 + abs(min(max_dd, 0)) * 50 + max(0, 0.015 - max_gain) * 100
+            entry_issues.append({**item, "entry_quality": "需要改进", "exit_quality": "观察", "reason": "最近 24h 入场后空间不足或回撤偏大", "_severity": severity, "_type": "entry"})
+        elif max_gain >= 0.035 and final_ret >= 0.015:
+            severity = max_gain * 100 + final_ret * 50
+            exit_issues.append({**item, "entry_quality": "基本正确", "exit_quality": "可能偏早", "reason": "最近 24h 信号后仍有上行空间", "_severity": severity, "_type": "exit"})
+        if max_dd <= -0.04 or final_ret <= -0.025:
+            good_exits.append({**item, "entry_quality": "风险偏高", "exit_quality": "保护有效", "reason": "最近 24h 后续回撤或转负明显，保护退出有价值", "_severity": abs(min(max_dd, final_ret)) * 100})
+
+    live_good = []
+    for t in trades:
+        pnl_pct = float(t["pnl_pct"] or 0)
+        reason = str(t["exit_reason"] or "")
+        if pnl_pct > 0 or any(x in reason for x in ("TP1", "TP2", "trailing_stop")):
+            live_good.append({
+                "symbol": t["symbol"],
+                "grade": t["grade_at_entry"] or "-",
+                "score": round(float(t["score_at_entry"] or 0), 1),
+                "grade_time": t["exit_time"],
+                "max_gain_pct": round(max(pnl_pct, 0), 2),
+                "max_dd_pct": 0,
+                "ret_6h_pct": round(pnl_pct, 2),
+                "ret_24h_pct": round(pnl_pct, 2),
+                "entry_quality": "实盘验证",
+                "exit_quality": "有效做法",
+                "reason": reason or "最近 24h 盈利退出",
+                "_severity": abs(pnl_pct),
+            })
+
+    issue_pool = entry_issues + exit_issues
+    issue_pool.sort(key=lambda x: x.get("_severity", 0), reverse=True)
+    unique_issues = []
+    seen_symbols = set()
+    for item in issue_pool:
+        symbol_key = item.get("symbol")
+        if symbol_key in seen_symbols:
+            continue
+        seen_symbols.add(symbol_key)
+        unique_issues.append(item)
+        if len(unique_issues) >= 10:
+            break
+    if len(unique_issues) < 10:
+        seen_ids = {(x.get("symbol"), x.get("grade_time"), x.get("_type")) for x in unique_issues}
+        for item in issue_pool:
+            item_id = (item.get("symbol"), item.get("grade_time"), item.get("_type"))
+            if item_id in seen_ids:
+                continue
+            unique_issues.append(item)
+            seen_ids.add(item_id)
+            if len(unique_issues) >= 10:
+                break
+    issue_pool = unique_issues
+    review["entry_issues"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in issue_pool if x["_type"] == "entry"]
+    review["exit_issues"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in issue_pool if x["_type"] == "exit"]
+    good_pool = live_good + good_exits
+    good_pool.sort(key=lambda x: x.get("_severity", 0), reverse=True)
+    unique_good = []
+    seen_good_symbols = set()
+    for item in good_pool:
+        symbol_key = item.get("symbol")
+        if symbol_key in seen_good_symbols:
+            continue
+        seen_good_symbols.add(symbol_key)
+        unique_good.append(item)
+        if len(unique_good) >= 5:
+            break
+    review["good_exits"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in unique_good]
+    overview = (review.setdefault("summary", {}).setdefault("overview", {}))
+    overview["total_samples"] = len(rows)
+    overview["gave_space_5pct"] = sum(
+        1 for r in rows
+        if max([float(v) for v in (r["return_6h"], r["return_12h"], r["return_24h"], r["return_48h"]) if v is not None] or [0]) >= 0.05
+    )
+    overview["had_drawdown_8pct"] = sum(1 for r in rows if abs(float(r["max_drawdown"] or 0)) >= 0.08)
+    overview["trade_count"] = len(trades)
+    overview["review_window"] = "最近 1 天"
+    overview["grade_time_min"] = min((r["grade_time"] for r in rows), default=None)
+    overview["grade_time_max"] = max((r["grade_time"] for r in rows), default=None)
+    review["total_signals"] = len(rows)
+    review["total_trades"] = len(trades)
+    review["live_trades"] = [
+        {
+            "symbol": t["symbol"],
+            "side": t["side"],
+            "pnl_pct": round(float(t["pnl_pct"] or 0), 2),
+            "pnl": round(float(t["pnl"] or 0), 2),
+            "exit_reason": t["exit_reason"],
+            "entry_time": t["entry_time"],
+            "exit_time": t["exit_time"],
+            "grade": t["grade_at_entry"],
+            "score": t["score_at_entry"],
+        }
+        for t in trades
+    ]
+    overview["generated_issue_count"] = len(review["entry_issues"]) + len(review["exit_issues"])
+    review["rules"] = [
+        {
+            "section": "总体判断",
+            "text": f"本轮只看最近 1 天样本 {len(rows)} 个；重点问题只展示 {len(issue_pool)} 个，其中开仓问题 {len(review['entry_issues'])} 个、可能偏早退出 {len(review['exit_issues'])} 个；有效做法 {len(review['good_exits'])} 个。",
+        },
+        {"section": "开仓问题", "text": "最近需要特别注意的是入场后最大浮盈不足、或先出现较大回撤的信号。"},
+        {"section": "平仓问题", "text": "如果最近样本仍有上行空间，尾仓应更多依赖移动止盈和多因子同步转弱。"},
+        {"section": "有效做法", "text": "最近 1 天盈利退出、TP 或保护型退出会进入有效做法，用来保留真正有用的规则。"},
+    ]
+    return review
+
+
+@app.get("/api/alpha/trade_candidates")
+async def get_alpha_trade_candidates(user=Depends(get_user)):
+    return {
+        "candidates": fetch_latest_alpha_trade_candidates(200),
+        "cooldowns": fetch_active_alpha_cooldowns(100),
+    }
 
 
 def compute_heat_score(tech: dict, row: dict, fut: dict | None = None) -> dict:
@@ -610,11 +985,77 @@ async def get_backtest_summary(user=Depends(get_user)):
         }
     except Exception as e:
         outcome_summary["error"] = str(e)
+    backtest_status = {
+        "backtest_rows": 0,
+        "review_rows": 0,
+        "factor_rows": 0,
+        "score_count": 0,
+        "score_min_time": None,
+        "score_max_time": None,
+        "latest_price_time": None,
+        "latest_review_time": None,
+        "latest_factor_time": None,
+        "waiting_for_mature_returns": False,
+        "plain": "暂无成熟回测结果。",
+    }
+    try:
+        from shared.db import get_conn
+
+        conn = get_conn()
+        bt = conn.execute(
+            "SELECT COUNT(*) AS count, MAX(run_time) AS latest_run FROM backtest_results"
+        ).fetchone()
+        review_row = conn.execute(
+            "SELECT COUNT(*) AS count, MAX(run_time) AS latest_run FROM backtest_review"
+        ).fetchone()
+        factor_row = conn.execute(
+            "SELECT COUNT(*) AS count, MAX(run_time) AS latest_run FROM factor_performance"
+        ).fetchone()
+        score_row = conn.execute(
+            "SELECT COUNT(*) AS count, MIN(time) AS min_time, MAX(time) AS max_time FROM alpha_scores"
+        ).fetchone()
+        price_row = conn.execute(
+            "SELECT MAX(time) AS max_time FROM candles_1h"
+        ).fetchone()
+
+        backtest_rows = int(bt["count"] or 0)
+        score_count = int(score_row["count"] or 0)
+        latest_price_time = price_row["max_time"] if price_row else None
+        waiting = backtest_rows == 0 and score_count > 0 and bool(latest_price_time)
+        if waiting:
+            plain = (
+                "扫描评分和行情已经有数据，但当前信号还没走完 6h/12h/24h "
+                "未来收益验证窗口，所以暂时不会生成等级收益概览。"
+            )
+        elif score_count == 0:
+            plain = "暂无扫描评分样本，回测还没有可验证的信号来源。"
+        elif not latest_price_time:
+            plain = "暂无 1h 行情数据，回测无法计算未来收益。"
+        else:
+            plain = "暂无成熟回测结果，等待下一轮回测任务产出。"
+
+        backtest_status = {
+            "backtest_rows": backtest_rows,
+            "review_rows": int(review_row["count"] or 0),
+            "factor_rows": int(factor_row["count"] or 0),
+            "score_count": score_count,
+            "score_min_time": score_row["min_time"],
+            "score_max_time": score_row["max_time"],
+            "latest_price_time": latest_price_time,
+            "latest_review_time": review_row["latest_run"],
+            "latest_factor_time": factor_row["latest_run"],
+            "waiting_for_mature_returns": waiting,
+            "plain": plain,
+        }
+        conn.close()
+    except Exception as e:
+        backtest_status["error"] = str(e)
     return cache_set("backtest_summary", {
         "latest_run": latest,
         "grades": results,
         "decision_summary": decision_summary,
         "outcome_summary": outcome_summary,
+        "backtest_status": backtest_status,
     })
 
 
@@ -663,11 +1104,11 @@ async def get_factor_analysis(user=Depends(get_user)):
         ).fetchone()
         if row and row["result"]:
             return json.loads(row["result"])
-        return {"error": "no analysis data", "recommendations": [], "candidate_recommendations": []}
+        return _build_factor_analysis_from_performance(conn)
     except Exception as e:
         return {"error": str(e), "recommendations": [], "candidate_recommendations": []}
     finally:
-        pass
+        conn.close()
 
 
 @app.get("/api/backtest/review")
@@ -682,12 +1123,12 @@ async def get_backtest_review(user=Depends(get_user)):
         if row:
             data = json.loads(row["review_json"])
             data["_run_time"] = row["run_time"]
-            return data
+            return _enrich_backtest_review(conn, data)
         return {"error": "鏆傛棤澶嶇洏鏁版嵁锛岃杩愯鍥炴祴"}
     except Exception as e:
         return {"error": str(e)}
     finally:
-        pass
+        conn.close()
 
 
 @app.get("/api/backtest/factor_weights")
@@ -786,10 +1227,104 @@ async def update_strategy_learning_status(candidate_id: int, body: dict, user=De
 
 _trading_status_cache = {"data": None, "time": 0}
 _CACHE_TTL = 10  # 10绉掔紦瀛?
+
+
+def _clear_trading_caches():
+    _trading_status_cache["data"] = None
+    _trading_status_cache["time"] = 0
+    _response_cache.clear()
+    _api_cache.clear()
+
+
+def _position_strategy_source(conn, symbol):
+    row = conn.execute(
+        "SELECT strategy_source FROM position_history WHERE symbol=?",
+        (symbol,),
+    ).fetchone()
+    if row and row["strategy_source"]:
+        return row["strategy_source"]
+    return "normal"
+
+
+def _flatten_positions_by_source(strategy_source, reason):
+    from datetime import datetime, timezone
+    from trader.exchange import BinanceFutures
+    from trader.execution import ExecutionEngine
+    from shared.db import get_conn
+
+    ex = BinanceFutures()
+    conn = get_conn()
+    try:
+        engine = ExecutionEngine(ex)
+        positions = ex.get_positions()
+        actions = []
+        for pos in positions:
+            source = _position_strategy_source(conn, pos["symbol"])
+            if source != strategy_source:
+                continue
+            close_side = "SELL" if pos.get("side") == "LONG" else "BUY"
+            actions.append({
+                "action": "close",
+                "symbol": pos["symbol"],
+                "side": close_side,
+                "position_side": pos.get("side"),
+                "close_price": pos.get("mark_price"),
+                "reason": reason,
+                "strategy_source": source,
+                "run_id": f"manual-switch-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            })
+        if not actions:
+            return {"closed": 0, "results": []}
+        results = engine.execute(actions)
+        return {
+            "closed": sum(1 for r in results if r.get("status") == "ok"),
+            "results": results,
+        }
+    finally:
+        conn.close()
+        ex.close()
+
+
+@app.get("/api/trading/controls")
+async def get_trading_controls(user=Depends(get_user)):
+    return get_trading_runtime_controls()
+
+
+@app.post("/api/trading/controls")
+async def update_trading_controls(body: dict, user=Depends(get_user)):
+    key_map = {
+        "normal": "normal_trading_enabled",
+        "normal_trading_enabled": "normal_trading_enabled",
+        "alpha": "alpha_trading_enabled",
+        "alpha_trading_enabled": "alpha_trading_enabled",
+    }
+    mode = str(body.get("mode") or body.get("key") or "").strip()
+    key = key_map.get(mode)
+    if not key:
+        return {"error": "unsupported trading control"}
+    enabled = bool(body.get("enabled"))
+    controls = set_trading_runtime_control(key, enabled)
+    close_result = {"closed": 0, "results": []}
+    if not enabled:
+        source = "alpha" if key == "alpha_trading_enabled" else "normal"
+        label = "Alpha" if source == "alpha" else "普通"
+        close_result = _flatten_positions_by_source(
+            source,
+            f"manual_{source}_trading_switch_off: 页面关闭{label}交易",
+        )
+    _clear_trading_caches()
+    return {
+        "ok": True,
+        "controls": controls,
+        "close_result": close_result,
+    }
+
+
 def _build_local_trading_status(error=None):
     from shared.db import fetch_position_trade_groups, get_conn
     from trader.config import TRADING_CONFIG
 
+    controls = get_trading_runtime_controls()
     conn = get_conn()
     try:
         excluded = ("historical_import", "閸樺棗褰剁悰銉ョ秿(閹靛濮╅獮鍏呯波)")
@@ -885,6 +1420,7 @@ def _build_local_trading_status(error=None):
                 for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
             },
             "latest_position_snapshot": latest_snapshot,
+            "trading_controls": controls,
         }
     finally:
         conn.close()
@@ -919,6 +1455,7 @@ async def get_trading_status(user=Depends(get_user)):
             "positions": [],
             "recent_trades": [],
             "total_pnl": 0,
+            "trading_controls": get_trading_runtime_controls(),
         }
 
     EXCLUDED_REASONS = ("historical_import", "鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)")
@@ -926,6 +1463,7 @@ async def get_trading_status(user=Depends(get_user)):
     from trader.exchange import BinanceFutures
     from trader.config import TRADING_CONFIG
     INITIAL_CAPITAL = TRADING_CONFIG.get("total_capital", 5000)
+    controls = get_trading_runtime_controls()
     ex = BinanceFutures()
     try:
         margin_data = ex.get_margin_balance()
@@ -972,6 +1510,13 @@ async def get_trading_status(user=Depends(get_user)):
                     "highest_price": None,
                     "last_exit_reason": None,
                     "last_exit_plain": None,
+                    "strategy_source": "normal",
+                    "signal_source": None,
+                    "alpha_symbol": None,
+                    "alpha_profile": None,
+                    "alpha_entry_level": None,
+                    "alpha_score": None,
+                    "alpha_suggested_position_pct": None,
                 }
             return {
                 "entry_reason": r["entry_reason"],
@@ -981,6 +1526,13 @@ async def get_trading_status(user=Depends(get_user)):
                 "highest_price": float(r["highest_price"] or 0) if "highest_price" in r.keys() else None,
                 "last_exit_reason": r["last_exit_reason"] if "last_exit_reason" in r.keys() else None,
                 "last_exit_plain": plain_reason(r["last_exit_reason"]) if "last_exit_reason" in r.keys() else None,
+                "strategy_source": r["strategy_source"] if "strategy_source" in r.keys() else "normal",
+                "signal_source": r["signal_source"] if "signal_source" in r.keys() else None,
+                "alpha_symbol": r["alpha_symbol"] if "alpha_symbol" in r.keys() else None,
+                "alpha_profile": r["alpha_profile"] if "alpha_profile" in r.keys() else None,
+                "alpha_entry_level": r["alpha_entry_level"] if "alpha_entry_level" in r.keys() else None,
+                "alpha_score": float(r["alpha_score"] or 0) if "alpha_score" in r.keys() else None,
+                "alpha_suggested_position_pct": float(r["alpha_suggested_position_pct"] or 0) if "alpha_suggested_position_pct" in r.keys() else None,
             }
 
         decision_panel = {
@@ -1101,6 +1653,7 @@ async def get_trading_status(user=Depends(get_user)):
                 for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
             },
             "decision_panel": decision_panel,
+            "trading_controls": controls,
         }
         # 淇濆瓨缂撳瓨
         _trading_status_cache["data"] = result
@@ -1114,6 +1667,7 @@ async def get_trading_status(user=Depends(get_user)):
             "positions": [],
             "recent_trades": [],
             "total_pnl": 0,
+            "trading_controls": get_trading_runtime_controls(),
         }
     finally:
         ex.close()

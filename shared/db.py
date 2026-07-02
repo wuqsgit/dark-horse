@@ -400,12 +400,168 @@ def init_db():
             quote_volume_24h REAL DEFAULT 0,
             UNIQUE(time, symbol)
         );
+        CREATE TABLE IF NOT EXISTS alpha_symbols (
+            alpha_symbol TEXT PRIMARY KEY,
+            base_asset TEXT,
+            token_id TEXT,
+            alpha_name TEXT,
+            status TEXT,
+            alpha_trade_symbol TEXT,
+            futures_symbol TEXT,
+            tradeability TEXT,
+            price REAL,
+            percent_change_24h REAL,
+            volume_24h REAL,
+            liquidity REAL,
+            market_cap REAL,
+            first_seen TEXT DEFAULT (datetime('now')),
+            last_seen TEXT DEFAULT (datetime('now')),
+            raw_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_symbols_tradeability ON alpha_symbols(tradeability);
+        CREATE INDEX IF NOT EXISTS idx_alpha_symbols_volume ON alpha_symbols(volume_24h DESC);
+        CREATE TABLE IF NOT EXISTS alpha_candles_1h (
+            time TEXT, alpha_symbol TEXT,
+            open REAL, high REAL, low REAL, close REAL,
+            volume REAL, quote_vol REAL, trades INTEGER,
+            PRIMARY KEY (time, alpha_symbol)
+        );
+        CREATE TABLE IF NOT EXISTS alpha_candles_15m (
+            time TEXT, alpha_symbol TEXT,
+            open REAL, high REAL, low REAL, close REAL,
+            volume REAL, quote_vol REAL, trades INTEGER,
+            PRIMARY KEY (time, alpha_symbol)
+        );
+        CREATE TABLE IF NOT EXISTS alpha_candles_6h (
+            time TEXT, alpha_symbol TEXT,
+            open REAL, high REAL, low REAL, close REAL,
+            volume REAL, quote_vol REAL, trades INTEGER,
+            PRIMARY KEY (time, alpha_symbol)
+        );
+        CREATE TABLE IF NOT EXISTS alpha_candles_24h (
+            time TEXT, alpha_symbol TEXT,
+            open REAL, high REAL, low REAL, close REAL,
+            volume REAL, quote_vol REAL, trades INTEGER,
+            PRIMARY KEY (time, alpha_symbol)
+        );
+        CREATE TABLE IF NOT EXISTS alpha_orderbook_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            alpha_symbol TEXT,
+            bid_depth REAL,
+            ask_depth REAL,
+            imbalance_ratio REAL,
+            spread_pct REAL,
+            top_bid_qty REAL,
+            top_ask_qty REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_ob_symbol ON alpha_orderbook_snapshots(alpha_symbol);
+        CREATE INDEX IF NOT EXISTS idx_alpha_ob_time ON alpha_orderbook_snapshots(timestamp DESC);
+        CREATE TABLE IF NOT EXISTS alpha_scan_scores (
+            time TEXT,
+            scan_id TEXT,
+            alpha_symbol TEXT,
+            base_asset TEXT,
+            futures_symbol TEXT,
+            alpha_score REAL,
+            discovery_score REAL,
+            momentum_score REAL,
+            liquidity_score REAL,
+            risk_score REAL,
+            tradeability_score REAL,
+            grade TEXT,
+            decision TEXT,
+            market_price REAL,
+            raw_features TEXT,
+            alpha_profile TEXT,
+            entry_level TEXT,
+            suggested_position_pct REAL DEFAULT 0,
+            block_reasons TEXT,
+            profile_thresholds TEXT,
+            PRIMARY KEY (scan_id, alpha_symbol)
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_scan_scores_scan ON alpha_scan_scores(scan_id);
+        CREATE INDEX IF NOT EXISTS idx_alpha_scan_scores_symbol ON alpha_scan_scores(alpha_symbol);
+        CREATE INDEX IF NOT EXISTS idx_alpha_scan_scores_time ON alpha_scan_scores(time DESC);
+        CREATE TABLE IF NOT EXISTS trading_runtime_controls (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS alpha_trade_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id TEXT,
+            time TEXT,
+            alpha_symbol TEXT NOT NULL,
+            futures_symbol TEXT,
+            base_asset TEXT,
+            alpha_discovery_score REAL,
+            alpha_profile TEXT,
+            alpha_reason TEXT,
+            raw_alpha_json TEXT,
+            normal_score REAL,
+            normal_grade TEXT,
+            normal_side TEXT,
+            entry_profile TEXT,
+            entry_status TEXT,
+            block_reason TEXT,
+            adapter_quality REAL,
+            missing_fields_json TEXT,
+            volume_price_state TEXT,
+            volume_price_action TEXT,
+            volume_price_reasons_json TEXT,
+            volume_price_metrics_json TEXT,
+            volume_price_max_position_factor REAL,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(scan_id, alpha_symbol)
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_trade_candidates_time ON alpha_trade_candidates(time DESC);
+        CREATE INDEX IF NOT EXISTS idx_alpha_trade_candidates_symbol ON alpha_trade_candidates(alpha_symbol);
+        CREATE INDEX IF NOT EXISTS idx_alpha_trade_candidates_futures ON alpha_trade_candidates(futures_symbol);
+        CREATE TABLE IF NOT EXISTS alpha_cooldowns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT DEFAULT 'alpha',
+            symbol TEXT,
+            cooldown_type TEXT,
+            reason TEXT,
+            cooldown_until TEXT,
+            loss_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(source, symbol, cooldown_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_cooldowns_until ON alpha_cooldowns(cooldown_until);
+        CREATE INDEX IF NOT EXISTS idx_alpha_cooldowns_symbol ON alpha_cooldowns(symbol);
     """)
     _ensure_column(conn, "positions_history", "position_side", "TEXT")
     _ensure_column(conn, "positions_history", "mark_price", "REAL")
     _ensure_column(conn, "positions_history", "leverage", "INTEGER DEFAULT 1")
     for table in ("trades", "orders", "fills", "position_history"):
         _ensure_column(conn, table, "position_id", "TEXT")
+        _ensure_column(conn, table, "strategy_source", "TEXT DEFAULT 'normal'")
+        _ensure_column(conn, table, "signal_source", "TEXT")
+        _ensure_column(conn, table, "alpha_symbol", "TEXT")
+        _ensure_column(conn, table, "alpha_profile", "TEXT")
+        _ensure_column(conn, table, "alpha_entry_level", "TEXT")
+        _ensure_column(conn, table, "alpha_score", "REAL")
+        _ensure_column(conn, table, "alpha_suggested_position_pct", "REAL")
+    for column, ddl in {
+        "volume_price_state": "TEXT",
+        "volume_price_action": "TEXT",
+        "volume_price_reasons_json": "TEXT",
+        "volume_price_metrics_json": "TEXT",
+        "volume_price_max_position_factor": "REAL",
+    }.items():
+        _ensure_column(conn, "alpha_trade_candidates", column, ddl)
+    for column, ddl in {
+        "alpha_profile": "TEXT",
+        "entry_level": "TEXT",
+        "suggested_position_pct": "REAL DEFAULT 0",
+        "block_reasons": "TEXT",
+        "profile_thresholds": "TEXT",
+    }.items():
+        _ensure_column(conn, "alpha_scan_scores", column, ddl)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_position_id ON trades(position_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_position_id ON fills(position_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id)")
@@ -483,6 +639,14 @@ def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_candidates_dedupe "
         "ON strategy_policy_candidates(dedupe_key) WHERE dedupe_key IS NOT NULL"
     )
+    conn.execute(
+        """INSERT OR IGNORE INTO trading_runtime_controls(key, value)
+           VALUES ('normal_trading_enabled', 'true')"""
+    )
+    conn.execute(
+        """INSERT OR IGNORE INTO trading_runtime_controls(key, value)
+           VALUES ('alpha_trading_enabled', 'false')"""
+    )
     conn.commit()
 
 
@@ -496,6 +660,68 @@ def close_conn():
     if hasattr(_local, "conn") and _local.conn:
         _local.conn.close()
         _local.conn = None
+
+
+def get_trading_runtime_controls():
+    defaults = {
+        "normal_trading_enabled": True,
+        "alpha_trading_enabled": False,
+    }
+    conn = get_conn()
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS trading_runtime_controls (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        for key, enabled in defaults.items():
+            conn.execute(
+                """INSERT OR IGNORE INTO trading_runtime_controls(key, value)
+                   VALUES (?, ?)""",
+                (key, "true" if enabled else "false"),
+            )
+        rows = conn.execute("SELECT key, value, updated_at FROM trading_runtime_controls").fetchall()
+        conn.commit()
+    finally:
+        conn.close()
+
+    controls = defaults.copy()
+    updated_at = {}
+    for row in rows:
+        key = row["key"]
+        if key in controls:
+            controls[key] = str(row["value"]).lower() in ("1", "true", "yes", "on")
+            updated_at[key] = row["updated_at"]
+    controls["updated_at"] = updated_at
+    return controls
+
+
+def set_trading_runtime_control(key, enabled):
+    if key not in {"normal_trading_enabled", "alpha_trading_enabled"}:
+        raise ValueError(f"unsupported trading control: {key}")
+    conn = get_conn()
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS trading_runtime_controls (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO trading_runtime_controls(key, value, updated_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                 value=excluded.value,
+                 updated_at=datetime('now')""",
+            (key, "true" if enabled else "false"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_trading_runtime_controls()
 
 
 # ---- Candles ----
@@ -538,6 +764,109 @@ def insert_candles_24h(rows):
         rows,
     )
     conn.commit()
+
+
+def upsert_alpha_symbols(rows):
+    conn = get_conn()
+    conn.executemany(
+        """INSERT INTO alpha_symbols
+           (alpha_symbol, base_asset, token_id, alpha_name, status, alpha_trade_symbol,
+            futures_symbol, tradeability, price, percent_change_24h, volume_24h,
+            liquidity, market_cap, raw_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(alpha_symbol) DO UPDATE SET
+             base_asset=excluded.base_asset,
+             token_id=excluded.token_id,
+             alpha_name=excluded.alpha_name,
+             status=excluded.status,
+             alpha_trade_symbol=excluded.alpha_trade_symbol,
+             futures_symbol=excluded.futures_symbol,
+             tradeability=excluded.tradeability,
+             price=excluded.price,
+             percent_change_24h=excluded.percent_change_24h,
+             volume_24h=excluded.volume_24h,
+             liquidity=excluded.liquidity,
+             market_cap=excluded.market_cap,
+             last_seen=datetime('now'),
+             raw_json=excluded.raw_json""",
+        rows,
+    )
+    conn.commit()
+
+
+def insert_alpha_candles(table, rows):
+    if table not in {"alpha_candles_1h", "alpha_candles_15m", "alpha_candles_6h", "alpha_candles_24h"}:
+        raise ValueError(f"unsupported alpha candle table: {table}")
+    conn = get_conn()
+    conn.executemany(
+        f"""INSERT OR REPLACE INTO {table}
+           (time, alpha_symbol, open, high, low, close, volume, quote_vol, trades)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+
+def insert_alpha_orderbook_snapshot(rows):
+    conn = get_conn()
+    conn.executemany(
+        """INSERT INTO alpha_orderbook_snapshots
+           (timestamp, alpha_symbol, bid_depth, ask_depth, imbalance_ratio,
+            spread_pct, top_bid_qty, top_ask_qty)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+
+def fetch_active_alpha_symbols(limit=200):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT *
+           FROM alpha_symbols
+           WHERE status = 'TRADING'
+             AND tradeability != 'inactive'
+             AND COALESCE(volume_24h, 0) > 0
+           ORDER BY
+             CASE tradeability WHEN 'alpha_futures_mapped' THEN 0
+                               WHEN 'alpha_tradeable' THEN 1
+                               ELSE 2 END,
+             volume_24h DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return rows
+
+
+def fetch_alpha_candles(table, symbols, hours=None, days=None):
+    if not symbols:
+        return []
+    if table not in {"alpha_candles_1h", "alpha_candles_15m", "alpha_candles_6h", "alpha_candles_24h"}:
+        raise ValueError(f"unsupported alpha candle table: {table}")
+    placeholders = ",".join("?" for _ in symbols)
+    if days is not None:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        cutoff = (datetime.utcnow() - timedelta(hours=hours or 72)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = get_conn()
+    return conn.execute(
+        f"""SELECT time, alpha_symbol, open, high, low, close, volume, quote_vol, trades
+            FROM {table}
+            WHERE alpha_symbol IN ({placeholders}) AND time > ?
+            ORDER BY alpha_symbol, time""",
+        symbols + [cutoff],
+    ).fetchall()
+
+
+def fetch_alpha_orderbook_depth(symbol, hours=6):
+    conn = get_conn()
+    return conn.execute(
+        """SELECT *
+           FROM alpha_orderbook_snapshots
+           WHERE alpha_symbol = ? AND timestamp > datetime('now', ?, '+8 hours')
+           ORDER BY timestamp DESC""",
+        (symbol, f"-{hours} hours"),
+    ).fetchall()
 
 
 def fetch_klines_1h(symbols, hours=72):
@@ -656,19 +985,78 @@ def new_position_id(symbol, side):
     return f"{clean_symbol}-{clean_side}-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def record_trade(symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason, grade, score, entry_reason=None, position_id=None):
+def record_trade(
+    symbol,
+    side,
+    qty,
+    entry_price,
+    exit_price,
+    pnl,
+    pnl_pct,
+    exit_reason,
+    grade,
+    score,
+    entry_reason=None,
+    position_id=None,
+    strategy_source="normal",
+    signal_source=None,
+    alpha_symbol=None,
+    alpha_profile=None,
+    alpha_entry_level=None,
+    alpha_score=None,
+    alpha_suggested_position_pct=None,
+):
     conn = get_conn()
     conn.execute(
         """INSERT INTO trades
            (position_id, symbol, side, quantity, entry_price, exit_price, pnl, pnl_pct,
-            exit_reason, entry_reason, entry_time, exit_time, grade_at_entry, score_at_entry)
-           VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'), ?, ?)""",
-        (position_id, symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason, entry_reason, grade, score)
+            exit_reason, entry_reason, entry_time, exit_time, grade_at_entry, score_at_entry,
+            strategy_source, signal_source, alpha_symbol, alpha_profile, alpha_entry_level,
+            alpha_score, alpha_suggested_position_pct)
+           VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            position_id,
+            symbol,
+            side,
+            qty,
+            entry_price,
+            exit_price,
+            pnl,
+            pnl_pct,
+            exit_reason,
+            entry_reason,
+            grade,
+            score,
+            strategy_source,
+            signal_source,
+            alpha_symbol,
+            alpha_profile,
+            alpha_entry_level,
+            alpha_score,
+            alpha_suggested_position_pct,
+        )
     )
     conn.commit()
 
 
-def upsert_position_history(symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value, position_id=None):
+def upsert_position_history(
+    symbol,
+    side,
+    quantity,
+    entry_price,
+    entry_reason,
+    entry_score,
+    tp3_price,
+    atr_value,
+    position_id=None,
+    strategy_source="normal",
+    signal_source=None,
+    alpha_symbol=None,
+    alpha_profile=None,
+    alpha_entry_level=None,
+    alpha_score=None,
+    alpha_suggested_position_pct=None,
+):
     """V3.0 记录/更新开仓信息，重启后可恢复"""
     conn = get_conn()
     existing = conn.execute("SELECT position_id FROM position_history WHERE symbol=?", (symbol,)).fetchone()
@@ -676,8 +1064,9 @@ def upsert_position_history(symbol, side, quantity, entry_price, entry_reason, e
     conn.execute(
         """INSERT INTO position_history
            (symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value,
-            highest_price, position_id, update_time)
-           VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'))
+            highest_price, position_id, strategy_source, signal_source, alpha_symbol,
+            alpha_profile, alpha_entry_level, alpha_score, alpha_suggested_position_pct, update_time)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
            ON CONFLICT(symbol) DO UPDATE SET
              side=excluded.side,
              quantity=excluded.quantity,
@@ -687,9 +1076,34 @@ def upsert_position_history(symbol, side, quantity, entry_price, entry_reason, e
              tp3_price=excluded.tp3_price,
              atr_value=excluded.atr_value,
              position_id=COALESCE(position_history.position_id, excluded.position_id),
+             strategy_source=excluded.strategy_source,
+             signal_source=excluded.signal_source,
+             alpha_symbol=excluded.alpha_symbol,
+             alpha_profile=excluded.alpha_profile,
+             alpha_entry_level=excluded.alpha_entry_level,
+             alpha_score=excluded.alpha_score,
+             alpha_suggested_position_pct=excluded.alpha_suggested_position_pct,
              highest_price=COALESCE(position_history.highest_price, excluded.highest_price),
              update_time=datetime('now')""",
-        (symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value, entry_price, position_id)
+        (
+            symbol,
+            side,
+            quantity,
+            entry_price,
+            entry_reason,
+            entry_score,
+            tp3_price,
+            atr_value,
+            entry_price,
+            position_id,
+            strategy_source,
+            signal_source,
+            alpha_symbol,
+            alpha_profile,
+            alpha_entry_level,
+            alpha_score,
+            alpha_suggested_position_pct,
+        )
     )
     conn.commit()
     conn.close()
@@ -748,7 +1162,14 @@ def fetch_position_trade_groups(limit=100):
                MAX(grade_at_entry) AS grade_at_entry,
                MAX(score_at_entry) AS score_at_entry,
                MAX(entry_reason) AS entry_reason,
-               MAX(source) AS source
+               MAX(source) AS source,
+               MAX(strategy_source) AS strategy_source,
+               MAX(signal_source) AS signal_source,
+               MAX(alpha_symbol) AS alpha_symbol,
+               MAX(alpha_profile) AS alpha_profile,
+               MAX(alpha_entry_level) AS alpha_entry_level,
+               MAX(alpha_score) AS alpha_score,
+               MAX(alpha_suggested_position_pct) AS alpha_suggested_position_pct
            FROM trades
            WHERE source='system'
              AND exit_time IS NOT NULL
@@ -868,6 +1289,237 @@ def fetch_score_history(symbol, limit=100):
         (symbol, limit),
     ).fetchall()
     return list(reversed(rows))
+
+
+def insert_alpha_scan_scores(rows):
+    conn = get_conn()
+    conn.executemany(
+        """INSERT OR REPLACE INTO alpha_scan_scores
+           (time, scan_id, alpha_symbol, base_asset, futures_symbol, alpha_score,
+            discovery_score, momentum_score, liquidity_score, risk_score,
+            tradeability_score, grade, decision, market_price, raw_features,
+            alpha_profile, entry_level, suggested_position_pct, block_reasons,
+            profile_thresholds)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+
+def fetch_latest_alpha_scan():
+    conn = get_conn()
+    scan = conn.execute(
+        "SELECT scan_id, time FROM alpha_scan_scores ORDER BY time DESC LIMIT 1"
+    ).fetchone()
+    if not scan:
+        return None, []
+    rows = conn.execute(
+        """SELECT s.*, a.alpha_name, a.tradeability, a.status, a.volume_24h,
+                  a.liquidity, a.percent_change_24h, a.token_id
+           FROM alpha_scan_scores s
+           LEFT JOIN alpha_symbols a ON a.alpha_symbol = s.alpha_symbol
+           WHERE s.scan_id = ?
+           ORDER BY s.alpha_score DESC""",
+        (scan["scan_id"],),
+    ).fetchall()
+    return scan, rows
+
+
+def fetch_alpha_symbol_detail(alpha_symbol):
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT s.*, a.alpha_name, a.tradeability, a.status, a.volume_24h,
+                  a.liquidity, a.percent_change_24h, a.token_id, a.raw_json AS symbol_raw_json
+           FROM alpha_scan_scores s
+           LEFT JOIN alpha_symbols a ON a.alpha_symbol = s.alpha_symbol
+           WHERE s.alpha_symbol = ?
+           ORDER BY s.time DESC
+           LIMIT 1""",
+        (alpha_symbol,),
+    ).fetchone()
+    return row
+
+
+def fetch_alpha_score_history(alpha_symbol, limit=100):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT time, alpha_score, grade, market_price
+           FROM alpha_scan_scores
+           WHERE alpha_symbol = ?
+           ORDER BY time DESC LIMIT ?""",
+        (alpha_symbol, limit),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def fetch_latest_score_for_symbol(symbol):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM alpha_scores WHERE symbol = ? ORDER BY time DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_alpha_trade_candidate(
+    scan_id,
+    time,
+    alpha_symbol,
+    futures_symbol=None,
+    base_asset=None,
+    alpha_discovery_score=0,
+    alpha_profile=None,
+    alpha_reason=None,
+    raw_alpha=None,
+    normal_score=None,
+    normal_grade=None,
+    normal_side=None,
+    entry_profile=None,
+    entry_status=None,
+    block_reason=None,
+    adapter_quality=0,
+    missing_fields=None,
+    volume_price=None,
+):
+    vp = volume_price or {}
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO alpha_trade_candidates
+               (scan_id, time, alpha_symbol, futures_symbol, base_asset,
+                alpha_discovery_score, alpha_profile, alpha_reason, raw_alpha_json,
+                normal_score, normal_grade, normal_side, entry_profile, entry_status,
+                block_reason, adapter_quality, missing_fields_json,
+                volume_price_state, volume_price_action, volume_price_reasons_json,
+                volume_price_metrics_json, volume_price_max_position_factor, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+               ON CONFLICT(scan_id, alpha_symbol) DO UPDATE SET
+                 time=excluded.time,
+                 futures_symbol=excluded.futures_symbol,
+                 base_asset=excluded.base_asset,
+                 alpha_discovery_score=excluded.alpha_discovery_score,
+                 alpha_profile=excluded.alpha_profile,
+                 alpha_reason=excluded.alpha_reason,
+                 raw_alpha_json=excluded.raw_alpha_json,
+                 normal_score=excluded.normal_score,
+                 normal_grade=excluded.normal_grade,
+                 normal_side=excluded.normal_side,
+                 entry_profile=excluded.entry_profile,
+                 entry_status=excluded.entry_status,
+                 block_reason=excluded.block_reason,
+                 adapter_quality=excluded.adapter_quality,
+                 missing_fields_json=excluded.missing_fields_json,
+                 volume_price_state=excluded.volume_price_state,
+                 volume_price_action=excluded.volume_price_action,
+                 volume_price_reasons_json=excluded.volume_price_reasons_json,
+                 volume_price_metrics_json=excluded.volume_price_metrics_json,
+                 volume_price_max_position_factor=excluded.volume_price_max_position_factor,
+                 updated_at=datetime('now')""",
+            (
+                scan_id,
+                time,
+                alpha_symbol,
+                futures_symbol,
+                base_asset,
+                alpha_discovery_score,
+                alpha_profile,
+                alpha_reason,
+                json.dumps(raw_alpha or {}, ensure_ascii=False),
+                normal_score,
+                normal_grade,
+                normal_side,
+                json.dumps(entry_profile or {}, ensure_ascii=False) if isinstance(entry_profile, (dict, list)) else entry_profile,
+                entry_status,
+                block_reason,
+                adapter_quality,
+                json.dumps(missing_fields or [], ensure_ascii=False),
+                vp.get("state"),
+                vp.get("action"),
+                json.dumps(vp.get("reasons") or [], ensure_ascii=False),
+                json.dumps(vp.get("metrics") or {}, ensure_ascii=False),
+                vp.get("max_position_factor"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_latest_alpha_trade_candidates(limit=200):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT *
+               FROM alpha_trade_candidates
+               ORDER BY time DESC, updated_at DESC, id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_alpha_cooldown(symbol=None, cooldown_type=None, source="alpha"):
+    conn = get_conn()
+    try:
+        where = ["source = ?", "cooldown_until > datetime('now')"]
+        params = [source]
+        if symbol is not None:
+            where.append("(symbol = ? OR symbol = '*')")
+            params.append(symbol)
+        if cooldown_type is not None:
+            where.append("cooldown_type = ?")
+            params.append(cooldown_type)
+        row = conn.execute(
+            f"""SELECT *
+                FROM alpha_cooldowns
+                WHERE {' AND '.join(where)}
+                ORDER BY cooldown_until DESC
+                LIMIT 1""",
+            params,
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def set_alpha_cooldown(symbol, cooldown_type, reason, minutes, source="alpha", loss_count=0):
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO alpha_cooldowns
+               (source, symbol, cooldown_type, reason, cooldown_until, loss_count, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now', ?), ?, datetime('now'))
+               ON CONFLICT(source, symbol, cooldown_type) DO UPDATE SET
+                 reason=excluded.reason,
+                 cooldown_until=excluded.cooldown_until,
+                 loss_count=excluded.loss_count,
+                 updated_at=datetime('now')""",
+            (source, symbol or "*", cooldown_type, reason, f"+{int(minutes)} minutes", int(loss_count or 0)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_active_alpha_cooldowns(limit=100):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT *
+               FROM alpha_cooldowns
+               WHERE cooldown_until > datetime('now')
+               ORDER BY cooldown_until DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # ---- Backtest ----
@@ -1321,13 +1973,47 @@ def fetch_latest_factor_run():
 
 # ---- Orders ----
 
-def insert_order(symbol, side, order_type, quantity, price, status="pending", reason=None, position_id=None):
+def insert_order(
+    symbol,
+    side,
+    order_type,
+    quantity,
+    price,
+    status="pending",
+    reason=None,
+    position_id=None,
+    strategy_source="normal",
+    signal_source=None,
+    alpha_symbol=None,
+    alpha_profile=None,
+    alpha_entry_level=None,
+    alpha_score=None,
+    alpha_suggested_position_pct=None,
+):
     conn = get_conn()
     conn.execute(
         """INSERT INTO orders
-           (position_id, symbol, side, order_type, quantity, price, status, reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (position_id, symbol, side, order_type, quantity, price, status, reason),
+           (position_id, symbol, side, order_type, quantity, price, status, reason,
+            strategy_source, signal_source, alpha_symbol, alpha_profile, alpha_entry_level,
+            alpha_score, alpha_suggested_position_pct)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            position_id,
+            symbol,
+            side,
+            order_type,
+            quantity,
+            price,
+            status,
+            reason,
+            strategy_source,
+            signal_source,
+            alpha_symbol,
+            alpha_profile,
+            alpha_entry_level,
+            alpha_score,
+            alpha_suggested_position_pct,
+        ),
     )
     conn.commit()
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1341,13 +2027,51 @@ def update_order_status(order_id, status):
     conn.commit()
 
 
-def insert_fill(symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id, position_id=None):
+def insert_fill(
+    symbol,
+    order_id,
+    side,
+    quantity,
+    price,
+    realized_pnl,
+    fee,
+    fee_asset,
+    trade_id,
+    position_id=None,
+    strategy_source="normal",
+    signal_source=None,
+    alpha_symbol=None,
+    alpha_profile=None,
+    alpha_entry_level=None,
+    alpha_score=None,
+    alpha_suggested_position_pct=None,
+):
     conn = get_conn()
     conn.execute(
         """INSERT INTO fills
-           (position_id, symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (position_id, symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id),
+           (position_id, symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id,
+            strategy_source, signal_source, alpha_symbol, alpha_profile, alpha_entry_level,
+            alpha_score, alpha_suggested_position_pct)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            position_id,
+            symbol,
+            order_id,
+            side,
+            quantity,
+            price,
+            realized_pnl,
+            fee,
+            fee_asset,
+            trade_id,
+            strategy_source,
+            signal_source,
+            alpha_symbol,
+            alpha_profile,
+            alpha_entry_level,
+            alpha_score,
+            alpha_suggested_position_pct,
+        ),
     )
     conn.commit()
 

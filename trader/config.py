@@ -95,6 +95,24 @@ TRADING_CONFIG = {
             "hard_max": 0.0100,
         },
     },
+    "alpha_trading": {
+        "enabled": True,
+        "testnet_only": True,
+        "allow_short": True,
+        "max_account_exposure": 0.30,
+        "max_positions": 3,
+        "max_normal_reviews_per_loop": 2,
+        "min_score": 68,
+        "signal_ttl_minutes": 45,
+        "volume_price_ttl_minutes": 20,
+        "normal_score_ttl_minutes": 15,
+        "probe_max_position_pct": 0.30,
+        "candidate_max_position_pct": 0.50,
+        "cooldown_minutes": 30,
+        "max_spread_pct": 0.008,
+        "blocked_profiles": ["high_risk_watch"],
+        "allowed_entry_levels": ["probe", "candidate"],
+    },
 }
 
 HARD_FILTERS = {

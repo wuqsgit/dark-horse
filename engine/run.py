@@ -40,8 +40,8 @@ def generate_backtest_review(conn, auto_tune_records=None):
         """SELECT symbol, grade, grade_score, grade_time, max_drawdown,
                   return_6h, return_12h, return_24h, return_48h, win_12h, win_24h
            FROM backtest_results
-           WHERE grade_time >= datetime('now', '-14 days')
-           ORDER BY grade_time DESC"""
+           WHERE datetime(substr(replace(grade_time, 'T', ' '), 1, 19)) >= datetime('now', '-1 day')
+           ORDER BY datetime(substr(replace(grade_time, 'T', ' '), 1, 19)) DESC"""
     ).fetchall()
     trades = []
     try:
@@ -49,8 +49,8 @@ def generate_backtest_review(conn, auto_tune_records=None):
             """SELECT symbol, side, pnl_pct, pnl, exit_reason, entry_time, exit_time,
                       grade_at_entry, score_at_entry
                FROM trades
-               WHERE exit_time >= datetime('now', '-14 days')
-               ORDER BY exit_time DESC"""
+               WHERE datetime(substr(replace(exit_time, 'T', ' '), 1, 19)) >= datetime('now', '-1 day')
+               ORDER BY datetime(substr(replace(exit_time, 'T', ' '), 1, 19)) DESC"""
         ).fetchall()
     except Exception:
         trades = []
@@ -96,23 +96,25 @@ def generate_backtest_review(conn, auto_tune_records=None):
             continue
         max_gain = max(returns)
         max_loss = abs(r["max_drawdown"] or 0)
+        raw_dd = float(r["max_drawdown"] or 0)
         ret24 = r["return_24h"]
         if ret24 is None or (abs(ret24) < 0.0001 and max_gain < 0.01 and max_loss < 0.01):
             continue
         entry_quality = "需要改进"
-        if max_gain >= 0.05 and max_loss < 0.08:
+        if max_gain >= 0.035 and max_loss < 0.08:
             entry_quality = "基本正确"
-        elif max_gain >= 0.10 and max_loss < 0.12:
+        elif max_gain >= 0.07 and max_loss < 0.12:
             entry_quality = "可接受"
         exit_quality = "基本正确"
-        if ret24 > 0.05:
+        if ret24 > 0.035 or (max_gain >= 0.05 and ret24 > 0.015):
             exit_quality = "偏早"
-        elif ret24 < -0.05:
+        elif ret24 < -0.03 or max_loss >= 0.06:
             exit_quality = "保护有效"
         item = {
             "symbol": r["symbol"],
             "grade": r["grade"],
             "score": round(r["grade_score"] or 0, 1),
+            "grade_time": r["grade_time"],
             "max_gain_pct": round(max_gain * 100, 2),
             "max_dd_pct": round((r["max_drawdown"] or 0) * 100, 2),
             "ret_6h_pct": round((r["return_6h"] or 0) * 100, 2),
@@ -121,27 +123,89 @@ def generate_backtest_review(conn, auto_tune_records=None):
             "exit_quality": exit_quality,
         }
         if entry_quality == "需要改进":
+            item["reason"] = "入场后空间不足或回撤偏大"
+            item["_severity"] = abs(min(ret24 or 0, 0)) * 100 + abs(min(raw_dd, 0)) * 50 + max(0, 0.015 - max_gain) * 100
+            item["_type"] = "entry"
             review["entry_issues"].append(item)
         elif exit_quality == "偏早":
+            item["reason"] = "信号后仍有上行空间，退出可能偏早"
+            item["_severity"] = max_gain * 100 + (ret24 or 0) * 50
+            item["_type"] = "exit"
             review["exit_issues"].append(item)
         elif exit_quality == "保护有效":
+            item["reason"] = "后续走弱或回撤偏大，平仓保护有效"
+            item["_severity"] = max_loss * 100
             review["good_exits"].append(item)
 
-    review["entry_issues"] = sorted(review["entry_issues"], key=lambda x: x["max_dd_pct"])[:50]
-    review["exit_issues"] = sorted(review["exit_issues"], key=lambda x: -x["ret_24h_pct"])[:50]
-    review["good_exits"] = sorted(review["good_exits"], key=lambda x: x["ret_24h_pct"])[:50]
+    live_good = []
+    for t in trades:
+        pnl_pct = float(t["pnl_pct"] or 0)
+        reason = str(t["exit_reason"] or "")
+        if pnl_pct > 0 or any(x in reason for x in ("TP1", "TP2", "trailing_stop")):
+            live_good.append({
+                "symbol": t["symbol"],
+                "grade": t["grade_at_entry"] or "-",
+                "score": round(float(t["score_at_entry"] or 0), 1),
+                "grade_time": t["exit_time"],
+                "max_gain_pct": round(max(pnl_pct, 0), 2),
+                "max_dd_pct": 0,
+                "ret_6h_pct": round(pnl_pct, 2),
+                "ret_24h_pct": round(pnl_pct, 2),
+                "entry_quality": "实盘验证",
+                "exit_quality": "有效做法",
+                "reason": reason or "最近 24h 盈利退出",
+                "_severity": abs(pnl_pct),
+            })
+
+    issue_pool = review["entry_issues"] + review["exit_issues"]
+    sorted_issues = sorted(issue_pool, key=lambda x: x.get("_severity", 0), reverse=True)
+    unique_issues = []
+    seen_symbols = set()
+    for item in sorted_issues:
+        symbol_key = item.get("symbol")
+        if symbol_key in seen_symbols:
+            continue
+        seen_symbols.add(symbol_key)
+        unique_issues.append(item)
+        if len(unique_issues) >= 10:
+            break
+    if len(unique_issues) < 10:
+        seen_ids = {(x.get("symbol"), x.get("grade_time"), x.get("_type")) for x in unique_issues}
+        for item in sorted_issues:
+            item_id = (item.get("symbol"), item.get("grade_time"), item.get("_type"))
+            if item_id in seen_ids:
+                continue
+            unique_issues.append(item)
+            seen_ids.add(item_id)
+            if len(unique_issues) >= 10:
+                break
+    issue_pool = unique_issues
+    review["entry_issues"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in issue_pool if x.get("_type") == "entry"]
+    review["exit_issues"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in issue_pool if x.get("_type") == "exit"]
+    good_pool = live_good + review["good_exits"]
+    unique_good = []
+    seen_good_symbols = set()
+    for item in sorted(good_pool, key=lambda x: x.get("_severity", 0), reverse=True):
+        symbol_key = item.get("symbol")
+        if symbol_key in seen_good_symbols:
+            continue
+        seen_good_symbols.add(symbol_key)
+        unique_good.append(item)
+        if len(unique_good) >= 5:
+            break
+    review["good_exits"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in unique_good]
     review["rules"] = [
         {
             "section": "总体判断",
             "text": (
-                f"本轮回测 {total_samples} 个近两周样本；"
-                f"开仓需改进 {len(review['entry_issues'])} 个，平仓偏早 {len(review['exit_issues'])} 个，"
-                f"平仓保护有效 {len(review['good_exits'])} 个。"
+                f"本轮只看最近 1 天样本 {total_samples} 个；"
+                f"重点问题只展示 {len(issue_pool)} 个，其中开仓问题 {len(review['entry_issues'])} 个，"
+                f"平仓偏早 {len(review['exit_issues'])} 个，有效做法 {len(review['good_exits'])} 个。"
             ),
         },
-        {"section": "开仓问题", "text": "重点过滤入场后先大幅回撤、最大浮盈不足的样本。"},
+        {"section": "开仓问题", "text": "最近需要特别注意的是入场后最大浮盈不足、或先出现较大回撤的信号。"},
         {"section": "平仓问题", "text": "偏早退出样本说明尾仓应结合价格回撤、评分、OI 和筹码同步转弱再全平。"},
-        {"section": "有效做法", "text": "保护利润和转弱退出仍有价值，不能直接取消。"},
+        {"section": "有效做法", "text": "最近 1 天盈利退出、TP 或保护型退出会进入有效做法，用来保留真正有用的规则。"},
     ]
     if auto_tune_records:
         review["auto_tune"] = {
@@ -305,14 +369,20 @@ async def run_backtest():
             logger.info("No scores for backtest")
             return
 
-        cols = ["time","symbol","composite_score","composite_summary","market_price"]
+        cols = ["time","symbol","composite_score","composite_summary","market_price","raw_features"]
         df_scores = pd.DataFrame([dict(zip(cols, [s[c] for c in cols])) for s in scores])
+        df_scores["time"] = pd.to_datetime(df_scores["time"], errors="coerce", utc=True)
+        df_scores["composite_score"] = pd.to_numeric(df_scores["composite_score"], errors="coerce")
+        df_scores["market_price"] = pd.to_numeric(df_scores["market_price"], errors="coerce")
+        df_scores = df_scores.dropna(subset=["time", "symbol"])
 
         symbols = df_scores["symbol"].unique().tolist()
         prices_raw = fetch_price_history(symbols)
         price_cols = ["time_bucket","symbol","close"]
         df_prices = pd.DataFrame([dict(zip(price_cols, [p[c] for c in price_cols])) for p in prices_raw])
-        df_prices["time_bucket"] = pd.to_datetime(df_prices["time_bucket"])
+        df_prices["time_bucket"] = pd.to_datetime(df_prices["time_bucket"], errors="coerce", utc=True)
+        df_prices["close"] = pd.to_numeric(df_prices["close"], errors="coerce")
+        df_prices = df_prices.dropna(subset=["time_bucket", "symbol", "close"])
 
         logger.info(f"Backtest: {len(df_scores)} scores, {len(df_prices)} prices")
 
@@ -335,6 +405,21 @@ async def run_backtest():
             ]
             insert_backtest(db_rows)
             logger.info(f"Saved {len(db_rows)} backtest results")
+            try:
+                cleanup_conn = get_conn()
+                deleted = cleanup_conn.execute(
+                    """DELETE FROM backtest_results
+                       WHERE return_6h IS NULL
+                         AND return_12h IS NULL
+                         AND return_24h IS NULL
+                         AND return_48h IS NULL"""
+                ).rowcount
+                cleanup_conn.commit()
+                cleanup_conn.close()
+                if deleted:
+                    logger.info(f"Removed {deleted} immature backtest rows without future returns")
+            except Exception as e:
+                logger.warning(f"Backtest immature cleanup failed: {e}")
 
             # ── 🆕 更新 training_samples 的未来收益标签 ──
             try:
@@ -419,7 +504,7 @@ async def run_backtest():
             cfg = None
             for p in cfg_paths:
                 if p.exists():
-                    with open(p) as f:
+                    with open(p, encoding="utf-8") as f:
                         cfg = json.load(f)
                     break
 
@@ -503,7 +588,7 @@ async def run_backtest():
 
                 if changed:
                     cfg_path = cfg_paths[0]
-                    with open(cfg_path, "w") as f:
+                    with open(cfg_path, "w", encoding="utf-8") as f:
                         json.dump(cfg, f, ensure_ascii=False, indent=2)
                     logger.info(f"  [auto-tune] ✅ 自动调整阈值已写入 {cfg_path}")
                 else:
@@ -539,11 +624,15 @@ async def run_backtest():
 
         # ── 🔧 因子归因分析 ──
         try:
-            if results:
-                factor_rows = compute_factor_performance(results, df_scores)
+            matured_results = [
+                r for r in results
+                if any(r.get(k) is not None for k in ("return_6h", "return_12h", "return_24h", "return_48h"))
+            ] if results else []
+            if matured_results:
+                factor_rows = compute_factor_performance(matured_results, df_scores)
                 if factor_rows:
                     insert_factor_performance(factor_rows)
-                    effectiveness_rows = compute_layer_effectiveness(results, df_scores)
+                    effectiveness_rows = compute_layer_effectiveness(matured_results, df_scores)
                     factor_result = build_factor_analysis_result(factor_rows, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
                     conn = get_conn()
                     write_factor_effectiveness(conn, effectiveness_rows)
@@ -556,6 +645,8 @@ async def run_backtest():
                     except Exception as e:
                         logger.warning(f"Factor learning candidate generation failed: {e}")
                     logger.info(f"Saved {len(factor_rows)} factor performance records")
+            elif results:
+                logger.info("Factor analysis skipped: no matured backtest returns yet")
         except Exception as e:
             logger.warning(f"Factor analysis error: {e}")
 
@@ -590,7 +681,13 @@ def compute_factor_performance(results, df_scores):
             nearest = score_rows.iloc[-1] if not score_rows.empty else None
         if nearest is None:
             continue
-        ret_12h = r.get("return_12h")
+        ret_12h = (
+            r.get("return_24h")
+            if r.get("return_24h") is not None
+            else r.get("return_12h")
+            if r.get("return_12h") is not None
+            else r.get("return_6h")
+        )
         mdd = r.get("max_drawdown", 0)
         if ret_12h is None:
             continue
@@ -677,7 +774,7 @@ def compute_layer_effectiveness(results, df_scores):
                 continue
             buckets[(factor_name, layer, profile, bucket)].append({
                 "ret_6h": r.get("return_6h"),
-                "ret_24h": r.get("return_24h"),
+            "ret_24h": r.get("return_24h") if r.get("return_24h") is not None else r.get("return_12h") if r.get("return_12h") is not None else r.get("return_6h"),
                 "mdd": r.get("max_drawdown", 0),
             })
     rows = []
@@ -710,7 +807,7 @@ def adjust_weights_24h():
     weights_path = Path(__file__).parent / "factor_weights.json"
     if not weights_path.exists():
         return
-    with open(weights_path) as f:
+    with open(weights_path, encoding="utf-8") as f:
         weights = json.load(f)
     sub_w = weights.get("sub_weights", {})
     if not sub_w:
@@ -737,7 +834,7 @@ def adjust_weights_24h():
                 sub_w[mapped] = max(0.05, sub_w[mapped] * 0.5); changed = True
     if changed:
         weights["sub_weights"] = sub_w
-        with open(weights_path, "w") as f:
+        with open(weights_path, "w", encoding="utf-8") as f:
             json.dump(weights, f, ensure_ascii=False, indent=2)
         logger.info(f"[weight-adjust] Factor weights adjusted")
     else:

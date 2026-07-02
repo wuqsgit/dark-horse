@@ -203,6 +203,7 @@ export default function BacktestPanel() {
     const grades = summary?.grades || [];
     const latestRun = summary?.latest_run;
     const decisionSummary = summary?.decision_summary || {};
+    const backtestStatus = summary?.backtest_status || {};
     const stageCounts = Object.fromEntries((decisionSummary.stage_counts || []).map(x => [x.stage, x.count]));
     const resultCounts = Object.fromEntries((decisionSummary.result_counts || []).map(x => [x.result, x.count]));
     if (grades.length > 0) {
@@ -336,8 +337,81 @@ export default function BacktestPanel() {
       );
     }
 
-    // 没有 summary 时显示 loading
-    return <div style={{ color: '#6b7280', padding: 40, textAlign: 'center' }}>加载中...</div>;
+    if (!summary) {
+      return <div style={{ color: '#6b7280', padding: 40, textAlign: 'center' }}>加载中...</div>;
+    }
+
+    const fmtTime = (value) => value ? new Date(value).toLocaleString('zh-CN') : '--';
+    return (
+      <div className="trading-section" style={{ background: '#111827' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, marginBottom: 14 }}>
+          <h3 style={{ margin: 0, color: '#f8fafc', fontSize: 18 }}>暂无成熟回测概览</h3>
+          <span style={{ color: '#94a3b8', fontSize: 12 }}>
+            {backtestStatus.waiting_for_mature_returns ? '等待收益窗口成熟' : '等待回测产出'}
+          </span>
+        </div>
+        <div style={{
+          border: '1px solid #243246',
+          borderRadius: 8,
+          padding: 14,
+          color: '#cbd5e1',
+          background: '#0b1220',
+          marginBottom: 14,
+          lineHeight: 1.7
+        }}>
+          {backtestStatus.plain || '回测接口已返回，但当前没有可展示的等级收益数据。'}
+        </div>
+        <div className="backtest-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', marginBottom: 16 }}>
+          <div className="bt-card">
+            <h3>成熟回测样本</h3>
+            <div className="value">{backtestStatus.backtest_rows || 0}</div>
+            <div className="detail">生成等级收益概览后会显示</div>
+          </div>
+          <div className="bt-card">
+            <h3>扫描评分样本</h3>
+            <div className="value positive">{backtestStatus.score_count || 0}</div>
+            <div className="detail">最新: {fmtTime(backtestStatus.score_max_time)}</div>
+          </div>
+          <div className="bt-card">
+            <h3>最新 1h 行情</h3>
+            <div className="value" style={{ fontSize: 16 }}>{fmtTime(backtestStatus.latest_price_time)}</div>
+            <div className="detail">用于计算未来收益</div>
+          </div>
+          <div className="bt-card">
+            <h3>复盘记录</h3>
+            <div className="value">{backtestStatus.review_rows || 0}</div>
+            <div className="detail">最近: {fmtTime(backtestStatus.latest_review_time)}</div>
+          </div>
+        </div>
+        {decisionSummary.latest_run_id && (
+          <div style={{ borderTop: '1px solid #243246', paddingTop: 14 }}>
+            <div style={{ color: '#38bdf8', fontSize: 14, fontWeight: 700, marginBottom: 10 }}>策略决策日志仍然可用</div>
+            <div className="backtest-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))' }}>
+              <div className="bt-card">
+                <h3>本轮记录</h3>
+                <div className="value">{decisionSummary.total || 0}</div>
+                <div className="detail">run: {(decisionSummary.latest_run_id || '').slice(0, 26)}</div>
+              </div>
+              <div className="bt-card">
+                <h3>扫描信号</h3>
+                <div className="value">{stageCounts.scan || 0}</div>
+                <div className="detail">进入学习样本池</div>
+              </div>
+              <div className="bt-card">
+                <h3>候选过滤</h3>
+                <div className="value negative">{stageCounts.candidate_filter || 0}</div>
+                <div className="detail">记录未开仓原因</div>
+              </div>
+              <div className="bt-card">
+                <h3>计划开仓</h3>
+                <div className="value positive">{resultCounts.planned_open || 0}</div>
+                <div className="detail">进入执行前候选</div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   // 复盘分析：显示详细问题分析（review 数据）
@@ -380,10 +454,11 @@ export default function BacktestPanel() {
         <div className="trading-section" style={{ background: '#111827' }}>
           <h3 style={{ fontSize: 14, marginBottom: 8 }}>📈 总体判断</h3>
           <div style={{ fontSize: 12, color: '#9ca3af', lineHeight: 1.7 }}>
-            本轮复盘 {overview.total_samples || 0} 个近两周已评分样本；
+            本轮复盘 {overview.total_samples || 0} 个{overview.review_window || '最近 1 天'}已评分样本；
             其中 {overview.gave_space_5pct || 0} 个在持仓内曾给出超过 5% 的顺势空间，
             {overview.had_drawdown_8pct || 0} 个出现超过 8% 的持仓内回撤。
             <br /><br />
+            最近重点问题共 <strong style={{ color: '#fbbf24' }}>{entryIssues.length + exitIssues.length}</strong> 个；
             开仓需改进 <strong style={{ color: '#fbbf24' }}>{entryIssues.length}</strong> 个，
             主要问题是入场后先承受较大回撤或最大浮盈不足；
             平仓偏早 <strong style={{ color: '#f87171' }}>{exitIssues.length}</strong> 个，
@@ -435,7 +510,7 @@ export default function BacktestPanel() {
                 <tr><th>币种</th><th>等级</th><th>最大浮盈</th><th>最大回撤</th><th>6h收益</th><th>24h收益</th><th>开仓</th><th>平仓</th></tr>
               </thead>
               <tbody>
-                {entryIssues.slice(0, 8).map((e, i) => (
+                {entryIssues.slice(0, 10).map((e, i) => (
                   <tr key={i}>
                     <td style={{ fontWeight: 600 }}>{e.symbol}</td>
                     <td><span className={`grade-${e.grade || 'B'}`}>{e.grade || '-'}</span></td>
@@ -450,9 +525,9 @@ export default function BacktestPanel() {
               </tbody>
             </table>
           </div>
-          {entryIssues.length > 8 && (
+          {entryIssues.length > 10 && (
             <div style={{ color: '#6b7280', fontSize: 11, marginTop: 6 }}>
-              还有 {entryIssues.length - 8} 个...
+              还有 {entryIssues.length - 10} 个...
             </div>
           )}
         </div>
@@ -470,7 +545,7 @@ export default function BacktestPanel() {
                 <tr><th>币种</th><th>等级</th><th>最大浮盈</th><th>最大回撤</th><th>6h收益</th><th>24h收益</th><th>开仓</th><th>平仓</th></tr>
               </thead>
               <tbody>
-                {exitIssues.slice(0, 8).map((e, i) => (
+                {exitIssues.slice(0, 10).map((e, i) => (
                   <tr key={i}>
                     <td style={{ fontWeight: 600 }}>{e.symbol}</td>
                     <td><span className={`grade-${e.grade || 'B'}`}>{e.grade || '-'}</span></td>
@@ -485,9 +560,9 @@ export default function BacktestPanel() {
               </tbody>
             </table>
           </div>
-          {exitIssues.length > 8 && (
+          {exitIssues.length > 10 && (
             <div style={{ color: '#6b7280', fontSize: 11, marginTop: 6 }}>
-              还有 {exitIssues.length - 8} 个...
+              还有 {exitIssues.length - 10} 个...
             </div>
           )}
         </div>

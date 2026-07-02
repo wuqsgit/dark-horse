@@ -29,6 +29,35 @@
         }
       ],
       "description": "composite_score 的 60-69 桶明显优于 50-59 桶"
+    },
+    "funding_rate": {
+      "weight": 5,
+      "source": "funding_rate",
+      "mapping": "thresholds",
+      "default": 50,
+      "thresholds": [
+        {
+          "max": 30,
+          "score": 80
+        },
+        {
+          "max": 50,
+          "score": 65
+        },
+        {
+          "max": 70,
+          "score": 50
+        },
+        {
+          "max": 85,
+          "score": 35
+        },
+        {
+          "max": 999,
+          "score": 20
+        }
+      ],
+      "description": "funding_rate 的 0.05%~0.1% 桶明显优于 <-0.1% 桶"
     }
   },
   "sub_weights": {

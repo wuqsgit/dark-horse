@@ -32,6 +32,15 @@ class WalkForwardBacktest:
         """
         if df_scores.empty or df_prices.empty:
             return None
+
+        df_scores = df_scores.copy()
+        df_prices = df_prices.copy()
+        df_scores["time"] = pd.to_datetime(df_scores["time"], errors="coerce", utc=True)
+        df_prices["time_bucket"] = pd.to_datetime(df_prices["time_bucket"], errors="coerce", utc=True)
+        df_scores = df_scores.dropna(subset=["time"])
+        df_prices = df_prices.dropna(subset=["time_bucket"])
+        if df_scores.empty or df_prices.empty:
+            return None
         
         # 按时间排序
         df_scores = df_scores.sort_values("time")
@@ -74,8 +83,12 @@ class WalkForwardBacktest:
         if scores.empty:
             return {"label": label, "count": 0}
         
-        win_12h = scores[scores.get("return_12h", pd.Series([None]*len(scores))) > 0]
-        avg_ret = scores["return_12h"].mean() if "return_12h" in scores.columns else 0
+        returns = pd.to_numeric(
+            scores["return_12h"] if "return_12h" in scores.columns else pd.Series([None] * len(scores), index=scores.index),
+            errors="coerce",
+        )
+        win_12h = returns[returns > 0]
+        avg_ret = returns.mean() if not returns.empty else 0
         
         return {
             "label": label,
@@ -276,8 +289,8 @@ class EventDrivenBacktest:
         
         for _, score_row in df_scores.iterrows():
             sym = score_row["symbol"]
-            score = score_row.get("composite_score", 50)
-            price = score_row.get("market_price", 0)
+            score = float(score_row.get("composite_score", 50) or 50)
+            price = float(score_row.get("market_price", 0) or 0)
             time = score_row["time"]
             
             if price == 0:
@@ -295,6 +308,7 @@ class EventDrivenBacktest:
                 
                 positions.append({
                     "symbol": sym,
+                    "side": "LONG",
                     "entry_price": entry_price,
                     "qty": qty,
                     "entry_time": time,

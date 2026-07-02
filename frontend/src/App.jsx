@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import ScanTable from './components/ScanTable';
+import AlphaScan from './components/AlphaScan';
 import BacktestPanel from './components/BacktestPanel';
 import LiveTrading from './components/LiveTrading';
 import './styles.css';
@@ -19,6 +20,7 @@ export default function App() {
         </div>
         <nav className="nav">
           <button className={currentPage === 'scan' ? 'active' : ''} onClick={() => setCurrentPage('scan')}>扫描</button>
+          <button className={currentPage === 'alpha' ? 'active' : ''} onClick={() => setCurrentPage('alpha')}>Alpha 扫描</button>
           <button className={currentPage === 'backtest' ? 'active' : ''} onClick={() => setCurrentPage('backtest')}>回测</button>
           <button className={currentPage === 'trading' ? 'active' : ''} onClick={() => setCurrentPage('trading')}>实盘</button>
         </nav>
@@ -30,7 +32,8 @@ export default function App() {
 
       <main className="main">
         {currentPage === 'scan' && <ScanTable />}
-        {currentPage === 'backtest' && <BacktestPanel API={{ get: (url) => fetch(`/api${url}`).then(r => r.json()) }} />}
+        {currentPage === 'alpha' && <AlphaScan />}
+        {currentPage === 'backtest' && <BacktestPanel API={{ get: (url) => fetch(`/api${url}`).then((r) => r.json()) }} />}
         {currentPage === 'trading' && <LiveTrading API="/api" />}
       </main>
     </div>

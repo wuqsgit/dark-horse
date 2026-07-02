@@ -1162,19 +1162,29 @@ class ScoringEngine:
         price_index = {}
         for sym in df_prices["symbol"].unique():
             sub = df_prices[df_prices["symbol"]==sym].sort_values("time_bucket")
-            price_index[sym] = (sub["time_bucket"].values, sub["close"].values)
+            times = pd.to_datetime(sub["time_bucket"], errors="coerce", utc=True).dt.tz_convert(None)
+            closes = pd.to_numeric(sub["close"], errors="coerce")
+            valid = times.notna() & closes.notna()
+            price_index[sym] = (times[valid].dt.to_pydatetime().tolist(), closes[valid].astype(float).tolist())
         for sym in df_scores["symbol"].unique():
             ss = df_scores[df_scores["symbol"]==sym].sort_values("time")
             ts, cs = price_index.get(sym, (None, None))
             if ts is None or len(ts) == 0: continue
             for _, row in ss.iterrows():
                 gt = row["time"]
-                if not isinstance(gt, (pd.Timestamp, datetime)): gt = pd.to_datetime(gt)
+                if not isinstance(gt, (pd.Timestamp, datetime)): gt = pd.to_datetime(gt, errors="coerce", utc=True)
+                if pd.isna(gt):
+                    continue
                 grade = row.get("composite_summary","B")
                 gs = row.get("composite_score",50)
-                pa = row.get("market_price",0)
+                pa = float(row.get("market_price",0) or 0)
                 if pa == 0: continue
-                gt2 = gt.tz_localize(None) if hasattr(gt,"tz") and gt.tz is not None else gt
+                if isinstance(gt, pd.Timestamp):
+                    gt2 = gt.tz_convert(None).to_pydatetime() if gt.tz is not None else gt.to_pydatetime()
+                elif getattr(gt, "tzinfo", None) is not None:
+                    gt2 = gt.astimezone(timezone.utc).replace(tzinfo=None)
+                else:
+                    gt2 = gt
                 idx = bisect_left(ts, gt2)
                 rets = {}
                 for lb, h in [("return_6h",6),("return_12h",12),("return_24h",24),("return_48h",48)]:
