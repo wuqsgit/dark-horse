@@ -533,6 +533,21 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_alpha_cooldowns_until ON alpha_cooldowns(cooldown_until);
         CREATE INDEX IF NOT EXISTS idx_alpha_cooldowns_symbol ON alpha_cooldowns(symbol);
+        CREATE TABLE IF NOT EXISTS position_roll_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id TEXT,
+            symbol TEXT NOT NULL,
+            position_side TEXT,
+            strategy_source TEXT DEFAULT 'normal',
+            roll_layer INTEGER,
+            roll_qty REAL,
+            roll_price REAL,
+            roll_reason TEXT,
+            risk_before_json TEXT,
+            risk_after_json TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_position_roll_events_symbol ON position_roll_events(symbol, created_at DESC);
     """)
     _ensure_column(conn, "positions_history", "position_side", "TEXT")
     _ensure_column(conn, "positions_history", "mark_price", "REAL")
@@ -570,6 +585,13 @@ def init_db():
         "tp2_hit": "INTEGER DEFAULT 0",
         "highest_price": "REAL",
         "last_exit_reason": "TEXT",
+        "roll_layer": "INTEGER DEFAULT 0",
+        "last_roll_time": "TEXT",
+        "roll_parent_trade_id": "TEXT",
+        "protected_profit": "REAL DEFAULT 0",
+        "max_floating_pnl": "REAL DEFAULT 0",
+        "roll_enabled": "INTEGER DEFAULT 0",
+        "roll_block_reason": "TEXT",
     }.items():
         _ensure_column(conn, "position_history", column, ddl)
     for column, ddl in {
@@ -1128,7 +1150,20 @@ def delete_position_history(symbol):
 
 def update_position_management(symbol, **fields):
     """Update live position management state without resetting the entry record."""
-    allowed = {"quantity", "highest_price", "tp1_hit", "tp2_hit", "last_exit_reason"}
+    allowed = {
+        "quantity",
+        "entry_price",
+        "highest_price",
+        "tp1_hit",
+        "tp2_hit",
+        "last_exit_reason",
+        "roll_layer",
+        "last_roll_time",
+        "protected_profit",
+        "max_floating_pnl",
+        "roll_enabled",
+        "roll_block_reason",
+    }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
@@ -1138,6 +1173,41 @@ def update_position_management(symbol, **fields):
     conn.execute(
         f"UPDATE position_history SET {assignments}, update_time=datetime('now') WHERE symbol=?",
         values,
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_position_roll_event(
+    symbol,
+    position_side,
+    strategy_source,
+    roll_layer,
+    roll_qty,
+    roll_price,
+    roll_reason,
+    position_id=None,
+    risk_before=None,
+    risk_after=None,
+):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO position_roll_events
+           (position_id, symbol, position_side, strategy_source, roll_layer, roll_qty,
+            roll_price, roll_reason, risk_before_json, risk_after_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            position_id,
+            symbol,
+            position_side,
+            strategy_source,
+            roll_layer,
+            roll_qty,
+            roll_price,
+            roll_reason,
+            json.dumps(risk_before or {}, ensure_ascii=False),
+            json.dumps(risk_after or {}, ensure_ascii=False),
+        ),
     )
     conn.commit()
     conn.close()

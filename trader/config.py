@@ -113,6 +113,24 @@ TRADING_CONFIG = {
         "blocked_profiles": ["high_risk_watch"],
         "allowed_entry_levels": ["probe", "candidate"],
     },
+    "roll_trading": {
+        "enabled": True,
+        "max_layers": 2,
+        "size_factors": [0.50, 0.25],
+        "min_profit_pct": 5.0,
+        "min_profit_r": 1.0,
+        "cooldown_minutes": 60,
+        "max_giveback_pct": 35.0,
+        "max_15m_return_pct": 4.0,
+        "max_1h_return_pct": 8.0,
+        "max_spread_pct": 0.0012,
+        "alpha_size_factor": 0.50,
+        "spread_degraded_size_factor": 0.50,
+        "lock_profit_pct": 0.30,
+        "allowed_normal_keywords": ["trend", "breakout", "pullback", "momentum", "趋势", "突破", "回踩", "动量"],
+        "allowed_alpha_states": ["breakout_pullback", "accumulation_volume"],
+        "blocked_alpha_profiles": ["high_risk_watch"],
+    },
 }
 
 HARD_FILTERS = {

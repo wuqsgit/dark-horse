@@ -277,6 +277,9 @@ export default function LiveTrading() {
                     <div>TP1：{p.tp1_hit ? '已减过仓' : '未触发'} · TP2：{p.tp2_hit ? '已减过仓' : '未触发'}</div>
                     <div>最高跟踪价：{p.highest_price ? `$${fmt(p.highest_price, 4)}` : '-'}</div>
                     <div>上次系统动作：{p.last_exit_plain || p.last_exit_reason || '暂无'}</div>
+                    <div>滚仓层数：{p.roll_layer || 0}/2 · 保护利润：${fmt(p.protected_profit || 0)}</div>
+                    <div>最高浮盈：${fmt(p.max_floating_pnl || 0)} · {p.roll_enabled ? '允许滚仓观察' : '暂不滚仓'}</div>
+                    {p.roll_block_reason && <div>滚仓阻断：{p.roll_block_reason}</div>}
                   </div>
                 </div>
               </div>

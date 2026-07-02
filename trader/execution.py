@@ -862,6 +862,235 @@ class ExecutionEngine:
 
         return actions
 
+    def _roll_profile_allowed(self, hist: dict, latest: dict, raw: dict) -> tuple[bool, str]:
+        cfg = self.cfg.get("roll_trading") or {}
+        strategy_source = hist.get("strategy_source") or "normal"
+        entry_reason = str(hist.get("entry_reason") or "").lower()
+        if strategy_source == "alpha":
+            alpha_profile = hist.get("alpha_profile")
+            if alpha_profile in set(cfg.get("blocked_alpha_profiles") or []):
+                return False, f"alpha profile blocked: {alpha_profile}"
+            allowed_states = [str(x).lower() for x in (cfg.get("allowed_alpha_states") or [])]
+            if any(state in entry_reason for state in allowed_states):
+                return True, "alpha volume-price trend state"
+            if float(hist.get("alpha_score") or 0) >= 75 and alpha_profile in ("momentum_continuation", "futures_mapped"):
+                return True, "alpha strong mapped trend"
+            return False, "alpha profile is not roll-enabled"
+
+        keywords = [str(x).lower() for x in (cfg.get("allowed_normal_keywords") or [])]
+        trend_text = " ".join(
+            str(x or "").lower()
+            for x in (
+                hist.get("entry_reason"),
+                latest.get("trend_state"),
+                latest.get("trend_direction"),
+                latest.get("risk_label"),
+                latest.get("price_position"),
+            )
+        )
+        if any(k in trend_text for k in keywords):
+            return True, "normal trend/breakout profile"
+        if float(latest.get("composite_score") or hist.get("entry_score") or 0) >= 72:
+            return True, "normal high score trend candidate"
+        return False, "position type is not roll-enabled"
+
+    def _build_roll_actions(self, top_symbols: list, current_positions: list, planned_actions: list, balance: float, run_id: str | None = None) -> list:
+        from shared.db import get_position_history, update_position_management
+
+        cfg = self.cfg.get("roll_trading") or {}
+        if not cfg.get("enabled", False):
+            return []
+
+        actions = []
+        latest_map = _latest_by_symbol(top_symbols)
+        blocked_symbols = {a.get("symbol") for a in planned_actions if a.get("action") in ("close", "partial_close")}
+        max_layers = int(cfg.get("max_layers", 2))
+        size_factors = list(cfg.get("size_factors") or [0.5, 0.25])
+        min_profit_pct = float(cfg.get("min_profit_pct", 5.0))
+        max_giveback_pct = float(cfg.get("max_giveback_pct", 35.0))
+        cooldown_minutes = float(cfg.get("cooldown_minutes", 60))
+        max_15m = float(cfg.get("max_15m_return_pct", 4.0))
+        max_1h = float(cfg.get("max_1h_return_pct", 8.0))
+        max_spread = float(cfg.get("max_spread_pct", 0.0012))
+        alpha_size_factor = float(cfg.get("alpha_size_factor", 0.5))
+        spread_degraded_factor = float(cfg.get("spread_degraded_size_factor", 0.5))
+        lock_profit_pct = float(cfg.get("lock_profit_pct", 0.30))
+
+        for pos in current_positions:
+            sym = pos.get("symbol")
+            if not sym or sym in blocked_symbols:
+                continue
+
+            hist = get_position_history(sym) or {}
+            latest = latest_map.get(sym) or {}
+            raw = _raw_features(latest)
+            tech = raw.get("technical") or {}
+            depth = raw.get("depth") or {}
+            strategy_source = hist.get("strategy_source") or "normal"
+            side = pos.get("side")
+            mark_price = float(pos.get("mark_price") or 0)
+            entry_price = float(pos.get("entry_price") or 0)
+            quantity = float(pos.get("quantity") or 0)
+            leverage = max(float(pos.get("leverage") or 1), 1)
+            pnl = float(pos.get("unrealized_pnl") or 0)
+            margin = entry_price * quantity / leverage if entry_price and quantity else 0
+            pnl_pct = pnl / margin * 100 if margin else 0.0
+            roll_layer = int(hist.get("roll_layer") or 0)
+            max_floating_pnl = max(float(hist.get("max_floating_pnl") or 0), pnl)
+            giveback_pct = ((max_floating_pnl - pnl) / max_floating_pnl * 100) if max_floating_pnl > 0 else 0.0
+
+            def block(reason):
+                update_position_management(
+                    sym,
+                    roll_enabled=0,
+                    roll_block_reason=reason,
+                    max_floating_pnl=max_floating_pnl,
+                )
+                self._record_decision(
+                    sym,
+                    run_id=run_id,
+                    side=side,
+                    decision_stage="roll_position",
+                    decision_result="filtered",
+                    filter_reason=reason,
+                    risk_params={
+                        "roll_layer": roll_layer,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "max_floating_pnl": max_floating_pnl,
+                        "giveback_pct": giveback_pct,
+                        "strategy_source": strategy_source,
+                    },
+                )
+
+            if roll_layer >= max_layers:
+                block(f"max roll layers reached {roll_layer}/{max_layers}")
+                continue
+            if pnl_pct < min_profit_pct:
+                block(f"profit {pnl_pct:.1f}% < roll trigger {min_profit_pct:.1f}%")
+                continue
+            if not int(hist.get("tp1_hit") or 0):
+                block("TP1 not locked yet; wait before roll")
+                continue
+            if max_floating_pnl > 0 and giveback_pct > max_giveback_pct:
+                block(f"profit giveback {giveback_pct:.1f}% > {max_giveback_pct:.1f}%")
+                continue
+            last_roll_age = _age_hours(hist.get("last_roll_time"))
+            if last_roll_age is not None and last_roll_age * 60 < cooldown_minutes:
+                block(f"roll cooldown {last_roll_age * 60:.0f}m < {cooldown_minutes:.0f}m")
+                continue
+            allowed, allowed_reason = self._roll_profile_allowed(hist, latest, raw)
+            if not allowed:
+                block(allowed_reason)
+                continue
+
+            ret_15m = float(tech.get("return_15m") or raw.get("ret_15m") or 0)
+            ret_1h = float(tech.get("return_1h") or 0)
+            if abs(ret_15m) * (100 if abs(ret_15m) < 1 else 1) > max_15m:
+                block(f"15m move too hot for roll: {ret_15m:.2f}")
+                continue
+            if abs(ret_1h) * (100 if abs(ret_1h) < 1 else 1) > max_1h:
+                block(f"1h move too hot for roll: {ret_1h:.2f}")
+                continue
+
+            entry_profile = {"template": "roll_trend_continuation", "status": "probe" if roll_layer > 0 else "pass"}
+            try:
+                ob_ok, ob_reason, ob_info = self._check_live_orderbook(sym, side, entry_profile)
+            except Exception as e:
+                ob_ok, ob_reason, ob_info = False, f"binance depth error: {e}", {}
+            if not ob_ok:
+                block(ob_reason)
+                continue
+            spread_pct = float(ob_info.get("spread_pct") or 1)
+            if spread_pct > max_spread and not ob_info.get("spread_degraded"):
+                block(f"roll spread too wide: {spread_pct:.4%} > {max_spread:.2%}")
+                continue
+
+            next_layer = roll_layer + 1
+            layer_factor = float(size_factors[roll_layer] if roll_layer < len(size_factors) else size_factors[-1])
+            source_factor = alpha_size_factor if strategy_source == "alpha" else 1.0
+            spread_factor = spread_degraded_factor if ob_info.get("spread_degraded") else 1.0
+            add_qty = self.ex.adjust_quantity(sym, quantity * layer_factor * source_factor * spread_factor)
+            if add_qty <= 0:
+                block("roll quantity <= 0")
+                continue
+
+            hard_stop_pct = float(self.cfg.get("hard_stop_pct", 0.05))
+            added_notional = add_qty * mark_price
+            added_worst_loss = added_notional * hard_stop_pct
+            allowed_giveback = max(0.0, pnl * max_giveback_pct / 100)
+            if added_worst_loss > allowed_giveback:
+                block(f"roll risk {added_worst_loss:.2f} > allowed profit giveback {allowed_giveback:.2f}")
+                continue
+
+            atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
+            stop_price = mark_price * (1 - hard_stop_pct) if side == "LONG" else mark_price * (1 + hard_stop_pct)
+            protected_profit = max(float(hist.get("protected_profit") or 0), pnl * lock_profit_pct)
+            action_side = "BUY" if side == "LONG" else "SELL"
+            reason = f"roll_layer_{next_layer}: {allowed_reason}; pnl={pnl_pct:.1f}% giveback={giveback_pct:.1f}%"
+            actions.append({
+                "action": "roll_add",
+                "symbol": sym,
+                "side": action_side,
+                "position_side": side,
+                "quantity": add_qty,
+                "entry_price": mark_price,
+                "stop_loss": stop_price,
+                "leverage": int(pos.get("leverage") or self.cfg.get("leverage_max", 3)),
+                "atr_value": atr,
+                "reason": reason,
+                "score": float(latest.get("composite_score") or hist.get("entry_score") or 0),
+                "run_id": run_id,
+                "position_id": hist.get("position_id"),
+                "strategy_source": strategy_source,
+                "signal_source": hist.get("signal_source"),
+                "alpha_symbol": hist.get("alpha_symbol"),
+                "alpha_profile": hist.get("alpha_profile"),
+                "alpha_entry_level": hist.get("alpha_entry_level"),
+                "alpha_score": hist.get("alpha_score"),
+                "alpha_suggested_position_pct": hist.get("alpha_suggested_position_pct"),
+                "roll_layer": next_layer,
+                "protected_profit": protected_profit,
+                "max_floating_pnl": max_floating_pnl,
+                "risk_before": {
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "quantity": quantity,
+                    "max_floating_pnl": max_floating_pnl,
+                    "giveback_pct": giveback_pct,
+                },
+                "risk_after": {
+                    "add_qty": add_qty,
+                    "added_notional": added_notional,
+                    "added_worst_loss": added_worst_loss,
+                    "allowed_giveback": allowed_giveback,
+                    "source_factor": source_factor,
+                    "layer_factor": layer_factor,
+                    "spread_factor": spread_factor,
+                    "orderbook": ob_info,
+                },
+            })
+            update_position_management(
+                sym,
+                roll_enabled=1,
+                roll_block_reason=None,
+                max_floating_pnl=max_floating_pnl,
+                protected_profit=protected_profit,
+            )
+            self._record_decision(
+                sym,
+                run_id=run_id,
+                side=side,
+                decision_stage="roll_position",
+                decision_result="planned_roll_add",
+                quantity=add_qty,
+                entry_price=mark_price,
+                risk_params=actions[-1]["risk_after"],
+                reason={"reason": reason},
+            )
+
+        return actions
+
     def decide(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
         """Build open, close and partial-close actions."""
         actions = []
@@ -873,6 +1102,7 @@ class ExecutionEngine:
 
         self._sync_tracker(current_positions)
         actions.extend(self._build_position_actions(top_symbols, current_positions))
+        actions.extend(self._build_roll_actions(top_symbols, current_positions, actions, balance, run_id=run_id))
 
         # === 1. 妫鏌ュ凡鏈夋寔浠?===
         for pos in current_positions:
@@ -1287,6 +1517,8 @@ class ExecutionEngine:
             try:
                 if act["action"] == "open":
                     self._execute_open(act, results)
+                elif act["action"] == "roll_add":
+                    self._execute_roll_add(act, results)
                 elif act["action"] == "close":
                     self._execute_close(act, results)
                 elif act["action"] == "partial_close":
@@ -1435,6 +1667,109 @@ class ExecutionEngine:
             "highest_price": act["entry_price"],
             "entry_price": act["entry_price"],
         }
+        results.append({"status": "ok", **act})
+
+    def _execute_roll_add(self, act, results):
+        logger.info(
+            f"  滚仓 {act['position_side']} {act['symbol']} layer={act.get('roll_layer')} "
+            f"x{act['quantity']} @${act['entry_price']:.4f}"
+        )
+        self.ex.set_leverage(act["symbol"], act.get("leverage", 3))
+        order = self.ex.place_market_order(act["symbol"], act["side"], act["quantity"])
+        try:
+            from shared.db import insert_order
+            insert_order(
+                act["symbol"],
+                act["side"],
+                "MARKET",
+                act["quantity"],
+                act["entry_price"],
+                status="submitted",
+                reason=act.get("reason"),
+                position_id=act.get("position_id"),
+                strategy_source=act.get("strategy_source", "normal"),
+                signal_source=act.get("signal_source"),
+                alpha_symbol=act.get("alpha_symbol"),
+                alpha_profile=act.get("alpha_profile"),
+                alpha_entry_level=act.get("alpha_entry_level"),
+                alpha_score=act.get("alpha_score"),
+                alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
+            )
+        except Exception as e:
+            logger.warning(f"    local roll order write failed: {e}")
+
+        stop_side = "SELL" if act["position_side"] == "LONG" else "BUY"
+        try:
+            stop_order = self.ex.place_stop_order(act["symbol"], stop_side, act["quantity"], act["stop_loss"])
+            try:
+                from shared.db import insert_order
+                insert_order(
+                    act["symbol"],
+                    stop_side,
+                    "STOP_MARKET",
+                    act["quantity"],
+                    act["stop_loss"],
+                    status="submitted",
+                    reason="roll_stop_loss",
+                    position_id=act.get("position_id"),
+                    strategy_source=act.get("strategy_source", "normal"),
+                    signal_source=act.get("signal_source"),
+                    alpha_symbol=act.get("alpha_symbol"),
+                    alpha_profile=act.get("alpha_profile"),
+                    alpha_entry_level=act.get("alpha_entry_level"),
+                    alpha_score=act.get("alpha_score"),
+                    alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
+                )
+            except Exception as e:
+                logger.warning(f"    local roll stop order write failed: {e}")
+            logger.info(f"    滚仓止损挂单 @${act['stop_loss']:.4f}: {stop_order.get('orderId')}")
+        except Exception as e:
+            logger.warning(f"    roll stop order failed: {e}")
+
+        try:
+            from shared.db import record_position_roll_event, update_position_management
+            positions = self.ex.get_positions()
+            pos = next((p for p in positions if p["symbol"] == act["symbol"]), None)
+            update_fields = {
+                "roll_layer": act.get("roll_layer"),
+                "last_roll_time": datetime.now(timezone.utc).isoformat(),
+                "protected_profit": act.get("protected_profit"),
+                "max_floating_pnl": act.get("max_floating_pnl"),
+                "roll_enabled": 1,
+                "roll_block_reason": None,
+                "last_exit_reason": act.get("reason"),
+            }
+            if pos:
+                update_fields["quantity"] = pos.get("quantity")
+                update_fields["entry_price"] = pos.get("entry_price")
+            update_position_management(act["symbol"], **update_fields)
+            record_position_roll_event(
+                symbol=act["symbol"],
+                position_side=act.get("position_side"),
+                strategy_source=act.get("strategy_source", "normal"),
+                roll_layer=act.get("roll_layer"),
+                roll_qty=act.get("quantity"),
+                roll_price=act.get("entry_price"),
+                roll_reason=act.get("reason"),
+                position_id=act.get("position_id"),
+                risk_before=act.get("risk_before"),
+                risk_after=act.get("risk_after"),
+            )
+        except Exception as e:
+            logger.warning(f"    roll state write failed: {e}")
+
+        self._record_decision(
+            act["symbol"],
+            run_id=act.get("run_id"),
+            side=act.get("position_side"),
+            decision_stage="execution",
+            decision_result="rolled_add",
+            quantity=act.get("quantity"),
+            entry_price=act.get("entry_price"),
+            risk_params=act.get("risk_after"),
+            reason={"reason": act.get("reason"), "order_id": order.get("orderId")},
+        )
+        logger.info(f"    滚仓成交: {order.get('orderId')}")
         results.append({"status": "ok", **act})
 
     def _execute_close(self, act, results):

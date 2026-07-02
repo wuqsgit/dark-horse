@@ -1517,6 +1517,12 @@ async def get_trading_status(user=Depends(get_user)):
                     "alpha_entry_level": None,
                     "alpha_score": None,
                     "alpha_suggested_position_pct": None,
+                    "roll_layer": 0,
+                    "last_roll_time": None,
+                    "protected_profit": 0,
+                    "max_floating_pnl": 0,
+                    "roll_enabled": False,
+                    "roll_block_reason": None,
                 }
             return {
                 "entry_reason": r["entry_reason"],
@@ -1533,6 +1539,12 @@ async def get_trading_status(user=Depends(get_user)):
                 "alpha_entry_level": r["alpha_entry_level"] if "alpha_entry_level" in r.keys() else None,
                 "alpha_score": float(r["alpha_score"] or 0) if "alpha_score" in r.keys() else None,
                 "alpha_suggested_position_pct": float(r["alpha_suggested_position_pct"] or 0) if "alpha_suggested_position_pct" in r.keys() else None,
+                "roll_layer": int(r["roll_layer"] or 0) if "roll_layer" in r.keys() else 0,
+                "last_roll_time": r["last_roll_time"] if "last_roll_time" in r.keys() else None,
+                "protected_profit": float(r["protected_profit"] or 0) if "protected_profit" in r.keys() else 0,
+                "max_floating_pnl": float(r["max_floating_pnl"] or 0) if "max_floating_pnl" in r.keys() else 0,
+                "roll_enabled": bool(r["roll_enabled"]) if "roll_enabled" in r.keys() else False,
+                "roll_block_reason": r["roll_block_reason"] if "roll_block_reason" in r.keys() else None,
             }
 
         decision_panel = {
