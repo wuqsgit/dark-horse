@@ -104,8 +104,6 @@ export default function LiveTrading() {
         </div>
       </div>
 
-      <DecisionPanel panel={status?.decision_panel} />
-
       <div className="trading-section">
         <h3>当前持仓</h3>
         {positions.length === 0 ? (
@@ -117,13 +115,16 @@ export default function LiveTrading() {
                 <div className="pos-header">
                   <span className="pos-symbol">{p.symbol}</span>
                   <span className="pos-side" style={{ color: p.side === 'LONG' ? '#22c55e' : '#ef4444' }}>{p.side === 'LONG' ? '做多' : '做空'}</span>
-                  <span style={{ marginLeft: 'auto', fontSize: 12, color: '#6b7280' }}>投入 {fmt(p.invested || p.margin)}U</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 12, color: '#6b7280' }}>名义价值 {fmt(p.invested || p.margin)}U</span>
                 </div>
                 <div className="pos-body">
                   <div className="pos-row"><span className="label">数量</span><span className="value">{p.quantity}</span></div>
+                  <div className="pos-row"><span className="label">杠杆</span><span className="value">{p.leverage ? `${p.leverage}x` : '-'}</span></div>
+                  <div className="pos-row"><span className="label">保证金</span><span className="value">{fmt(p.margin)}U</span></div>
+                  <div className="pos-row"><span className="label">保证金率</span><span className="value">{p.margin_ratio != null ? `${fmt(p.margin_ratio)}%` : '-'}</span></div>
                   <div className="pos-row"><span className="label">入场价</span><span className="value">${fmt(p.entry_price, 4)}</span></div>
                   <div className="pos-row"><span className="label">当前价</span><span className="value">${fmt(p.mark_price, 4)}</span></div>
-                  <div className="pos-row"><span className="label">浮动盈亏</span><span className="value" style={pnlColor(p.unrealized_pnl)}>${fmt(p.unrealized_pnl)} ({fmt(p.pnl_pct)}%)</span></div>
+                  <div className="pos-row"><span className="label">浮动盈亏/保证金</span><span className="value" style={pnlColor(p.unrealized_pnl)}>${fmt(p.unrealized_pnl)} ({fmt(p.pnl_pct)}%)</span></div>
                   <div className="position-rules">
                     <div><b>系统管理</b> 入场评分 {p.entry_score ? fmt(p.entry_score, 1) : '-'}</div>
                     <div>TP1：{p.tp1_hit ? '已减过仓' : '未触发'} · TP2：{p.tp2_hit ? '已减过仓' : '未触发'}</div>
@@ -136,6 +137,8 @@ export default function LiveTrading() {
           </div>
         )}
       </div>
+
+      <DecisionPanel panel={status?.decision_panel} />
 
       <div className="trading-section">
         <h3>历史交易</h3>

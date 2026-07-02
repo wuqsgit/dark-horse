@@ -1082,6 +1082,7 @@ async def get_trading_status(user=Depends(get_user)):
                     "unrealized_pnl": p["unrealized_pnl"],
                     "leverage": p["leverage"],
                     "margin": round(p["entry_price"] * p["quantity"] / p["leverage"], 2) if p["entry_price"] and p["leverage"] else 0,
+                    "margin_ratio": round(100 / p["leverage"], 2) if p["leverage"] else 0,
                     "pnl_pct": round(p["unrealized_pnl"] / (p["entry_price"] * p["quantity"] / p["leverage"]) * 100, 2) if p["entry_price"] and p["leverage"] else 0,
                     "invested": round(p["entry_price"] * p["quantity"], 2),
                     **position_management_fields(p["symbol"]),
