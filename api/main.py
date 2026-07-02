@@ -927,9 +927,9 @@ async def get_trading_status(user=Depends(get_user)):
     from trader.config import EXCHANGE_CONFIG
     missing_binance_vars = []
     if not EXCHANGE_CONFIG.get("api_key"):
-        missing_binance_vars.append("BINANCE_API_KEY")
+        missing_binance_vars.append("TESTNET_API_KEY" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_KEY")
     if not EXCHANGE_CONFIG.get("api_secret"):
-        missing_binance_vars.append("BINANCE_API_SECRET")
+        missing_binance_vars.append("TESTNET_API_SECRET" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_SECRET")
     if missing_binance_vars:
         return {
             "error": "missing " + ", ".join(missing_binance_vars),
