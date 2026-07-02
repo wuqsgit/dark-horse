@@ -305,10 +305,11 @@ export default function ScanTable() {
       </div>
 
       {loading ? <div className="loading">加载中...</div> : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
+        <div className="scan-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
           {rows.map((r) => (
             <div
               key={r.symbol}
+              className="scan-card"
               onClick={() => setSelected(r.symbol)}
               style={{
                 background: '#0d1117',

@@ -10,13 +10,22 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>🐎 DarkHorse</h1>
-        <span className="subtitle">加密货币多维评分系统</span>
+        <div className="brand-lockup">
+          <div className="brand-mark">DH</div>
+          <div>
+            <h1>DarkHorse</h1>
+            <span className="subtitle">Quant Trading Terminal</span>
+          </div>
+        </div>
         <nav className="nav">
           <button className={currentPage === 'scan' ? 'active' : ''} onClick={() => setCurrentPage('scan')}>扫描</button>
           <button className={currentPage === 'backtest' ? 'active' : ''} onClick={() => setCurrentPage('backtest')}>回测</button>
           <button className={currentPage === 'trading' ? 'active' : ''} onClick={() => setCurrentPage('trading')}>实盘</button>
         </nav>
+        <div className="terminal-status">
+          <span className="live-dot" />
+          <span>TESTNET LIVE</span>
+        </div>
       </header>
 
       <main className="main">
