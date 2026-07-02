@@ -3,6 +3,7 @@ import os
 import json
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "alphadog.db")
@@ -403,6 +404,11 @@ def init_db():
     _ensure_column(conn, "positions_history", "position_side", "TEXT")
     _ensure_column(conn, "positions_history", "mark_price", "REAL")
     _ensure_column(conn, "positions_history", "leverage", "INTEGER DEFAULT 1")
+    for table in ("trades", "orders", "fills", "position_history"):
+        _ensure_column(conn, table, "position_id", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_position_id ON trades(position_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_position_id ON fills(position_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id)")
     for column, ddl in {
         "tp1_hit": "INTEGER DEFAULT 0",
         "tp2_hit": "INTEGER DEFAULT 0",
@@ -643,23 +649,35 @@ def fetch_onchain(symbols, hours=72):
 
 # ---- Trades ----
 
-def record_trade(symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason, grade, score, entry_reason=None):
+def new_position_id(symbol, side):
+    clean_symbol = (symbol or "UNKNOWN").replace("/", "").upper()
+    clean_side = (side or "SIDE").upper()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{clean_symbol}-{clean_side}-{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def record_trade(symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason, grade, score, entry_reason=None, position_id=None):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO trades (symbol, side, quantity, entry_price, exit_price, pnl, pnl_pct, exit_reason, entry_reason, entry_time, exit_time, grade_at_entry, score_at_entry) VALUES (?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'), ?, ?)",
-        (symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason, entry_reason, grade, score)
+        """INSERT INTO trades
+           (position_id, symbol, side, quantity, entry_price, exit_price, pnl, pnl_pct,
+            exit_reason, entry_reason, entry_time, exit_time, grade_at_entry, score_at_entry)
+           VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'), ?, ?)""",
+        (position_id, symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason, entry_reason, grade, score)
     )
     conn.commit()
 
 
-def upsert_position_history(symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value):
+def upsert_position_history(symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value, position_id=None):
     """V3.0 记录/更新开仓信息，重启后可恢复"""
     conn = get_conn()
+    existing = conn.execute("SELECT position_id FROM position_history WHERE symbol=?", (symbol,)).fetchone()
+    position_id = position_id or (existing["position_id"] if existing and "position_id" in existing.keys() else None) or new_position_id(symbol, side)
     conn.execute(
         """INSERT INTO position_history
            (symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value,
-            highest_price, update_time)
-           VALUES (?,?,?,?,?,?,?,?,?, datetime('now'))
+            highest_price, position_id, update_time)
+           VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'))
            ON CONFLICT(symbol) DO UPDATE SET
              side=excluded.side,
              quantity=excluded.quantity,
@@ -668,12 +686,14 @@ def upsert_position_history(symbol, side, quantity, entry_price, entry_reason, e
              entry_score=excluded.entry_score,
              tp3_price=excluded.tp3_price,
              atr_value=excluded.atr_value,
+             position_id=COALESCE(position_history.position_id, excluded.position_id),
              highest_price=COALESCE(position_history.highest_price, excluded.highest_price),
              update_time=datetime('now')""",
-        (symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value, entry_price)
+        (symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value, entry_price, position_id)
     )
     conn.commit()
     conn.close()
+    return position_id
 
 
 def get_position_history(symbol):
@@ -705,6 +725,63 @@ def update_position_management(symbol, **fields):
         f"UPDATE position_history SET {assignments}, update_time=datetime('now') WHERE symbol=?",
         values,
     )
+    conn.commit()
+    conn.close()
+
+
+def fetch_position_trade_groups(limit=100):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT
+               COALESCE(position_id, symbol || '-' || side || '-' || entry_time) AS position_id,
+               symbol,
+               side,
+               MIN(entry_time) AS entry_time,
+               MAX(exit_time) AS exit_time,
+               SUM(COALESCE(quantity, 0)) AS quantity,
+               SUM(COALESCE(quantity, 0) * COALESCE(entry_price, 0)) / NULLIF(SUM(COALESCE(quantity, 0)), 0) AS entry_price,
+               SUM(COALESCE(quantity, 0) * COALESCE(exit_price, 0)) / NULLIF(SUM(COALESCE(quantity, 0)), 0) AS exit_price,
+               SUM(COALESCE(pnl, 0)) AS pnl,
+               SUM(COALESCE(entry_price, 0) * COALESCE(quantity, 0)) AS notional,
+               GROUP_CONCAT(DISTINCT exit_reason) AS exit_reasons,
+               COUNT(*) AS close_count,
+               MAX(grade_at_entry) AS grade_at_entry,
+               MAX(score_at_entry) AS score_at_entry,
+               MAX(entry_reason) AS entry_reason,
+               MAX(source) AS source
+           FROM trades
+           WHERE source='system'
+             AND exit_time IS NOT NULL
+             AND exit_time != 'N/A'
+           GROUP BY COALESCE(position_id, symbol || '-' || side || '-' || entry_time), symbol, side
+           ORDER BY MAX(COALESCE(exit_time, created_at)) DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        pnl = float(d.get("pnl") or 0)
+        notional = float(d.get("notional") or 0)
+        # Assume max leverage for historical grouped records when exact leverage is not stored in trades.
+        margin = notional / 3 if notional else 0
+        d["pnl"] = round(pnl, 2)
+        d["pnl_pct"] = round(pnl / margin * 100, 2) if margin else 0
+        d["qty"] = round(float(d.get("quantity") or 0), 6)
+        d["entry_price"] = round(float(d.get("entry_price") or 0), 8)
+        d["exit_price"] = round(float(d.get("exit_price") or 0), 8)
+        d["exit_reason"] = d.get("exit_reasons")
+        d["is_grouped"] = True
+        result.append(d)
+    conn.close()
+    return result
+
+
+def clear_trade_history():
+    conn = get_conn()
+    for table in ("trades", "fills", "orders"):
+        conn.execute(f"DELETE FROM {table}")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
     conn.commit()
     conn.close()
 
@@ -1244,13 +1321,13 @@ def fetch_latest_factor_run():
 
 # ---- Orders ----
 
-def insert_order(symbol, side, order_type, quantity, price, status="pending", reason=None):
+def insert_order(symbol, side, order_type, quantity, price, status="pending", reason=None, position_id=None):
     conn = get_conn()
     conn.execute(
         """INSERT INTO orders
-           (symbol, side, order_type, quantity, price, status, reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (symbol, side, order_type, quantity, price, status, reason),
+           (position_id, symbol, side, order_type, quantity, price, status, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (position_id, symbol, side, order_type, quantity, price, status, reason),
     )
     conn.commit()
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1264,13 +1341,13 @@ def update_order_status(order_id, status):
     conn.commit()
 
 
-def insert_fill(symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id):
+def insert_fill(symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id, position_id=None):
     conn = get_conn()
     conn.execute(
         """INSERT INTO fills
-           (symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id),
+           (position_id, symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (position_id, symbol, order_id, side, quantity, price, realized_pnl, fee, fee_asset, trade_id),
     )
     conn.commit()
 

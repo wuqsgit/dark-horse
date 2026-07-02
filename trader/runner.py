@@ -182,6 +182,8 @@ def fetch_and_store_income(ex, days_back=7):
     
     # 默认查最近 7 天
     start_ts = int((now - timedelta(days=days_back)).timestamp() * 1000)
+    if not last_sync:
+        start_ts = int((now - timedelta(minutes=10)).timestamp() * 1000)
     if last_sync:
         # 转换为毫秒时间戳
         try:

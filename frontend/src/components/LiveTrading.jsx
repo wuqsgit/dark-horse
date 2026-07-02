@@ -153,7 +153,10 @@ export default function LiveTrading() {
               <tbody>
                 {visibleTrades.map((t, i) => (
                   <tr key={i}>
-                    <td style={{ fontWeight: 600, color: '#c9d1d9' }}>{t.symbol}</td>
+                    <td style={{ fontWeight: 600, color: '#c9d1d9' }}>
+                      {t.symbol}
+                      {t.close_count > 1 ? <span className="mini-pill" style={{ marginLeft: 6 }}>合并 {t.close_count}</span> : null}
+                    </td>
                     <td style={{ color: t.side === 'LONG' ? '#22c55e' : '#ef4444' }}>{t.side === 'LONG' ? '多' : '空'}</td>
                     <td>{t.qty || t.quantity}</td>
                     <td>${fmt(t.entry_price, 4)}</td>

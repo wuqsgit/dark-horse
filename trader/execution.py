@@ -870,7 +870,8 @@ class ExecutionEngine:
         # 璁板綍寮浠撳喎鍗?30鍒嗛挓)
         record_profit(act['symbol'], is_weak_exit=False)
         try:
-            from shared.db import upsert_position_history
+            from shared.db import new_position_id, upsert_position_history
+            position_id = act.get("position_id") or new_position_id(act["symbol"], act["position_side"])
             upsert_position_history(
                 act["symbol"],
                 act["position_side"],
@@ -880,7 +881,9 @@ class ExecutionEngine:
                 act.get("score", 0),
                 act.get("tp2_price", 0),
                 act.get("atr_value", 0),
+                position_id=position_id,
             )
+            act["position_id"] = position_id
         except Exception as e:
             logger.warning(f"    position history write failed: {e}")
         
@@ -899,7 +902,8 @@ class ExecutionEngine:
             logger.warning(f"    {act['symbol']}: no current position found")
             return
         self.ex.close_position_market(act["symbol"], act["side"], pos["quantity"])
-        from shared.db import delete_position_history, record_trade
+        from shared.db import delete_position_history, get_position_history, record_trade
+        hist = get_position_history(act["symbol"]) or {}
         pnl = pos.get("unrealized_pnl", 0)
         margin = pos["entry_price"] * pos["quantity"] / max(pos.get("leverage", 1), 1)
         pnl_pct = round(pnl / margin * 100, 2) if margin else 0
@@ -910,6 +914,8 @@ class ExecutionEngine:
             pnl=round(pnl, 2), pnl_pct=pnl_pct,
             exit_reason=act.get("reason", ""),
             grade=act.get("grade", ""), score=act.get("score", 0),
+            entry_reason=hist.get("entry_reason"),
+            position_id=hist.get("position_id"),
         )
         self._record_decision(
             act["symbol"],
@@ -950,7 +956,8 @@ class ExecutionEngine:
         margin = pos["entry_price"] * pos["quantity"] / max(pos.get("leverage", 1), 1)
         pnl = pos["unrealized_pnl"] * pct
         pnl_pct_v = round(pnl / (margin * pct) * 100, 2) if margin else 0
-        from shared.db import record_trade
+        from shared.db import get_position_history, record_trade
+        hist = get_position_history(act["symbol"]) or {}
         record_trade(
             symbol=act["symbol"], side=pos["side"],
             qty=close_qty, entry_price=pos["entry_price"],
@@ -958,6 +965,8 @@ class ExecutionEngine:
             pnl=round(pnl, 2), pnl_pct=pnl_pct_v,
             exit_reason=act.get("reason", ""),
             grade=act.get("grade", ""), score=act.get("score", 0),
+            entry_reason=hist.get("entry_reason"),
+            position_id=hist.get("position_id"),
         )
         self._record_decision(
             act["symbol"],

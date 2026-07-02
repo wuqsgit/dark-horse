@@ -787,7 +787,7 @@ async def update_strategy_learning_status(candidate_id: int, body: dict, user=De
 _trading_status_cache = {"data": None, "time": 0}
 _CACHE_TTL = 10  # 10绉掔紦瀛?
 def _build_local_trading_status(error=None):
-    from shared.db import get_conn
+    from shared.db import fetch_position_trade_groups, get_conn
     from trader.config import TRADING_CONFIG
 
     conn = get_conn()
@@ -800,13 +800,7 @@ def _build_local_trading_status(error=None):
                 "SELECT * FROM positions_history WHERE time = ? ORDER BY symbol",
                 (latest_snapshot,),
             ).fetchall()
-        recent_trades = conn.execute(
-            """SELECT * FROM trades
-               WHERE exit_reason NOT IN (?,?)
-               ORDER BY COALESCE(exit_time, entry_time, created_at) DESC
-               LIMIT 100""",
-            excluded,
-        ).fetchall()
+        recent_trades = fetch_position_trade_groups(100)
         closed = conn.execute(
             """SELECT pnl, pnl_pct, exit_reason, entry_time, exit_time
                FROM trades
@@ -870,20 +864,7 @@ def _build_local_trading_status(error=None):
             "balance": round(initial_capital + realized + unrealized_total, 2),
             "total_trades": total_trades,
             "positions": positions,
-            "recent_trades": [
-                {
-                    "symbol": t["symbol"], "side": t["side"],
-                    "qty": t["quantity"],
-                    "entry_price": t["entry_price"], "exit_price": t["exit_price"],
-                    "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
-                    "exit_reason": t["exit_reason"],
-                    "entry_reason": t["entry_reason"] if "entry_reason" in t.keys() else None,
-                    "entry_time": t["entry_time"], "exit_time": t["exit_time"],
-                    "grade_at_entry": t["grade_at_entry"], "score_at_entry": t["score_at_entry"],
-                    "source": t["source"],
-                }
-                for t in recent_trades
-            ],
+            "recent_trades": recent_trades,
             "total_pnl": round(realized + unrealized_total, 2),
             "realized_pnl": realized,
             "trades_pnl": realized,
@@ -916,7 +897,7 @@ async def get_trading_status(user=Depends(get_user)):
     import time
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from shared.db import get_conn
+    from shared.db import fetch_position_trade_groups, get_conn
 
     # Check cache.
     if _trading_status_cache["data"] and time.time() - _trading_status_cache["time"] < _CACHE_TTL:
@@ -951,17 +932,7 @@ async def get_trading_status(user=Depends(get_user)):
         balance = margin_data["totalWalletBalance"]
         positions = ex.get_positions()
         conn = get_conn()
-        # V3.1: only keep the latest trade for each symbol.
-        recent_trades = conn.execute(
-            """SELECT t.* FROM trades t
-            INNER JOIN (
-                SELECT symbol, MAX(created_at) as max_created
-                FROM trades
-                WHERE exit_reason NOT IN ('historical_import','鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)')
-                GROUP BY symbol
-            ) tm ON t.symbol = tm.symbol AND t.created_at = tm.max_created
-            ORDER BY t.created_at DESC LIMIT 100"""
-        ).fetchall()
+        recent_trades = fetch_position_trade_groups(100)
         total_trades = conn.execute("SELECT COUNT(*) FROM trades WHERE exit_reason NOT IN ('historical_import','鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)') AND source='system'").fetchone()[0]
         
         # ---- stats 鏁版嵁 ----
@@ -1095,20 +1066,7 @@ async def get_trading_status(user=Depends(get_user)):
                 }
                 for p in positions
             ],
-            "recent_trades": [
-                {
-                    "symbol": t["symbol"], "side": t["side"],
-                    "qty": t["quantity"],
-                    "entry_price": t["entry_price"], "exit_price": t["exit_price"],
-                    "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
-                    "exit_reason": t["exit_reason"],
-                    "entry_reason": t["entry_reason"] if "entry_reason" in t.keys() else None,  # V3.0
-                    "entry_time": t["entry_time"], "exit_time": t["exit_time"],
-                    "grade_at_entry": t["grade_at_entry"], "score_at_entry": t["score_at_entry"],
-                    "source": t["source"],
-                }
-                for t in recent_trades
-            ],
+            "recent_trades": recent_trades,
             # stats 瀛楁
             "total_pnl": round(balance - INITIAL_CAPITAL, 2) if isinstance(balance, (int, float)) else 0,
             "trades_pnl": round(total_pnl, 2),
