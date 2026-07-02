@@ -855,6 +855,7 @@ def _build_local_trading_status(error=None):
                 "unrealized_pnl": unrealized,
                 "leverage": leverage,
                 "margin": round(margin, 2),
+                "margin_ratio": round(100 / leverage, 2) if leverage else 0,
                 "pnl_pct": round(unrealized / margin * 100, 2) if margin else 0,
                 "invested": round(entry_price * qty, 2),
                 "entry_reason": None,
