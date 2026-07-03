@@ -175,6 +175,18 @@ def _json_or_empty(value):
     return {}
 
 
+def _json_or_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
 def _grade_from_score(score):
     score = float(score or 0)
     if score >= 80:
@@ -358,7 +370,153 @@ class ExecutionEngine:
         except Exception as e:
             logger.debug(f"strategy decision log failed: {e}")
 
-    def _build_position_actions(self, top_symbols: list, current_positions: list) -> list:
+    def _latest_alpha_position_context(self, symbol: str, hist: dict) -> dict | None:
+        try:
+            from shared.db import fetch_latest_alpha_position_context
+
+            return fetch_latest_alpha_position_context(
+                symbol=symbol,
+                alpha_symbol=hist.get("alpha_symbol"),
+            )
+        except Exception as e:
+            logger.warning(f"Alpha position context unavailable for {symbol}: {e}")
+            return None
+
+    def _build_alpha_position_action(
+        self,
+        pos: dict,
+        hist: dict,
+        pnl_pct: float,
+        mark_price: float,
+        close_side: str,
+        highest_price: float,
+        atr: float,
+        age_h: float | None,
+        run_id: str | None = None,
+    ) -> dict | None:
+        sym = pos["symbol"]
+        side = pos.get("side")
+        ctx = self._latest_alpha_position_context(sym, hist)
+        entry_score = float(hist.get("alpha_score") or hist.get("entry_score") or 0)
+
+        def add(reason, is_stop=False, score=None):
+            item = {
+                "action": "close",
+                "symbol": sym,
+                "side": close_side,
+                "reason": reason,
+                "close_price": mark_price,
+                "score": float(score if score is not None else entry_score),
+                "strategy_source": "alpha",
+                "signal_source": hist.get("signal_source"),
+                "alpha_symbol": hist.get("alpha_symbol"),
+                "alpha_profile": hist.get("alpha_profile"),
+                "alpha_entry_level": hist.get("alpha_entry_level"),
+                "alpha_score": entry_score,
+                "alpha_suggested_position_pct": hist.get("alpha_suggested_position_pct"),
+            }
+            if is_stop:
+                item["is_stop"] = True
+            return item
+
+        if pnl_pct <= -float(self.cfg.get("hard_stop_pct", 0.05)) * 100:
+            return add(f"alpha_hard_stop pnl={pnl_pct:.1f}%", is_stop=True)
+
+        hold_reason = None
+        if not ctx:
+            hold_reason = "alpha position hold: latest alpha volume-price context unavailable"
+        else:
+            context_age = _signal_age_minutes(ctx)
+            max_age = float((_alpha_cfg() or {}).get("position_context_ttl_minutes", 30))
+            if max_age and context_age is not None and context_age > max_age:
+                hold_reason = f"alpha position hold: volume-price context stale age={context_age:.1f}m"
+
+        if hold_reason:
+            self._record_decision(
+                {
+                    "symbol": sym,
+                    "composite_score": entry_score,
+                    "grade": _grade_from_score(entry_score),
+                    "raw_features": {
+                        "alpha_position": {
+                            "strategy_source": "alpha",
+                            "alpha_symbol": hist.get("alpha_symbol"),
+                            "alpha_score": entry_score,
+                            "data_state": "missing_or_stale",
+                        }
+                    },
+                },
+                run_id=run_id,
+                side=side,
+                mode="alpha_live",
+                decision_stage="position_management",
+                decision_result="hold",
+                filter_reason=hold_reason,
+                reason={"reason": hold_reason, "pnl_pct": pnl_pct},
+            )
+            return None
+
+        current_score = float(ctx.get("alpha_score") or entry_score)
+        vp_state = str(ctx.get("volume_price_state") or "").lower()
+        vp_action = str(ctx.get("volume_price_action") or "").lower()
+        metrics = _json_or_empty(ctx.get("volume_price_metrics_json"))
+        reasons = _json_or_list(ctx.get("volume_price_reasons_json"))
+        ret_15m = float(metrics.get("ret_15m") or 0)
+        ret_1h = float(metrics.get("ret_1h") or 0)
+        ret_6h = float(metrics.get("ret_6h") or 0)
+        spread_pct = float(metrics.get("spread_pct") or 0)
+        max_spread_pct = float((_alpha_cfg() or {}).get("max_spread_pct", 0.0012)) * 100
+
+        weak_states = {"failed_breakout", "distribution", "dumping", "breakdown"}
+        if vp_state in weak_states and pnl_pct <= 2:
+            return add(f"alpha_volume_price_failed state={vp_state} pnl={pnl_pct:.1f}%", score=current_score)
+        if vp_action in {"observe", "cooldown"} and pnl_pct <= 0 and (ret_15m < 0 or ret_1h < 0):
+            return add(f"alpha_volume_price_weak action={vp_action} state={vp_state} pnl={pnl_pct:.1f}%", score=current_score)
+        if spread_pct > max_spread_pct and pnl_pct <= 0:
+            return add(f"alpha_spread_widened spread={spread_pct:.3f}% pnl={pnl_pct:.1f}%", score=current_score)
+        if side == "LONG" and ret_15m < 0 and ret_1h < 0 and ret_6h < 0 and pnl_pct <= 1:
+            return add(f"alpha_long_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}%", score=current_score)
+        if side == "SHORT" and ret_15m > 0 and ret_1h > 0 and ret_6h > 0 and pnl_pct <= 1:
+            return add(f"alpha_short_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}%", score=current_score)
+
+        time_stop_h = float(self.cfg.get("time_stop_hours", 12))
+        min_ret = float(self.cfg.get("time_stop_min_return", 0.02)) * 100
+        if age_h is not None and age_h >= time_stop_h and pnl_pct < min_ret and vp_action not in {"normal_review", "normal_review_probe"}:
+            return add(f"alpha_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}% state={vp_state}", score=current_score)
+        if pnl_pct >= float(self.cfg.get("tp2_target_pct", 0.10)) * 100 and calc_trailing_stop(mark_price, highest_price, atr, self.cfg.get("trailing_stop_atr_multiplier", 1.5)):
+            return add(f"alpha_trailing_stop high={highest_price:.4f} now={mark_price:.4f}", score=current_score)
+
+        hold_reason = f"alpha hold volume_price={vp_state or '-'} action={vp_action or '-'} score={current_score:.1f}"
+        if reasons:
+            hold_reason += f" reason={'; '.join(map(str, reasons[:2]))}"
+        self._record_decision(
+            {
+                "symbol": sym,
+                "composite_score": current_score,
+                "grade": _grade_from_score(current_score),
+                "raw_features": {
+                    "alpha_position": {
+                        "strategy_source": "alpha",
+                        "alpha_symbol": hist.get("alpha_symbol"),
+                        "entry_alpha_score": entry_score,
+                        "current_alpha_score": current_score,
+                        "volume_price_state": vp_state,
+                        "volume_price_action": vp_action,
+                        "volume_price_metrics": metrics,
+                    }
+                },
+            },
+            run_id=run_id,
+            side=side,
+            mode="alpha_live",
+            decision_stage="position_management",
+            decision_result="hold",
+            filter_reason=hold_reason,
+            reason={"reason": hold_reason, "pnl_pct": pnl_pct},
+        )
+        return None
+
+    def _build_position_actions(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
         from shared.db import get_position_history
 
         actions = []
@@ -399,6 +557,22 @@ class ExecutionEngine:
             tracker = self._pos_tracker.get(sym, {})
             highest_price = float(tracker.get("highest_price") or mark_price)
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
+
+            if (hist.get("strategy_source") or "normal") == "alpha":
+                alpha_action = self._build_alpha_position_action(
+                    pos,
+                    hist,
+                    pnl_pct,
+                    mark_price,
+                    close_side,
+                    highest_price,
+                    atr,
+                    age_h,
+                    run_id=run_id,
+                )
+                if alpha_action:
+                    actions.append(alpha_action)
+                continue
 
             def add(action, reason, close_pct=None, is_stop=False):
                 item = {
@@ -1101,7 +1275,7 @@ class ExecutionEngine:
         alpha_enabled = bool(controls.get("alpha_trading_enabled", False))
 
         self._sync_tracker(current_positions)
-        actions.extend(self._build_position_actions(top_symbols, current_positions))
+        actions.extend(self._build_position_actions(top_symbols, current_positions, run_id=run_id))
         actions.extend(self._build_roll_actions(top_symbols, current_positions, actions, balance, run_id=run_id))
 
         # === 1. 妫鏌ュ凡鏈夋寔浠?===

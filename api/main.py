@@ -1,4 +1,5 @@
 ﻿"""AlphaDog API Server 鈥?FastAPI (SQLite)"""
+import asyncio
 import os, sys, json, time
 from fastapi import FastAPI, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,7 @@ from shared.db import (
     fetch_latest_alpha_trade_candidates,
     fetch_active_alpha_cooldowns,
     fetch_latest_scan,
+    fetch_latest_scan_meta,
     fetch_symbol_detail,
     fetch_score_history,
     fetch_backtest_summary,
@@ -136,10 +138,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 _api_cache = {}
 _response_cache = {}
-_scan_payload_cache = {"scan_id": None, "payload": None}
+_versioned_cache = {}
+_scan_payload_cache = {"scan_id": None, "payload": None, "body": None, "time": 0}
+_scan_refresh_task = None
 _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
 _TRADING_CACHE_TTL = 10
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _FAST_CACHE_PATHS = {
     "/api/scan/latest",
     "/api/alpha/scan/latest",
@@ -147,6 +152,8 @@ _FAST_CACHE_PATHS = {
     "/api/backtest/summary",
     "/api/backtest/recent",
     "/api/backtest/signals",
+    "/api/backtest/factor_analysis",
+    "/api/backtest/review",
     "/api/backtest/factor_weights",
     "/api/strategy/learning",
     "/api/trading/status",
@@ -222,6 +229,41 @@ def cache_set(key, data):
     return data
 
 
+def versioned_cache_get(key, version, ttl=None):
+    item = _versioned_cache.get(key)
+    if not item or item.get("version") != version:
+        return None
+    if ttl is not None and time.time() - item.get("time", 0) >= ttl:
+        return None
+    return item.get("data")
+
+
+def versioned_cache_set(key, version, data):
+    _versioned_cache[key] = {"version": version, "time": time.time(), "data": data}
+    return data
+
+
+def json_response(data):
+    return Response(
+        content=json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"),
+        media_type="application/json",
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+def versioned_response_get(key, version, ttl=None):
+    body = versioned_cache_get(key, version, ttl)
+    if body is None:
+        return None
+    return Response(content=body, media_type="application/json", headers=_NO_STORE_HEADERS)
+
+
+def versioned_response_set(key, version, data):
+    body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+    versioned_cache_set(key, version, body)
+    return Response(content=body, media_type="application/json", headers=_NO_STORE_HEADERS)
+
+
 def seed_response_cache(path, data):
     body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
     for host in ("http://127.0.0.1:8000", "http://localhost:8000", "http://127.0.0.1:3000", "http://localhost:3000"):
@@ -230,6 +272,7 @@ def seed_response_cache(path, data):
             "body": body,
             "status_code": 200,
             "media_type": "application/json",
+            "headers": dict(_NO_STORE_HEADERS),
         }
 
 
@@ -252,36 +295,51 @@ async def fast_path_cache(request, call_next):
             content=item["body"],
             status_code=item["status_code"],
             media_type=item["media_type"],
-            headers={"X-Cache": "HIT"},
+            headers={**_NO_STORE_HEADERS, **item.get("headers", {}), "X-Cache": "HIT"},
         )
     response = await call_next(request)
     body = b""
     async for chunk in response.body_iterator:
         body += chunk
     if response.status_code == 200:
+        cache_headers = {
+            k: v for k, v in response.headers.items()
+            if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}
+        }
+        cache_headers.update(_NO_STORE_HEADERS)
         payload = {
             "time": time.time(),
             "body": body,
             "status_code": response.status_code,
             "media_type": response.media_type or response.headers.get("content-type", "application/json"),
+            "headers": cache_headers,
         }
         _response_cache[key] = payload
         if request.url.path == "/api/trading/status":
             _response_cache[key.replace("/api/trading/status", "/api/trading/statu")] = payload
         elif request.url.path == "/api/trading/statu":
             _response_cache[key.replace("/api/trading/statu", "/api/trading/status")] = payload
+    response_headers = {
+        k: v for k, v in response.headers.items()
+        if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}
+    }
+    response_headers.update(_NO_STORE_HEADERS)
     return Response(
         content=body,
         status_code=response.status_code,
         media_type=response.media_type,
-        headers=dict(response.headers),
+        headers=response_headers,
     )
 
 
 @app.on_event("startup")
 async def startup():
+    global _scan_refresh_task
     init_db()
     try:
+        await asyncio.to_thread(_refresh_scan_payload_sync)
+        if _scan_refresh_task is None:
+            _scan_refresh_task = asyncio.create_task(_scan_cache_refresher())
         seed_response_cache("/api/backtest/summary", await get_backtest_summary(user="admin"))
         rows = fetch_recent_signals("S1", 50)
         seed_response_cache("/api/backtest/recent?grade=S1&limit=50", [
@@ -298,6 +356,11 @@ async def startup():
         weights_path = os.path.join(os.path.dirname(__file__), "..", "engine", "factor_weights.json")
         with open(weights_path, encoding="utf-8") as f:
             seed_response_cache("/api/backtest/factor_weights", json.load(f))
+        await get_latest_alpha_scan(user="admin")
+        await get_alpha_trade_candidates(user="admin")
+        trading_status = await get_trading_status(user="admin")
+        seed_response_cache("/api/trading/status", trading_status)
+        seed_response_cache("/api/trading/statu", trading_status)
     except Exception:
         pass
 
@@ -306,13 +369,7 @@ async def get_user():
     return "admin"
 
 
-@app.get("/api/scan/latest")
-async def get_latest_scan(user=Depends(get_user)):
-    scan, rows = fetch_latest_scan()
-    if not scan:
-        return {"scan_time": None, "symbols": []}
-    if _scan_payload_cache["scan_id"] == scan["scan_id"] and _scan_payload_cache["payload"] is not None:
-        return _scan_payload_cache["payload"]
+def _build_scan_payload(scan, rows):
     symbols = []
     for r in rows:
         plain = explain_scan_row(r)
@@ -326,10 +383,16 @@ async def get_latest_scan(user=Depends(get_user)):
         v3_signals = compute_v3_signals(r["symbol"], r, tech)
         try:
             from trader.entry_profiles import evaluate_profile_entry
-            entry_profile = evaluate_profile_entry(r, v3_signals, plain.get("side"))
+            entry_profile_full = evaluate_profile_entry(r, v3_signals, plain.get("side"))
         except Exception as e:
-            entry_profile = {"status": "error", "reason": str(e), "template": "unknown", "template_name": "鏈煡"}
-        plain = apply_entry_profile_plain_signal(plain, entry_profile)
+            entry_profile_full = {"status": "error", "reason": str(e), "template": "unknown", "template_name": "鏈煡"}
+        plain = apply_entry_profile_plain_signal(plain, entry_profile_full)
+        entry_profile = {
+            "status": entry_profile_full.get("status"),
+            "reason": entry_profile_full.get("reason"),
+            "template": entry_profile_full.get("template"),
+            "template_name": entry_profile_full.get("template_name"),
+        }
         symbols.append({
             "symbol": r["symbol"],
             "price": float(r["market_price"] or 0),
@@ -345,9 +408,7 @@ async def get_latest_scan(user=Depends(get_user)):
             "entry_alpha": float(r["entry_alpha"] or 0),
             "hold_alpha": float(r["hold_alpha"] or 0),
             "plain_signal": plain,
-            "v3_signals": v3_signals,
             "entry_profile": entry_profile,
-            "score_layers": features.get("score_layers", {}),
             "market_section": compute_market_section({
                 "relative_strength": r["relative_strength"],
                 "composite_score": r["composite_score"],
@@ -359,10 +420,52 @@ async def get_latest_scan(user=Depends(get_user)):
             }),
         })
     symbols.sort(key=lambda x: -x["composite_score"])
-    payload = {"scan_time": scan["time"], "count": len(symbols), "symbols": symbols}
-    _scan_payload_cache["scan_id"] = scan["scan_id"]
-    _scan_payload_cache["payload"] = payload
+    return {"scan_time": scan["time"], "count": len(symbols), "symbols": symbols}
+
+
+def _refresh_scan_payload_sync():
+    latest = fetch_latest_scan_meta()
+    if latest and _scan_payload_cache["scan_id"] == latest["scan_id"] and _scan_payload_cache["payload"] is not None:
+        return _scan_payload_cache["payload"]
+    scan, rows = fetch_latest_scan()
+    if not scan:
+        payload = {"scan_time": None, "symbols": []}
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        _scan_payload_cache.update({"scan_id": None, "payload": payload, "body": body, "time": time.time()})
+        return payload
+    if _scan_payload_cache["scan_id"] == scan["scan_id"] and _scan_payload_cache["payload"] is not None:
+        return _scan_payload_cache["payload"]
+    payload = _build_scan_payload(scan, rows)
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    _scan_payload_cache.update({"scan_id": scan["scan_id"], "payload": payload, "body": body, "time": time.time()})
     return payload
+
+
+def _scan_payload_response():
+    body = _scan_payload_cache.get("body")
+    if body is not None:
+        return Response(content=body, media_type="application/json")
+    return json_response(_scan_payload_cache.get("payload") or {"scan_time": None, "symbols": []})
+
+
+async def _scan_cache_refresher():
+    while True:
+        try:
+            await asyncio.to_thread(_refresh_scan_payload_sync)
+        except Exception:
+            pass
+        await asyncio.sleep(_SCAN_CACHE_TTL)
+
+
+@app.get("/api/scan/latest")
+async def get_latest_scan(user=Depends(get_user)):
+    scan = await asyncio.to_thread(fetch_latest_scan_meta)
+    if not scan:
+        return json_response({"scan_time": None, "symbols": []})
+    if _scan_payload_cache["scan_id"] == scan["scan_id"] and _scan_payload_cache["payload"] is not None:
+        return _scan_payload_response()
+    await asyncio.to_thread(_refresh_scan_payload_sync)
+    return _scan_payload_response()
 
 
 @app.get("/api/scan/details")
@@ -379,11 +482,47 @@ def _parse_json(value, default=None):
         return default if default is not None else {}
 
 
+def _alpha_dashboard_version():
+    from shared.db import get_conn
+
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT
+                   (SELECT scan_id FROM alpha_scan_scores ORDER BY time DESC LIMIT 1) AS scan_id,
+                   (SELECT MAX(time) FROM alpha_scan_scores) AS scan_time,
+                   (SELECT MAX(id) FROM alpha_trade_candidates) AS candidate_id,
+                   (SELECT MAX(updated_at) FROM alpha_trade_candidates) AS candidate_updated,
+                   (SELECT MAX(time) FROM alpha_trade_candidates) AS candidate_time,
+                   (SELECT COUNT(*) FROM alpha_trade_candidates) AS candidate_count,
+                   (SELECT MAX(cooldown_until) FROM alpha_cooldowns WHERE source = 'alpha') AS cooldown_until,
+                   (SELECT COUNT(*) FROM alpha_cooldowns WHERE source = 'alpha') AS cooldown_count"""
+        ).fetchone()
+        return tuple(row) if row else None
+    finally:
+        conn.close()
+
+
+def _slim_alpha_candidate(row):
+    keys = (
+        "id", "time", "alpha_symbol", "base_asset", "futures_symbol",
+        "alpha_discovery_score", "alpha_profile", "normal_score", "normal_grade",
+        "normal_side", "entry_status", "block_reason", "adapter_quality",
+        "volume_price_state", "volume_price_action", "volume_price_reasons_json",
+        "volume_price_max_position_factor", "updated_at",
+    )
+    return {k: row.get(k) for k in keys if k in row}
+
+
 @app.get("/api/alpha/scan/latest")
 async def get_latest_alpha_scan(user=Depends(get_user)):
+    version = await asyncio.to_thread(_alpha_dashboard_version)
+    cached = versioned_response_get("alpha_scan_latest", version)
+    if cached is not None:
+        return cached
     scan, rows = fetch_latest_alpha_scan()
     if not scan:
-        return {"scan_time": None, "count": 0, "symbols": []}
+        return versioned_response_set("alpha_scan_latest", version, {"scan_time": None, "count": 0, "symbols": []})
     candidate_rows = fetch_latest_alpha_trade_candidates(500)
     candidate_by_alpha = {}
     for c in candidate_rows:
@@ -441,7 +580,11 @@ async def get_latest_alpha_scan(user=Depends(get_user)):
                 "updated_at": candidate.get("updated_at"),
             } if candidate else None,
         })
-    return {"scan_time": scan["time"], "count": len(symbols), "symbols": symbols, "cooldowns": cooldowns}
+    return versioned_response_set(
+        "alpha_scan_latest",
+        version,
+        {"scan_time": scan["time"], "count": len(symbols), "symbols": symbols, "cooldowns": cooldowns},
+    )
 
 
 @app.get("/api/alpha/scan/by_symbol/{alpha_symbol}")
@@ -592,21 +735,26 @@ def _build_factor_analysis_from_performance(conn):
 
 def _enrich_backtest_review(conn, review):
     review = review or {}
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
     rows = conn.execute(
         """SELECT symbol, grade, grade_score, grade_time, max_drawdown,
                   return_6h, return_12h, return_24h, return_48h, win_12h, win_24h
            FROM backtest_results
-           WHERE datetime(substr(replace(grade_time, 'T', ' '), 1, 19)) >= datetime('now', '-1 day')
-           ORDER BY datetime(substr(replace(grade_time, 'T', ' '), 1, 19)) DESC
+           WHERE grade_time >= ?
+           ORDER BY grade_time DESC
            LIMIT 5000"""
+        ,
+        (cutoff,),
     ).fetchall()
     trades = conn.execute(
         """SELECT symbol, side, pnl_pct, pnl, exit_reason, entry_time, exit_time,
                   grade_at_entry, score_at_entry
            FROM trades
-           WHERE datetime(substr(replace(exit_time, 'T', ' '), 1, 19)) >= datetime('now', '-1 day')
-           ORDER BY datetime(substr(replace(exit_time, 'T', ' '), 1, 19)) DESC
+           WHERE exit_time >= ?
+           ORDER BY exit_time DESC
            LIMIT 200"""
+        ,
+        (cutoff,),
     ).fetchall()
     entry_issues = []
     exit_issues = []
@@ -737,10 +885,14 @@ def _enrich_backtest_review(conn, review):
 
 @app.get("/api/alpha/trade_candidates")
 async def get_alpha_trade_candidates(user=Depends(get_user)):
-    return {
-        "candidates": fetch_latest_alpha_trade_candidates(200),
+    version = await asyncio.to_thread(_alpha_dashboard_version)
+    cached = versioned_response_get("alpha_trade_candidates", version)
+    if cached is not None:
+        return cached
+    return versioned_response_set("alpha_trade_candidates", version, {
+        "candidates": [_slim_alpha_candidate(c) for c in fetch_latest_alpha_trade_candidates(200)],
         "cooldowns": fetch_active_alpha_cooldowns(100),
-    }
+    })
 
 
 def compute_heat_score(tech: dict, row: dict, fut: dict | None = None) -> dict:
@@ -1099,12 +1251,24 @@ async def get_factor_analysis(user=Depends(get_user)):
     from shared.db import get_conn
     conn = get_conn()
     try:
+        version_row = conn.execute(
+            """SELECT
+                   (SELECT MAX(rowid) FROM factor_analysis) AS analysis_rowid,
+                   (SELECT MAX(run_time) FROM factor_performance) AS performance_run"""
+        ).fetchone()
+        version = (
+            version_row["analysis_rowid"] if version_row else None,
+            version_row["performance_run"] if version_row else None,
+        )
+        cached = versioned_cache_get("backtest_factor_analysis", version)
+        if cached is not None:
+            return cached
         row = conn.execute(
             "SELECT result FROM factor_analysis ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         if row and row["result"]:
-            return json.loads(row["result"])
-        return _build_factor_analysis_from_performance(conn)
+            return versioned_cache_set("backtest_factor_analysis", version, json.loads(row["result"]))
+        return versioned_cache_set("backtest_factor_analysis", version, _build_factor_analysis_from_performance(conn))
     except Exception as e:
         return {"error": str(e), "recommendations": [], "candidate_recommendations": []}
     finally:
@@ -1121,9 +1285,28 @@ async def get_backtest_review(user=Depends(get_user)):
             "SELECT run_time, review_json FROM backtest_review ORDER BY run_time DESC LIMIT 1"
         ).fetchone()
         if row:
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+            version_row = conn.execute(
+                """SELECT
+                       (SELECT MAX(grade_time) FROM backtest_results WHERE grade_time >= ?) AS latest_grade_time,
+                       (SELECT COUNT(*) FROM backtest_results WHERE grade_time >= ?) AS recent_grade_count,
+                       (SELECT MAX(exit_time) FROM trades WHERE exit_time >= ?) AS latest_trade_exit,
+                       (SELECT COUNT(*) FROM trades WHERE exit_time >= ?) AS recent_trade_count""",
+                (cutoff, cutoff, cutoff, cutoff),
+            ).fetchone()
+            version = (
+                row["run_time"],
+                version_row["latest_grade_time"],
+                version_row["recent_grade_count"],
+                version_row["latest_trade_exit"],
+                version_row["recent_trade_count"],
+            )
+            cached = versioned_cache_get("backtest_review", version)
+            if cached is not None:
+                return cached
             data = json.loads(row["review_json"])
             data["_run_time"] = row["run_time"]
-            return _enrich_backtest_review(conn, data)
+            return versioned_cache_set("backtest_review", version, _enrich_backtest_review(conn, data))
         return {"error": "鏆傛棤澶嶇洏鏁版嵁锛岃杩愯鍥炴祴"}
     except Exception as e:
         return {"error": str(e)}
@@ -1523,7 +1706,23 @@ async def get_trading_status(user=Depends(get_user)):
                     "max_floating_pnl": 0,
                     "roll_enabled": False,
                     "roll_block_reason": None,
+                    "alpha_current_score": None,
+                    "alpha_volume_price_state": None,
+                    "alpha_volume_price_action": None,
+                    "alpha_volume_price_reason": None,
                 }
+            alpha_context = {}
+            if "strategy_source" in r.keys() and r["strategy_source"] == "alpha":
+                try:
+                    from shared.db import fetch_latest_alpha_position_context
+
+                    alpha_context = fetch_latest_alpha_position_context(
+                        symbol=symbol,
+                        alpha_symbol=r["alpha_symbol"] if "alpha_symbol" in r.keys() else None,
+                    ) or {}
+                except Exception:
+                    alpha_context = {}
+            alpha_reasons = _parse_json(alpha_context.get("volume_price_reasons_json"), [])
             return {
                 "entry_reason": r["entry_reason"],
                 "entry_score": float(r["entry_score"] or 0),
@@ -1545,6 +1744,10 @@ async def get_trading_status(user=Depends(get_user)):
                 "max_floating_pnl": float(r["max_floating_pnl"] or 0) if "max_floating_pnl" in r.keys() else 0,
                 "roll_enabled": bool(r["roll_enabled"]) if "roll_enabled" in r.keys() else False,
                 "roll_block_reason": r["roll_block_reason"] if "roll_block_reason" in r.keys() else None,
+                "alpha_current_score": float(alpha_context.get("alpha_score") or 0) if alpha_context else None,
+                "alpha_volume_price_state": alpha_context.get("volume_price_state") if alpha_context else None,
+                "alpha_volume_price_action": alpha_context.get("volume_price_action") if alpha_context else None,
+                "alpha_volume_price_reason": alpha_reasons[0] if alpha_reasons else None,
             }
 
         decision_panel = {
@@ -1824,24 +2027,41 @@ async def get_strategy_decisions(
             where.append("decision_result = ?")
             params.append(result)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        version_row = conn.execute(
+            f"""SELECT MAX(id) AS latest_id, MAX(time) AS latest_time, COUNT(*) AS total
+                FROM strategy_decisions
+                {where_sql}""",
+            params,
+        ).fetchone()
+        total = int(version_row["total"] or 0) if version_row else 0
+        version = (
+            page,
+            limit,
+            symbol.upper() if symbol else None,
+            stage,
+            result,
+            version_row["latest_id"] if version_row else None,
+            version_row["latest_time"] if version_row else None,
+            total,
+        )
+        cached = versioned_response_get("strategy_decisions", version)
+        if cached is not None:
+            return cached
         rows = conn.execute(
-            f"""SELECT *
+            f"""SELECT id, time, run_id, symbol, scan_id, decision_stage, decision_result,
+                       filter_reason, composite_score, side, price, created_at
                 FROM strategy_decisions
                 {where_sql}
                 ORDER BY time DESC, id DESC
                 LIMIT ? OFFSET ?""",
             (*params, limit, offset),
         ).fetchall()
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM strategy_decisions {where_sql}",
-            params,
-        ).fetchone()[0]
-        return {
+        return versioned_response_set("strategy_decisions", version, {
             "total": total,
             "page": page,
             "limit": limit,
             "decisions": [dict(r) for r in rows],
-        }
+        })
     except Exception as e:
         return {"error": str(e), "decisions": []}
     finally:

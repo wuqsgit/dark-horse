@@ -33,6 +33,32 @@ function entryLevelText(v) {
   return v || '-';
 }
 
+function volumePriceText(v) {
+  const map = {
+    accumulation_volume: 'Accumulation',
+    breakout_pullback: 'Breakout pullback',
+    momentum_continuation: 'Momentum',
+    wide_spread: 'Wide spread',
+    neutral: 'Neutral',
+    failed_breakout: 'Failed breakout',
+    distribution: 'Distribution',
+    dumping: 'Dumping',
+    breakdown: 'Breakdown',
+  };
+  return map[v] || v || '-';
+}
+
+function volumePriceActionText(v) {
+  const map = {
+    normal_review: 'normal',
+    normal_review_probe: 'probe',
+    short_review_only: 'short',
+    observe: 'observe',
+    cooldown: 'cooldown',
+  };
+  return map[v] || v || '-';
+}
+
 function DecisionPanel({ panel }) {
   const reasons = panel?.top_reasons || [];
   const recent = panel?.recent || [];
@@ -260,6 +286,13 @@ export default function LiveTrading() {
                 {p.strategy_source === 'alpha' && (
                   <div className="scan-score" style={{ marginBottom: 10 }}>
                     {p.alpha_symbol || 'Alpha'} · {alphaProfileText(p.alpha_profile)} · {entryLevelText(p.alpha_entry_level)} · Alpha {fmt(p.alpha_score, 1)}
+                  </div>
+                )}
+                {p.strategy_source === 'alpha' && p.alpha_volume_price_state && (
+                  <div className="scan-score" style={{ marginBottom: 10 }}>
+                    Alpha hold: {volumePriceText(p.alpha_volume_price_state)} · {volumePriceActionText(p.alpha_volume_price_action)}
+                    {p.alpha_current_score != null ? ` · score ${fmt(p.alpha_current_score, 1)}` : ''}
+                    {p.alpha_volume_price_reason ? ` · ${p.alpha_volume_price_reason}` : ''}
                   </div>
                 )}
                 <div className="pos-body">

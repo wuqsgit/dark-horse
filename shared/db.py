@@ -661,6 +661,7 @@ def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_candidates_dedupe "
         "ON strategy_policy_candidates(dedupe_key) WHERE dedupe_key IS NOT NULL"
     )
+    _ensure_performance_indexes(conn)
     conn.execute(
         """INSERT OR IGNORE INTO trading_runtime_controls(key, value)
            VALUES ('normal_trading_enabled', 'true')"""
@@ -676,6 +677,101 @@ def _ensure_column(conn, table, column, ddl):
     cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _ensure_performance_indexes(conn):
+    """Add query-path indexes for the scanner, dashboard, trader, and reviews."""
+    indexes = [
+        # Market data: most reads are latest-N by symbol or latest scan windows.
+        ("idx_c1h_time_symbol", "candles_1h", "time DESC, symbol"),
+        ("idx_c15m_time_symbol", "candles_15m", "time DESC, symbol"),
+        ("idx_c6h_sym_time", "candles_6h", "symbol, time DESC"),
+        ("idx_c6h_time_symbol", "candles_6h", "time DESC, symbol"),
+        ("idx_c24h_sym_time", "candles_24h", "symbol, time DESC"),
+        ("idx_c24h_time_symbol", "candles_24h", "time DESC, symbol"),
+        ("idx_fut_time_symbol", "futures_data", "time DESC, symbol"),
+        ("idx_oc_time_symbol", "onchain_flows", "time DESC, symbol"),
+        ("idx_oc_chain_time", "onchain_flows", "chain, time DESC"),
+        ("idx_orderbook_depth_symbol_time", "orderbook_depth", "symbol, time DESC"),
+        ("idx_orderbook_depth_time_symbol", "orderbook_depth", "time DESC, symbol"),
+        ("idx_ob_symbol_timestamp", "orderbook_snapshots", "symbol, timestamp DESC"),
+        # Normal scoring and live decisions.
+        ("idx_alpha_scores_symbol_time_desc", "alpha_scores", "symbol, time DESC"),
+        ("idx_alpha_scores_time_score", "alpha_scores", "time DESC, composite_score DESC"),
+        ("idx_alpha_scores_scan_score", "alpha_scores", "scan_id, composite_score DESC"),
+        ("idx_alpha_scores_grade_time", "alpha_scores", "composite_summary, time DESC"),
+        ("idx_strategy_decisions_symbol_time", "strategy_decisions", "symbol, time DESC"),
+        ("idx_strategy_decisions_stage_time", "strategy_decisions", "decision_stage, time DESC"),
+        ("idx_strategy_decisions_result_time", "strategy_decisions", "decision_result, time DESC"),
+        ("idx_strategy_decisions_run_symbol", "strategy_decisions", "run_id, symbol"),
+        ("idx_strategy_decisions_created", "strategy_decisions", "created_at DESC"),
+        ("idx_signal_outcomes_symbol_time", "signal_outcomes", "symbol, signal_time DESC"),
+        ("idx_signal_outcomes_complete_time", "signal_outcomes", "is_complete, signal_time DESC"),
+        ("idx_signal_outcomes_scan", "signal_outcomes", "scan_id"),
+        # Backtests, factors, and learning pages.
+        ("idx_backtest_symbol_time", "backtest_results", "symbol, grade_time DESC"),
+        ("idx_backtest_run_symbol", "backtest_results", "run_time DESC, symbol"),
+        ("idx_backtest_run_grade", "backtest_results", "run_time DESC, grade"),
+        ("idx_factor_perf_name_run", "factor_performance", "factor_name, run_time DESC"),
+        ("idx_factor_perf_bucket_run", "factor_performance", "bucket, run_time DESC"),
+        ("idx_factor_effectiveness_bucket", "factor_effectiveness", "bucket, run_time DESC"),
+        ("idx_factor_analysis_run", "factor_analysis", "run_time DESC"),
+        ("idx_policy_candidates_target_status", "strategy_policy_candidates", "target, status"),
+        ("idx_policy_audit_created", "strategy_policy_audit", "created_at DESC"),
+        ("idx_shadow_symbol_created", "shadow_decisions", "symbol, created_at DESC"),
+        # Orders, fills, trades, and position management.
+        ("idx_trades_symbol_created", "trades", "symbol, created_at DESC"),
+        ("idx_trades_created", "trades", "created_at DESC"),
+        ("idx_trades_source_created", "trades", "source, created_at DESC"),
+        ("idx_trades_strategy_created", "trades", "strategy_source, created_at DESC"),
+        ("idx_trades_alpha_symbol", "trades", "alpha_symbol, created_at DESC"),
+        ("idx_orders_status_created", "orders", "status, created_at DESC"),
+        ("idx_orders_symbol_created", "orders", "symbol, created_at DESC"),
+        ("idx_orders_alpha_symbol", "orders", "alpha_symbol, created_at DESC"),
+        ("idx_fills_symbol_created", "fills", "symbol, created_at DESC"),
+        ("idx_fills_order_id", "fills", "order_id"),
+        ("idx_fills_alpha_symbol", "fills", "alpha_symbol, created_at DESC"),
+        ("idx_position_history_update", "position_history", "update_time DESC"),
+        ("idx_position_history_strategy", "position_history", "strategy_source"),
+        ("idx_position_history_alpha", "position_history", "alpha_symbol"),
+        ("idx_positions_symbol_time", "positions_history", "symbol, time DESC"),
+        ("idx_position_roll_events_position", "position_roll_events", "position_id, created_at DESC"),
+        ("idx_position_roll_events_created", "position_roll_events", "created_at DESC"),
+        ("idx_trade_cooldown_until_symbol", "trade_cooldown", "cooldown_until, symbol"),
+        # Symbol universes and snapshots.
+        ("idx_symbols_active_last_seen", "symbols", "is_active, last_seen DESC"),
+        ("idx_symbol_snapshots_symbol_date", "symbol_snapshots", "symbol, date DESC"),
+        ("idx_symbol_snapshots_active_volume", "symbol_snapshots", "active, quote_volume DESC"),
+        # Alpha market data and execution adapters.
+        ("idx_alpha_symbols_base", "alpha_symbols", "base_asset"),
+        ("idx_alpha_symbols_futures", "alpha_symbols", "futures_symbol"),
+        ("idx_alpha_symbols_last_seen", "alpha_symbols", "last_seen DESC"),
+        ("idx_alpha_c1h_sym_time", "alpha_candles_1h", "alpha_symbol, time DESC"),
+        ("idx_alpha_c1h_time_symbol", "alpha_candles_1h", "time DESC, alpha_symbol"),
+        ("idx_alpha_c15m_sym_time", "alpha_candles_15m", "alpha_symbol, time DESC"),
+        ("idx_alpha_c15m_time_symbol", "alpha_candles_15m", "time DESC, alpha_symbol"),
+        ("idx_alpha_c6h_sym_time", "alpha_candles_6h", "alpha_symbol, time DESC"),
+        ("idx_alpha_c6h_time_symbol", "alpha_candles_6h", "time DESC, alpha_symbol"),
+        ("idx_alpha_c24h_sym_time", "alpha_candles_24h", "alpha_symbol, time DESC"),
+        ("idx_alpha_c24h_time_symbol", "alpha_candles_24h", "time DESC, alpha_symbol"),
+        ("idx_alpha_ob_symbol_time", "alpha_orderbook_snapshots", "alpha_symbol, timestamp DESC"),
+        ("idx_alpha_scan_scores_scan_score", "alpha_scan_scores", "scan_id, discovery_score DESC"),
+        ("idx_alpha_scan_scores_futures", "alpha_scan_scores", "futures_symbol"),
+        ("idx_alpha_scan_scores_profile_time", "alpha_scan_scores", "alpha_profile, time DESC"),
+        ("idx_alpha_scan_scores_entry_time", "alpha_scan_scores", "entry_level, time DESC"),
+        ("idx_alpha_trade_candidates_scan_score", "alpha_trade_candidates", "scan_id, alpha_discovery_score DESC"),
+        ("idx_alpha_trade_candidates_status_time", "alpha_trade_candidates", "entry_status, time DESC"),
+        ("idx_alpha_trade_candidates_updated", "alpha_trade_candidates", "updated_at DESC"),
+        ("idx_alpha_trade_candidates_profile", "alpha_trade_candidates", "alpha_profile, time DESC"),
+        ("idx_alpha_trade_candidates_vp_state", "alpha_trade_candidates", "volume_price_state, time DESC"),
+        ("idx_alpha_cooldowns_source_until", "alpha_cooldowns", "source, cooldown_until"),
+        # Miscellaneous small tables still benefit in admin/dashboard lookups.
+        ("idx_backtest_summary_updated", "backtest_summary_cache", "updated_at DESC"),
+        ("idx_trading_runtime_updated", "trading_runtime_controls", "updated_at DESC"),
+        ("idx_user_favorites_symbol", "user_favorites", "symbol"),
+    ]
+    for name, table, columns in indexes:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})")
 
 
 def close_conn():
@@ -1340,6 +1436,13 @@ def fetch_latest_scan():
     return scan, rows
 
 
+def fetch_latest_scan_meta():
+    conn = get_conn()
+    return conn.execute(
+        "SELECT scan_id, time FROM alpha_scores ORDER BY time DESC LIMIT 1"
+    ).fetchone()
+
+
 def fetch_symbol_detail(symbol):
     conn = get_conn()
     row = conn.execute(
@@ -1529,6 +1632,66 @@ def fetch_latest_alpha_trade_candidates(limit=200):
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fetch_latest_alpha_position_context(symbol=None, alpha_symbol=None):
+    """Return the freshest Alpha score and volume-price review for a live position."""
+    conn = get_conn()
+    try:
+        params = []
+        where = []
+        if symbol:
+            where.append("futures_symbol = ?")
+            params.append(symbol)
+        if alpha_symbol:
+            where.append("alpha_symbol = ?")
+            params.append(alpha_symbol)
+        if not where:
+            return None
+
+        candidate = conn.execute(
+            f"""SELECT *
+                FROM alpha_trade_candidates
+                WHERE {' OR '.join(where)}
+                ORDER BY time DESC, updated_at DESC, id DESC
+                LIMIT 1""",
+            params,
+        ).fetchone()
+
+        scan = conn.execute(
+            f"""SELECT *
+                FROM alpha_scan_scores
+                WHERE {' OR '.join(where)}
+                ORDER BY time DESC
+                LIMIT 1""",
+            params,
+        ).fetchone()
+
+        if not candidate and not scan:
+            return None
+
+        data = {}
+        if scan:
+            data.update(dict(scan))
+        if candidate:
+            c = dict(candidate)
+            data.update({
+                "candidate_id": c.get("id"),
+                "candidate_time": c.get("time"),
+                "candidate_status": c.get("entry_status"),
+                "candidate_block_reason": c.get("block_reason"),
+                "volume_price_state": c.get("volume_price_state"),
+                "volume_price_action": c.get("volume_price_action"),
+                "volume_price_reasons_json": c.get("volume_price_reasons_json"),
+                "volume_price_metrics_json": c.get("volume_price_metrics_json"),
+                "volume_price_max_position_factor": c.get("volume_price_max_position_factor"),
+                "raw_alpha_json": c.get("raw_alpha_json"),
+            })
+            if c.get("alpha_discovery_score") is not None:
+                data["alpha_score"] = c.get("alpha_discovery_score")
+        return data
     finally:
         conn.close()
 
