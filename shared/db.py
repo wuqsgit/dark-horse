@@ -1181,16 +1181,17 @@ def upsert_position_history(
     position_id = position_id or (existing["position_id"] if existing and "position_id" in existing.keys() else None) or new_position_id(symbol, side)
     conn.execute(
         """INSERT INTO position_history
-           (symbol, side, quantity, entry_price, entry_reason, entry_score, tp3_price, atr_value,
+           (symbol, side, quantity, entry_price, entry_reason, entry_score, entry_time, tp3_price, atr_value,
             highest_price, position_id, strategy_source, signal_source, alpha_symbol,
             alpha_profile, alpha_entry_level, alpha_score, alpha_suggested_position_pct, update_time)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+           VALUES (?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
            ON CONFLICT(symbol) DO UPDATE SET
              side=excluded.side,
              quantity=excluded.quantity,
              entry_price=excluded.entry_price,
              entry_reason=excluded.entry_reason,
              entry_score=excluded.entry_score,
+             entry_time=COALESCE(position_history.entry_time, excluded.entry_time),
              tp3_price=excluded.tp3_price,
              atr_value=excluded.atr_value,
              position_id=COALESCE(position_history.position_id, excluded.position_id),

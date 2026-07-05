@@ -32,7 +32,7 @@ TRADING_CONFIG = {
     "position_size_pct": 0.20,          # 每仓占总资金 20%
     "position_multiplier": 1.0,        # 仓位倍数（基于评分动态调整）
     "risk_per_trade_pct": 0.015,        # 每仓风险预算 1.5%
-    "max_positions": 3,
+    "max_positions": 5,
 
     # ── ATR 参数 ──
     "atr_multiplier_stop": 2.0,         # 止损 = ATR × 2.0
@@ -76,6 +76,7 @@ TRADING_CONFIG = {
     "spread_limits": {
         "prod": {
             "default": 0.0030,
+            "bluechip_trend": 0.0025,
             "accumulation": 0.0035,
             "breakout": 0.0035,
             "pullback": 0.0040,
@@ -86,6 +87,7 @@ TRADING_CONFIG = {
         },
         "testnet": {
             "default": 0.0050,
+            "bluechip_trend": 0.0050,
             "accumulation": 0.0045,
             "breakout": 0.0050,
             "pullback": 0.0055,
@@ -95,10 +97,40 @@ TRADING_CONFIG = {
             "hard_max": 0.0100,
         },
     },
+    "bluechip_trend": {
+        "enabled": True,
+        "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        "max_positions": 1,
+        "probe_size_factor": 0.25,
+        "confirmed_size_factor": 0.40,
+        "min_score": 55,
+        "min_entry_alpha": 45,
+        "min_relative_strength": 50,
+        "min_return_24h": 0.025,
+        "min_ema20_50_ratio": 1.004,
+        "min_support_score": 55,
+        "min_depth_score": 35,
+        "min_big_order_score": 40,
+        "max_funding_rate": 0.001,
+        "max_rsi": 82,
+        "max_price_position_value": 0.95,
+        "confirmed_score": 60,
+        "confirmed_entry_alpha": 50,
+        "confirmed_relative_strength": 58,
+        "confirmed_trend_score": 68,
+        "hard_stop_pct": 0.03,
+        "time_stop_hours": 6,
+        "time_stop_min_return": 0.008,
+        "tp1_target_pct": 0.035,
+        "tp2_target_pct": 0.070,
+        "tp1_pct": 0.50,
+        "tp2_pct": 0.30,
+        "exit_min_entry_alpha": 35,
+    },
     "alpha_trading": {
         "enabled": True,
         "testnet_only": True,
-        "allow_short": True,
+        "allow_short": False,
         "max_account_exposure": 0.30,
         "max_positions": 3,
         "max_normal_reviews_per_loop": 2,
@@ -110,6 +142,9 @@ TRADING_CONFIG = {
         "candidate_max_position_pct": 0.50,
         "cooldown_minutes": 30,
         "max_spread_pct": 0.008,
+        "position_probe_timeout_hours": 1.0,
+        "position_probe_min_progress_pct": 3.0,
+        "position_min_trend_score": 50,
         "blocked_profiles": ["high_risk_watch"],
         "allowed_entry_levels": ["probe", "candidate"],
     },

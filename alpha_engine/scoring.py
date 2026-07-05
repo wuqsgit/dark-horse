@@ -7,11 +7,14 @@ from alpha_engine.profiles import (
     classify_alpha_profile,
     weighted_alpha_score,
 )
+from alpha_engine.volume_regime import clamp, compute_trend_continuation
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 from shared.db import (
     fetch_active_alpha_symbols,
     fetch_alpha_candles,
     fetch_alpha_orderbook_depth,
+    fetch_futures,
+    fetch_klines_1h,
     insert_alpha_scan_scores,
 )
 
@@ -45,7 +48,63 @@ class AlphaScoringEngine:
     def _series(self, rows):
         return sorted(rows, key=lambda r: r["time"])
 
-    def _score_symbol(self, symbol_row, candles_1h, candles_15m, candles_24h, depth_rows):
+    def _compute_futures_sync(self, futures_symbol, futures_1h, futures_rows):
+        if not futures_symbol:
+            return {
+                "available": False,
+                "futures_volume_growth_6h": 1.0,
+                "oi_change_4h": 0.0,
+                "oi_change_24h": 0.0,
+                "funding_rate": 0.0,
+                "mark_price": 0.0,
+                "sync_score": 20.0,
+                "reason": "missing futures_symbol",
+            }
+        c1h = self._series(futures_1h)
+        frows = self._series(futures_rows)
+        quote_vol_6h = sum(float(r["quote_vol"] or 0) for r in c1h[-6:]) if c1h else 0
+        quote_vol_prev_6h = sum(float(r["quote_vol"] or 0) for r in c1h[-12:-6]) if len(c1h) >= 12 else 0
+        vol_growth = quote_vol_6h / quote_vol_prev_6h if quote_vol_prev_6h > 0 else 1.0
+        latest = frows[-1] if frows else None
+        oi_now = float(latest["open_interest"] or 0) if latest else 0.0
+
+        def oi_change(hours_back):
+            if not frows or oi_now <= 0:
+                return 0.0
+            idx = max(0, len(frows) - hours_back - 1)
+            old = float(frows[idx]["open_interest"] or 0)
+            return (oi_now - old) / old if old > 0 else 0.0
+
+        oi_4h = oi_change(4)
+        oi_24h = oi_change(24)
+        funding = float(latest["funding_rate"] or 0) if latest else 0.0
+        mark_price = float(latest["mark_price"] or 0) if latest else 0.0
+        score = 50.0
+        if vol_growth >= 1.3:
+            score += 15
+        if vol_growth >= 2.0:
+            score += 10
+        if oi_4h >= 0.03:
+            score += 15
+        if oi_24h >= 0.06:
+            score += 10
+        if abs(funding) > 0.0012:
+            score -= 15
+        if vol_growth < 1.0 and oi_4h <= 0:
+            score -= 20
+        return {
+            "available": bool(c1h or frows),
+            "futures_volume_growth_6h": round(vol_growth, 4),
+            "futures_quote_vol_6h": round(quote_vol_6h, 2),
+            "futures_quote_vol_prev_6h": round(quote_vol_prev_6h, 2),
+            "oi_change_4h": round(oi_4h, 6),
+            "oi_change_24h": round(oi_24h, 6),
+            "funding_rate": round(funding, 8),
+            "mark_price": mark_price,
+            "sync_score": round(clamp(score), 2),
+        }
+
+    def _score_symbol(self, symbol_row, candles_1h, candles_15m, candles_24h, depth_rows, futures_1h=None, futures_rows=None):
         c1h = self._series(candles_1h)
         c15m = self._series(candles_15m)
         c24h = self._series(candles_24h)
@@ -118,12 +177,25 @@ class AlphaScoringEngine:
 
         raw = {
             "returns": {"ret_15m": ret_15m, "ret_1h": ret_1h, "ret_6h": ret_6h, "pct_24h": pct_24h},
-            "volume": {"volume_24h": volume_24h, "liquidity": liquidity, "volume_growth_6h": volume_growth},
+            "volume": {
+                "volume_24h": volume_24h,
+                "liquidity": liquidity,
+                "volume_growth_6h": volume_growth,
+                "alpha_volume_growth_6h": volume_growth,
+                "alpha_quote_vol_6h": quote_vol_6h,
+                "alpha_quote_vol_prev_6h": quote_vol_prev_6h,
+            },
             "depth": {"spread_pct": spread_pct, "imbalance": imbalance, "bid_depth": bid_depth, "ask_depth": ask_depth},
             "risk": {"range_24h_pct": range_24, "pullback_from_high_pct": pullback_from_high},
             "tradeability": symbol_row["tradeability"],
             "futures_symbol": symbol_row["futures_symbol"],
         }
+        raw["futures_sync"] = self._compute_futures_sync(
+            symbol_row["futures_symbol"],
+            futures_1h or [],
+            futures_rows or [],
+        )
+        raw["alpha_trend"] = compute_trend_continuation(raw)
         raw["volume_price"] = evaluate_alpha_volume_price(raw, price)
         base_scores = {
             "discovery_score": discovery_score,
@@ -172,15 +244,24 @@ class AlphaScoringEngine:
         candles_1h = fetch_alpha_candles("alpha_candles_1h", alpha_symbols, hours=96)
         candles_15m = fetch_alpha_candles("alpha_candles_15m", alpha_symbols, hours=18)
         candles_24h = fetch_alpha_candles("alpha_candles_24h", alpha_symbols, days=40)
+        futures_symbols = sorted({r["futures_symbol"] for r in symbols if r["futures_symbol"]})
+        futures_1h = fetch_klines_1h(futures_symbols, hours=96) if futures_symbols else []
+        futures_rows = fetch_futures(futures_symbols, hours=72) if futures_symbols else []
         by_1h = {}
         by_15m = {}
         by_24h = {}
+        by_futures_1h = {}
+        by_futures = {}
         for row in candles_1h:
             by_1h.setdefault(row["alpha_symbol"], []).append(row)
         for row in candles_15m:
             by_15m.setdefault(row["alpha_symbol"], []).append(row)
         for row in candles_24h:
             by_24h.setdefault(row["alpha_symbol"], []).append(row)
+        for row in futures_1h:
+            by_futures_1h.setdefault(row["symbol"], []).append(row)
+        for row in futures_rows:
+            by_futures.setdefault(row["symbol"], []).append(row)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         results = []
@@ -195,6 +276,8 @@ class AlphaScoringEngine:
                 by_15m.get(symbol, []),
                 by_24h.get(symbol, []),
                 fetch_alpha_orderbook_depth(symbol, hours=6),
+                by_futures_1h.get(symbol_row["futures_symbol"], []),
+                by_futures.get(symbol_row["futures_symbol"], []),
             )
             results.append(result)
             insert_rows.append((

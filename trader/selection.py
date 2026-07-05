@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from shared.db import get_conn
+from trader.config import TRADING_CONFIG
+from trader.symbol_risk import get_symbol_risk
 
 logger = logging.getLogger("selection")
 
@@ -209,6 +211,8 @@ class CandidateSelector:
         raw = _raw_features(row)
         hist = raw.get("historical_performance") or self._get_historical_performance(row["symbol"])
         entry_alpha = float(row.get("entry_alpha") or raw.get("entry_alpha") or score)
+        symbol_risk = get_symbol_risk(row["symbol"])
+        risk_rank_factor = float(symbol_risk.get("max_position_factor") or 0.35)
 
         category = self._get_category(row["symbol"])
         discovery_bonus = 4.0 if category == DEFAULT_CATEGORY else 0.0
@@ -240,6 +244,7 @@ class CandidateSelector:
             + entry_alpha * 0.25
             + strength * 0.20
             + liquidity * 0.15
+            + min(6.0, risk_rank_factor * 6.0)
             + history_adjust
             + discovery_bonus
             - risk_penalty,
@@ -321,6 +326,167 @@ class CandidateSelector:
             return True, ""
         finally:
             conn.close()
+
+
+def _num(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else fallback)
+    except Exception:
+        return fallback
+
+
+class BluechipTrendSelector:
+    """Independent trend lane for BTC/ETH/SOL style steady moves."""
+
+    def __init__(self, cfg: dict | None = None):
+        self.cfg = cfg or (TRADING_CONFIG.get("bluechip_trend") or {})
+        self.last_evaluations: list[dict] = []
+
+    def _symbols(self) -> set[str]:
+        return {str(x).upper() for x in self.cfg.get("symbols", [])}
+
+    def _score(self, row: dict, raw: dict) -> tuple[float, dict]:
+        tech = raw.get("technical") or {}
+        fut = raw.get("futures") or {}
+        depth = raw.get("depth") or {}
+        score = _num(row.get("composite_score"))
+        entry_alpha = _num(row.get("entry_alpha"))
+        rs = _num(row.get("relative_strength"), 50)
+        ret_24h = _num(tech.get("price_change_24h") if tech.get("price_change_24h") is not None else tech.get("return_24h"))
+        ret_6h = _num(tech.get("return_6h"))
+        ema_slope = _num(tech.get("ema20_slope"))
+        ema_ratio = _num(tech.get("ema20_50_ratio"), 1.0)
+        volume_change = _num(tech.get("volume_change_pct"))
+        oi_change = _num(fut.get("oi_change_pct"))
+        support_score = _num(tech.get("support_score"), 50)
+        absorption_score = _num(tech.get("absorption_score"), 50)
+        depth_score = _num(depth.get("depth_ratio_score"), 50)
+        big_order_score = _num(depth.get("big_order_score"), 50)
+        rsi = _num(tech.get("rsi_14"), 50)
+        position_value = _num(tech.get("price_position_value"), 0.5)
+        trend_score = _num(tech.get("trend_score"), 50)
+
+        trend_component = min(100.0, max(0.0, 50 + ret_24h * 500 + max(0, ema_ratio - 1) * 1800 + max(0, ema_slope) * 6))
+        contract_component = min(100.0, max(0.0, 50 + oi_change * 500 + (10 if _num(fut.get("oi_score"), 50) >= 65 else 0)))
+        volume_component = min(100.0, max(0.0, 50 + volume_change * 45))
+        support_component = max(support_score, absorption_score)
+        depth_component = depth_score * 0.7 + big_order_score * 0.3
+        overheat_penalty = 0.0
+        if rsi > 72:
+            overheat_penalty += min(18.0, (rsi - 72) * 1.4)
+        if position_value > 0.88:
+            overheat_penalty += min(14.0, (position_value - 0.88) * 80)
+
+        bluechip_score = (
+            trend_component * 0.25
+            + contract_component * 0.20
+            + volume_component * 0.20
+            + support_component * 0.15
+            + depth_component * 0.10
+            + min(100.0, score + entry_alpha * 0.35 + rs * 0.20) * 0.10
+            - overheat_penalty
+        )
+        metrics = {
+            "bluechip_trend_score": round(bluechip_score, 2),
+            "trend_component": round(trend_component, 2),
+            "contract_component": round(contract_component, 2),
+            "volume_component": round(volume_component, 2),
+            "support_component": round(support_component, 2),
+            "depth_component": round(depth_component, 2),
+            "overheat_penalty": round(overheat_penalty, 2),
+            "score": score,
+            "entry_alpha": entry_alpha,
+            "relative_strength": rs,
+            "ret_24h": ret_24h,
+            "ret_6h": ret_6h,
+            "ema20_slope": ema_slope,
+            "ema20_50_ratio": ema_ratio,
+            "volume_change_pct": volume_change,
+            "oi_change_pct": oi_change,
+            "support_score": support_score,
+            "absorption_score": absorption_score,
+            "depth_ratio_score": depth_score,
+            "big_order_score": big_order_score,
+            "rsi_14": rsi,
+            "price_position_value": position_value,
+            "trend_score": trend_score,
+        }
+        return round(bluechip_score, 3), metrics
+
+    def _evaluate(self, row: dict, current_symbols: set[str], bluechip_open: int) -> dict:
+        raw = _raw_features(row)
+        symbol = str(row.get("symbol") or "").upper()
+        score, metrics = self._score(row, raw)
+        cfg = self.cfg
+        reasons = []
+        if not cfg.get("enabled", True):
+            reasons.append("bluechip trend lane disabled")
+        if symbol not in self._symbols():
+            reasons.append("not bluechip symbol")
+        if symbol in current_symbols:
+            reasons.append("already in position")
+        if bluechip_open >= int(cfg.get("max_positions", 1)):
+            reasons.append("bluechip trend slot already used")
+        if metrics["score"] < float(cfg.get("min_score", 55)):
+            reasons.append(f"score {metrics['score']:.1f} < {float(cfg.get('min_score', 55)):.1f}")
+        if metrics["entry_alpha"] < float(cfg.get("min_entry_alpha", 45)):
+            reasons.append(f"entry_alpha {metrics['entry_alpha']:.1f} < {float(cfg.get('min_entry_alpha', 45)):.1f}")
+        if metrics["relative_strength"] < float(cfg.get("min_relative_strength", 50)):
+            reasons.append(f"relative_strength {metrics['relative_strength']:.1f} < {float(cfg.get('min_relative_strength', 50)):.1f}")
+        if metrics["ret_24h"] < float(cfg.get("min_return_24h", 0.025)):
+            reasons.append(f"return_24h {metrics['ret_24h']:.2%} < {float(cfg.get('min_return_24h', 0.025)):.2%}")
+        if metrics["ema20_50_ratio"] < float(cfg.get("min_ema20_50_ratio", 1.004)) or metrics["ema20_slope"] <= 0:
+            reasons.append("EMA trend not confirmed")
+        if metrics["support_score"] < float(cfg.get("min_support_score", 55)) and metrics["absorption_score"] < float(cfg.get("min_support_score", 55)):
+            reasons.append("support/absorption not confirmed")
+        if metrics["depth_ratio_score"] < float(cfg.get("min_depth_score", 35)):
+            reasons.append(f"depth_score {metrics['depth_ratio_score']:.1f} too weak")
+        if metrics["big_order_score"] < float(cfg.get("min_big_order_score", 40)):
+            reasons.append(f"big_order_score {metrics['big_order_score']:.1f} too weak")
+        if metrics["rsi_14"] > float(cfg.get("max_rsi", 82)):
+            reasons.append(f"rsi {metrics['rsi_14']:.1f} > {float(cfg.get('max_rsi', 82)):.1f}")
+        if metrics["price_position_value"] > float(cfg.get("max_price_position_value", 0.95)):
+            reasons.append(f"price_position_value {metrics['price_position_value']:.2f} too high")
+        funding = _num((raw.get("futures") or {}).get("funding_rate"))
+        if abs(funding) > float(cfg.get("max_funding_rate", 0.001)):
+            reasons.append(f"funding_rate {funding:.5f} too high")
+
+        confirmed = (
+            metrics["score"] >= float(cfg.get("confirmed_score", 60))
+            and metrics["entry_alpha"] >= float(cfg.get("confirmed_entry_alpha", 50))
+            and metrics["relative_strength"] >= float(cfg.get("confirmed_relative_strength", 58))
+            and metrics["trend_score"] >= float(cfg.get("confirmed_trend_score", 68))
+        )
+        mode = "trend_confirmed" if confirmed else "probe"
+        return {
+            **row,
+            "side": "LONG",
+            "bluechip_trend_score": score,
+            "bluechip_metrics": metrics,
+            "bluechip_entry_mode": mode,
+            "bluechip_size_factor": float(cfg.get("confirmed_size_factor" if confirmed else "probe_size_factor", 0.25)),
+            "bluechip_reject_reason": "; ".join(reasons),
+            "selection_category": "bluechip_trend",
+            "selection_score": score,
+        }
+
+    def select_candidates(self, scored_symbols: list, current_positions: list, max_positions: int = 1) -> list[dict]:
+        if not self.cfg.get("enabled", False) or max_positions <= 0:
+            self.last_evaluations = []
+            return []
+        current_symbols = {str(p.get("symbol") or "").upper() for p in current_positions}
+        bluechip_symbols = self._symbols()
+        bluechip_open = sum(1 for sym in current_symbols if sym in bluechip_symbols)
+        evaluations = []
+        for raw in scored_symbols:
+            row = _as_dict(raw).copy()
+            if str(row.get("symbol") or "").upper() not in bluechip_symbols:
+                continue
+            evaluations.append(self._evaluate(row, current_symbols, bluechip_open))
+        evaluations.sort(key=lambda x: x["bluechip_trend_score"], reverse=True)
+        self.last_evaluations = evaluations
+        selected = [x for x in evaluations if not x.get("bluechip_reject_reason")]
+        return selected[: min(max_positions, int(self.cfg.get("max_positions", 1)))]
 
 
 def get_candidate_rankings(scored_symbols: list) -> list:

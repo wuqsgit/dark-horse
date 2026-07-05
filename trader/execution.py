@@ -12,7 +12,8 @@ from trader.entry_profiles import evaluate_profile_entry
 from trader.config import EXCHANGE_CONFIG, TRADING_CONFIG
 from trader.cooldown_manager import is_in_cooldown, record_stop, record_profit
 from trader.market_regime import detect_current_regime, adjust_strategy_for_regime, get_regime_adjustment_message
-from trader.selection import CandidateSelector  # V5: 鍊欓夐夋嫨鍣?
+from trader.selection import BluechipTrendSelector, CandidateSelector  # V5: 鍊欓夐夋嫨鍣?
+from trader.symbol_risk import get_symbol_risk
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 logger = logging.getLogger("execution")
 
@@ -110,6 +111,29 @@ def _compute_entry_v3_signals(symbol, row):
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def _bluechip_cfg():
+    return TRADING_CONFIG.get("bluechip_trend") or {}
+
+
+def _bluechip_tp_levels(entry_price: float, side: str) -> dict:
+    cfg = _bluechip_cfg()
+    tp1_pct = float(cfg.get("tp1_target_pct", 0.035))
+    tp2_pct = float(cfg.get("tp2_target_pct", 0.070))
+    if side == "LONG":
+        tp1 = entry_price * (1 + tp1_pct)
+        tp2 = entry_price * (1 + tp2_pct)
+    else:
+        tp1 = entry_price * (1 - tp1_pct)
+        tp2 = entry_price * (1 - tp2_pct)
+    return {
+        "tp1_price": round(tp1, 8),
+        "tp2_price": round(tp2, 8),
+        "tp1_qty_pct": float(cfg.get("tp1_pct", 0.50)),
+        "tp2_qty_pct": float(cfg.get("tp2_pct", 0.30)),
+        "trail_trigger_atr": float(TRADING_CONFIG.get("trailing_stop_atr_multiplier", 1.5)),
+    }
 
 
 def _parse_time(value):
@@ -465,11 +489,24 @@ class ExecutionEngine:
         ret_1h = float(metrics.get("ret_1h") or 0)
         ret_6h = float(metrics.get("ret_6h") or 0)
         spread_pct = float(metrics.get("spread_pct") or 0)
-        max_spread_pct = float((_alpha_cfg() or {}).get("max_spread_pct", 0.0012)) * 100
+        trend_score = float(metrics.get("trend_score") or metrics.get("trend_continuation_score") or 0)
+        trend_state = str(metrics.get("trend_state") or "").lower()
+        volume_regime = str(metrics.get("volume_regime") or "").lower()
+        alpha_cfg = _alpha_cfg() or {}
+        max_spread_pct = float(alpha_cfg.get("max_spread_pct", 0.0012)) * 100
 
-        weak_states = {"failed_breakout", "distribution", "dumping", "breakdown"}
+        weak_states = {"failed_breakout", "distribution", "dumping", "breakdown", "distribution_risk_long_only", "breakdown_volume_long_only"}
         if vp_state in weak_states and pnl_pct <= 2:
             return add(f"alpha_volume_price_failed state={vp_state} pnl={pnl_pct:.1f}%", score=current_score)
+        if trend_score and trend_score < float(alpha_cfg.get("position_min_trend_score", 50)) and pnl_pct <= 2:
+            return add(f"alpha_trend_score_fade trend={trend_score:.1f} state={trend_state or '-'} pnl={pnl_pct:.1f}%", score=current_score)
+        if volume_regime in {"suspicious", "overheated", "extreme"} and pnl_pct <= 2:
+            return add(f"alpha_volume_regime_bad regime={volume_regime} pnl={pnl_pct:.1f}%", score=current_score)
+        if hist.get("alpha_entry_level") == "probe" and age_h is not None:
+            probe_timeout_h = float(alpha_cfg.get("position_probe_timeout_hours", 1.0))
+            probe_min_progress = float(alpha_cfg.get("position_probe_min_progress_pct", 3.0))
+            if age_h >= probe_timeout_h and pnl_pct < probe_min_progress:
+                return add(f"alpha_probe_timeout age={age_h:.1f}h pnl={pnl_pct:.1f}% trend={trend_score:.1f}", score=current_score)
         if vp_action in {"observe", "cooldown"} and pnl_pct <= 0 and (ret_15m < 0 or ret_1h < 0):
             return add(f"alpha_volume_price_weak action={vp_action} state={vp_state} pnl={pnl_pct:.1f}%", score=current_score)
         if spread_pct > max_spread_pct and pnl_pct <= 0:
@@ -558,6 +595,21 @@ class ExecutionEngine:
             highest_price = float(tracker.get("highest_price") or mark_price)
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
 
+            def add(action, reason, close_pct=None, is_stop=False):
+                item = {
+                    "action": action,
+                    "symbol": sym,
+                    "side": close_side,
+                    "reason": reason,
+                    "close_price": mark_price,
+                    "score": score,
+                }
+                if close_pct is not None:
+                    item["close_pct"] = close_pct
+                if is_stop:
+                    item["is_stop"] = True
+                actions.append(item)
+
             if (hist.get("strategy_source") or "normal") == "alpha":
                 alpha_action = self._build_alpha_position_action(
                     pos,
@@ -574,20 +626,31 @@ class ExecutionEngine:
                     actions.append(alpha_action)
                 continue
 
-            def add(action, reason, close_pct=None, is_stop=False):
-                item = {
-                    "action": action,
-                    "symbol": sym,
-                    "side": close_side,
-                    "reason": reason,
-                    "close_price": mark_price,
-                    "score": score,
-                }
-                if close_pct is not None:
-                    item["close_pct"] = close_pct
-                if is_stop:
-                    item["is_stop"] = True
-                actions.append(item)
+            if hist.get("signal_source") == "bluechip_trend":
+                bluechip_cfg = _bluechip_cfg()
+                bluechip_stop = float(bluechip_cfg.get("hard_stop_pct", 0.03)) * 100
+                min_entry_alpha = float(bluechip_cfg.get("exit_min_entry_alpha", 35))
+                ema_ratio = float(tech.get("ema20_50_ratio") or 1.0)
+                ema_slope = float(tech.get("ema20_slope") or 0)
+                if pnl_pct <= -bluechip_stop:
+                    add("close", f"bluechip_hard_stop pnl={pnl_pct:.1f}%", is_stop=True)
+                    continue
+                if age_h is not None and age_h >= float(bluechip_cfg.get("time_stop_hours", 6)):
+                    if pnl_pct < float(bluechip_cfg.get("time_stop_min_return", 0.008)) * 100:
+                        add("close", f"bluechip_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
+                        continue
+                if hold_alpha < min_entry_alpha and pnl_pct <= 1:
+                    add("close", f"bluechip_entry_alpha_fade {hold_alpha:.1f}")
+                    continue
+                if side == "LONG" and (ema_ratio < 1.0 or ema_slope < 0) and pnl_pct <= 2:
+                    add("close", f"bluechip_trend_invalid ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f}")
+                    continue
+                if pnl_pct >= float(bluechip_cfg.get("tp2_target_pct", 0.070)) * 100 and not int(hist.get("tp2_hit") or 0):
+                    add("partial_close", f"bluechip_TP2 pnl={pnl_pct:.1f}%", float(bluechip_cfg.get("tp2_pct", 0.30)))
+                    continue
+                if pnl_pct >= float(bluechip_cfg.get("tp1_target_pct", 0.035)) * 100 and not int(hist.get("tp1_hit") or 0):
+                    add("partial_close", f"bluechip_TP1 pnl={pnl_pct:.1f}%", float(bluechip_cfg.get("tp1_pct", 0.50)))
+                    continue
 
             if pnl_pct <= -float(self.cfg.get("hard_stop_pct", 0.05)) * 100:
                 add("close", f"hard_stop pnl={pnl_pct:.1f}%", is_stop=True)
@@ -884,26 +947,18 @@ class ExecutionEngine:
                 reject("alpha追涨冷静：15m/1h 涨幅过大，等待回踩")
                 continue
 
-            if volume_price.get("allow_short") and not volume_price.get("allow_long"):
-                side = "SHORT"
-            elif volume_price.get("allow_long") and not volume_price.get("allow_short"):
-                side = "LONG"
-            else:
-                reject(f"volume_price has no executable side: {volume_price.get('state')}", {"volume_price": volume_price})
+            if volume_price.get("allow_short"):
+                reject("alpha short disabled; long-only alpha mode", {"volume_price": volume_price})
                 continue
-            if side == "LONG" and not volume_price.get("allow_long"):
-                reject(f"volume_price blocks LONG: {volume_price.get('state')}", {"volume_price": volume_price})
+            if not volume_price.get("allow_long"):
+                reject(f"alpha long not allowed by volume trend gate: {volume_price.get('state')}", {"volume_price": volume_price})
                 continue
-            if side == "SHORT" and not volume_price.get("allow_short"):
-                reject(f"volume_price blocks SHORT: {volume_price.get('state')}", {"volume_price": volume_price})
-                continue
-            if side == "SHORT" and not cfg.get("allow_short", False):
-                reject("alpha SHORT disabled by config")
-                continue
-            action_side = "BUY" if side == "LONG" else "SELL"
+            side = "LONG"
+            action_side = "BUY"
+            symbol_risk = get_symbol_risk(symbol)
 
             vp_factor = max(0.0, min(1.0, float(volume_price.get("max_position_factor") or 0)))
-            entry_status = "probe" if vp_action in ("normal_review_probe", "short_review_only") or vp_factor <= 0.25 else "pass"
+            entry_status = "probe" if vp_action == "normal_review_probe" or vp_factor <= 0.25 else "pass"
             entry_profile = {
                 "status": entry_status,
                 "template": f"alpha_{volume_price.get('state') or 'volume_price'}",
@@ -912,6 +967,7 @@ class ExecutionEngine:
                     "position_size_factor": 1.0,
                     "probe_position_size_factor": 1.0,
                 },
+                "risk_profile": symbol_risk,
                 "volume_price_state": volume_price.get("state"),
                 "volume_price_action": vp_action,
             }
@@ -948,12 +1004,13 @@ class ExecutionEngine:
             lev = min(int(pos_info.get("leverage") or self.cfg.get("leverage_max", 3)), 3)
             source_factor = 0.25 if entry_profile.get("status") == "probe" else 0.50
             quality_factor = 1.0
-            qty = float(pos_info.get("quantity") or 0) * source_factor * quality_factor * vp_factor
+            symbol_risk_factor = max(0.0, min(1.0, float(symbol_risk.get("max_position_factor") or 1.0)))
+            qty = float(pos_info.get("quantity") or 0) * source_factor * quality_factor * vp_factor * symbol_risk_factor
             qty = self.ex.adjust_quantity(symbol, qty)
             if ob_info.get("spread_degraded"):
                 qty = self.ex.adjust_quantity(symbol, qty * 0.5)
             if qty <= 0:
-                reject("quantity <= 0", {"pos_info": pos_info, "source_factor": source_factor, "quality_factor": quality_factor, "volume_price_factor": vp_factor})
+                reject("quantity <= 0", {"pos_info": pos_info, "source_factor": source_factor, "quality_factor": quality_factor, "volume_price_factor": vp_factor, "symbol_risk_factor": symbol_risk_factor, "symbol_risk": symbol_risk})
                 continue
 
             atr = float(pos_info.get("atr_value") or 0)
@@ -991,7 +1048,7 @@ class ExecutionEngine:
                 "alpha_profile": profile,
                 "alpha_entry_level": entry_profile.get("status"),
                 "alpha_score": discovery_score,
-                "alpha_suggested_position_pct": source_factor * quality_factor * vp_factor,
+                "alpha_suggested_position_pct": source_factor * quality_factor * vp_factor * symbol_risk_factor,
             }
             actions.append(action)
             record_candidate(None, status="planned_open")
@@ -1022,6 +1079,8 @@ class ExecutionEngine:
                     "source_factor": source_factor,
                     "quality_factor": quality_factor,
                     "volume_price_factor": vp_factor,
+                    "symbol_risk_factor": symbol_risk_factor,
+                    "symbol_risk": symbol_risk,
                     "volume_price": volume_price,
                     "leverage": lev,
                     "stop_loss": stop_price,
@@ -1405,12 +1464,17 @@ class ExecutionEngine:
             f"profile_gate_active; legacy_regime_score={adj_min_score}; "
             "score gate is handled by entry profile"
         )
+        bluechip_cfg = _bluechip_cfg()
+        bluechip_symbols = {str(x).upper() for x in bluechip_cfg.get("symbols", [])}
+        bluechip_open_count = sum(1 for p in current_positions if str(p.get("symbol") or "").upper() in bluechip_symbols)
+        bluechip_reserve = 1 if bluechip_cfg.get("enabled", False) and bluechip_open_count < int(bluechip_cfg.get("max_positions", 1)) and avail > 1 else 0
 
         # === V5: 浣跨敤鍊欓夐夋嫨鍣?===
         if avail > 0 and normal_enabled:
             selector = CandidateSelector()
+            normal_slots = max(0, avail - bluechip_reserve)
             candidates = selector.select_candidates(
-                top_symbols, current_positions, max_positions=avail
+                top_symbols, current_positions, max_positions=normal_slots
             )
             
             trading = self._get_trading_symbols()
@@ -1594,6 +1658,7 @@ class ExecutionEngine:
                     size_factor *= 0.5
                 pos_info["quantity"] = round(float(pos_info.get("quantity") or 0) * size_factor, 3)
                 pos_info["profile_position_size_factor"] = size_factor
+                pos_info["symbol_risk"] = entry_profile.get("risk_profile")
                 pos_info["spread_degraded"] = bool(ob_info.get("spread_degraded"))
                 qty = pos_info["quantity"]
                 if qty <= 0:
@@ -1667,6 +1732,202 @@ class ExecutionEngine:
                     break
         elif avail > 0:
             logger.info("  normal trading runtime switch is OFF; skip normal open candidates")
+
+        open_count = len([a for a in actions if a.get("action") == "open"])
+        bluechip_avail = max(0, adj_max_pos - open_count)
+        if bluechip_avail > 0 and normal_enabled and bluechip_cfg.get("enabled", False):
+            bluechip_selector = BluechipTrendSelector(bluechip_cfg)
+            bluechip_candidates = bluechip_selector.select_candidates(
+                top_symbols,
+                current_positions,
+                max_positions=min(bluechip_avail, int(bluechip_cfg.get("max_positions", 1))),
+            )
+            for rejected in [x for x in bluechip_selector.last_evaluations if x.get("bluechip_reject_reason")][:3]:
+                self._record_decision(
+                    rejected,
+                    run_id=run_id,
+                    side="LONG",
+                    mode="bluechip_trend",
+                    decision_stage="bluechip_trend",
+                    decision_result="filtered",
+                    filter_reason=rejected.get("bluechip_reject_reason"),
+                    risk_params={"metrics": rejected.get("bluechip_metrics")},
+                    market_regime=regime,
+                )
+            trading = self._get_trading_symbols()
+            cooldown_selector = CandidateSelector()
+            for s in bluechip_candidates:
+                s = _row_to_dict(s)
+                sym = s["symbol"]
+                side = "LONG"
+                if sym not in trading:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason="not_tradable_on_exchange",
+                        risk_params={"metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    continue
+                if sym in pos_symbols:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason="already_in_position",
+                        risk_params={"metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    continue
+                if any(a["symbol"] == sym for a in actions):
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason="already_has_pending_action",
+                        risk_params={"metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    continue
+                can_open, reason = cooldown_selector.can_open(sym)
+                if not can_open:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason=reason,
+                        risk_params={"metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    continue
+
+                entry_profile = {
+                    "status": "probe" if s.get("bluechip_entry_mode") == "probe" else "pass",
+                    "template": "bluechip_trend",
+                    "template_name": "Bluechip Trend",
+                }
+                try:
+                    ob_ok, ob_reason, ob_info = self._check_live_orderbook(sym, side, entry_profile)
+                except Exception as e:
+                    ob_ok, ob_reason, ob_info = False, f"binance depth error: {e}", {}
+                if not ob_ok:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason=ob_reason,
+                        risk_params={"metrics": s.get("bluechip_metrics"), "orderbook": ob_info},
+                        market_regime=regime,
+                    )
+                    logger.info(f"  {sym}: {ob_reason}, bluechip trend skip")
+                    continue
+
+                price = s.get("price", 0) or s.get("market_price", 0)
+                if price <= 0:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason="invalid_price",
+                        risk_params={"metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    continue
+
+                score = float(s.get("bluechip_trend_score") or s.get("composite_score") or 0)
+                pos_info = calculate_position(self.ex, sym, price, balance, score)
+                size_factor = float(s.get("bluechip_size_factor") or bluechip_cfg.get("probe_size_factor", 0.25))
+                if ob_info.get("spread_degraded"):
+                    size_factor *= 0.5
+                pos_info["quantity"] = round(float(pos_info.get("quantity") or 0) * size_factor, 3)
+                qty = pos_info["quantity"]
+                if qty <= 0:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="filtered",
+                        filter_reason="quantity <= 0",
+                        risk_params={**pos_info, "metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    continue
+
+                stop_price = price * (1 - float(bluechip_cfg.get("hard_stop_pct", 0.03)))
+                tp_levels = _bluechip_tp_levels(price, side)
+                invested = round(price * qty, 2)
+                action = {
+                    "action": "open",
+                    "symbol": sym,
+                    "side": "BUY",
+                    "position_side": side,
+                    "quantity": qty,
+                    "entry_price": price,
+                    "stop_loss": stop_price,
+                    "leverage": pos_info.get("leverage", 3),
+                    "tp1_price": tp_levels["tp1_price"],
+                    "tp2_price": tp_levels["tp2_price"],
+                    "tp1_qty_pct": tp_levels["tp1_qty_pct"],
+                    "tp2_qty_pct": tp_levels["tp2_qty_pct"],
+                    "atr_value": pos_info["atr_value"],
+                    "reason": f"bluechip_trend:{s.get('bluechip_entry_mode')} score={score:.1f}",
+                    "grade": s.get("grade") or s.get("composite_summary") or "",
+                    "score": score,
+                    "invested": invested,
+                    "run_id": run_id,
+                    "scan_id": s.get("scan_id"),
+                    "entry_mode": s.get("bluechip_entry_mode"),
+                    "strategy_source": "normal",
+                    "signal_source": "bluechip_trend",
+                }
+                actions.append(action)
+                self._record_decision(
+                    s,
+                    run_id=run_id,
+                    side=side,
+                    mode="bluechip_trend",
+                    decision_stage="bluechip_trend",
+                    decision_result="planned_probe" if s.get("bluechip_entry_mode") == "probe" else "planned_open",
+                    quantity=qty,
+                    entry_price=price,
+                    risk_params={
+                        "metrics": s.get("bluechip_metrics"),
+                        "size_factor": size_factor,
+                        "leverage": pos_info.get("leverage", 3),
+                        "stop_loss": stop_price,
+                        "tp1_price": tp_levels["tp1_price"],
+                        "tp2_price": tp_levels["tp2_price"],
+                        "atr_value": pos_info["atr_value"],
+                        "invested": invested,
+                        "orderbook": ob_info,
+                    },
+                    reason={"reason": action["reason"], "regime": regime},
+                    market_regime=regime,
+                )
+                logger.info(f"  {sym}: bluechip trend {s.get('bluechip_entry_mode')} ${invested} x{qty:.4f} @${price:.4f}")
+                if len([a for a in actions if a.get("action") == "open"]) >= adj_max_pos:
+                    break
 
         open_count = len([a for a in actions if a.get("action") == "open"])
         alpha_avail = max(0, adj_max_pos - open_count)

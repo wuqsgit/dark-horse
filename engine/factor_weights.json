@@ -62,10 +62,10 @@
   },
   "sub_weights": {
     "vol_quality": 0.18,
-    "chip": 0.2,
+    "chip": 0.24200000000000005,
     "absorption": 0.12,
     "position": 0.1,
-    "rsi": 0.12,
+    "rsi": 0.132,
     "atr": 0.08,
     "vol_ratio": 0.1,
     "depth_ratio": 0.05,

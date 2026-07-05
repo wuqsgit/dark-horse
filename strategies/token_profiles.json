@@ -2,7 +2,7 @@
   "categories": {
     "蓝筹": {
       "label": "蓝筹",
-      "score_threshold": 50,
+      "score_threshold": 63,
       "risk_factor": 0.7,
       "description": "BTC/ETH/主流L1/RWA，高确定性少开但信号可靠",
       "weight_boost": 1.0,
@@ -10,7 +10,7 @@
     },
     "基本面": {
       "label": "基本面",
-      "score_threshold": 49,
+      "score_threshold": 54,
       "risk_factor": 0.9,
       "description": "DeFi/L2/AI/基础设施，有协议/数据支撑",
       "weight_boost": 1.0,
@@ -18,7 +18,7 @@
     },
     "叙事/庄股": {
       "label": "叙事/庄股",
-      "score_threshold": 57,
+      "score_threshold": 54,
       "risk_factor": 1.15,
       "description": "强庄/铭文/新叙事/GameFi，有催化但无基本面",
       "weight_boost": 1.0,

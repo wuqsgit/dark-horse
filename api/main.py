@@ -560,6 +560,11 @@ async def get_latest_alpha_scan(user=Depends(get_user)):
             "percent_change_24h": float(r["percent_change_24h"] or 0),
             "spread_pct": (raw.get("depth") or {}).get("spread_pct"),
             "volume_growth_6h": (raw.get("volume") or {}).get("volume_growth_6h"),
+            "alpha_volume_growth_6h": (raw.get("volume") or {}).get("alpha_volume_growth_6h"),
+            "futures_volume_growth_6h": (raw.get("futures_sync") or {}).get("futures_volume_growth_6h"),
+            "futures_oi_change_4h": (raw.get("futures_sync") or {}).get("oi_change_4h"),
+            "futures_oi_change_24h": (raw.get("futures_sync") or {}).get("oi_change_24h"),
+            "alpha_trend": raw.get("alpha_trend") or {},
             "volume_price": volume_price,
             "normal_review": {
                 "normal_score": candidate.get("normal_score"),
@@ -1682,10 +1687,84 @@ async def get_trading_status(user=Depends(get_user)):
             if (r["pnl"] or 0) > 0:
                 reason_stats[reason]["wins"] += 1
 
-        def position_management_fields(symbol):
+        def parse_position_time(value):
+            if not value:
+                return None
+            try:
+                from datetime import datetime, timezone
+
+                text = str(value).strip()
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        def format_holding_time(seconds):
+            if seconds is None:
+                return "-"
+            seconds = max(0, int(seconds))
+            days, rem = divmod(seconds, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, secs = divmod(rem, 60)
+            if days:
+                return f"{days}天{hours}小时"
+            if hours:
+                return f"{hours}小时{minutes}分钟"
+            if minutes:
+                return f"{minutes}分钟"
+            return f"{secs}秒"
+
+        def holding_fields(entry_time):
+            dt = parse_position_time(entry_time)
+            if not dt:
+                return {
+                    "entry_time": entry_time,
+                    "holding_seconds": None,
+                    "holding_time": "-",
+                }
+            from datetime import datetime, timezone
+
+            seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+            return {
+                "entry_time": entry_time,
+                "holding_seconds": max(0, int(seconds)),
+                "holding_time": format_holding_time(seconds),
+            }
+
+        def entry_time_from_position_id(position_id):
+            try:
+                import re
+
+                match = re.search(r"(\d{8}T\d{6}Z)", str(position_id or ""))
+                if not match:
+                    return None
+                raw = match.group(1)
+                return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}T{raw[9:11]}:{raw[11:13]}:{raw[13:15]}Z"
+            except Exception:
+                return None
+
+        def fallback_entry_time(symbol, side):
+            if side not in ("LONG", "SHORT"):
+                return None
+            open_side = "BUY" if side == "LONG" else "SELL"
+            row = conn.execute(
+                """SELECT created_at FROM orders
+                   WHERE symbol=? AND side=? AND order_type='MARKET'
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                (symbol, open_side),
+            ).fetchone()
+            return row["created_at"] if row else None
+
+        def position_management_fields(symbol, side=None):
             r = conn.execute("SELECT * FROM position_history WHERE symbol=?", (symbol,)).fetchone()
             if not r:
                 return {
+                    **holding_fields(fallback_entry_time(symbol, side)),
                     "entry_reason": None,
                     "entry_score": 0,
                     "tp1_hit": False,
@@ -1723,7 +1802,13 @@ async def get_trading_status(user=Depends(get_user)):
                 except Exception:
                     alpha_context = {}
             alpha_reasons = _parse_json(alpha_context.get("volume_price_reasons_json"), [])
+            entry_time = r["entry_time"] if "entry_time" in r.keys() else None
+            if not entry_time and "position_id" in r.keys():
+                entry_time = entry_time_from_position_id(r["position_id"])
+            if not entry_time:
+                entry_time = fallback_entry_time(symbol, side)
             return {
+                **holding_fields(entry_time),
                 "entry_reason": r["entry_reason"],
                 "entry_score": float(r["entry_score"] or 0),
                 "tp1_hit": bool(r["tp1_hit"]) if "tp1_hit" in r.keys() else False,
@@ -1841,7 +1926,7 @@ async def get_trading_status(user=Depends(get_user)):
                     "liquidation_price": p.get("liquidation_price"),
                     "break_even_price": p.get("break_even_price"),
                     "risk_api_version": p.get("risk_api_version"),
-                    **position_management_fields(p["symbol"]),
+                    **position_management_fields(p["symbol"], p.get("side")),
                 }
                 for p in positions
             ],

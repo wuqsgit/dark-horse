@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 from trader.symbol_classifier import classify_symbol
+from trader.symbol_risk import get_symbol_risk
 
 PROFILE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "configs", "entry_profiles.json"))
 _CACHE = {"mtime": None, "data": None}
@@ -102,6 +103,7 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     classification = classify_symbol(row, v3_signals, side)
     symbol = str(row.get("symbol") or "").upper()
     profile = get_entry_profile(symbol, classification.get("profile"))
+    symbol_risk = get_symbol_risk(symbol)
 
     tech = raw.get("technical") or {}
     fut = raw.get("futures") or {}
@@ -130,8 +132,10 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
 
     rr_used = _num(rr.get("rr_used") if isinstance(rr, dict) else (v3_signals or {}).get("rr_ratio"))
     volume_ratio = _num(breakout.get("volume_ratio"))
-    min_score = _num(profile.get("min_score"), 0)
-    min_entry_alpha = _num(profile.get("min_entry_alpha"), 0)
+    base_min_score = _num(profile.get("min_score"), 0)
+    base_min_entry_alpha = _num(profile.get("min_entry_alpha"), 0)
+    min_score = max(0.0, min(100.0, base_min_score + _num(symbol_risk.get("min_score_offset"), 0)))
+    min_entry_alpha = max(0.0, min(100.0, base_min_entry_alpha + _num(symbol_risk.get("min_entry_alpha_offset"), 0)))
     min_vol = _num(profile.get("volume_multiplier"), 0)
     min_rr = _num(profile.get("min_rr"), 0)
     probe_min_rr = _num(profile.get("probe_min_rr"), 0)
@@ -149,8 +153,23 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     volume_ok = volume_ratio >= min_vol if min_vol else True
     oi_ok = oi_change >= 0
     short_structure_ok = downtrend_ok and (is_high or ret_24h < 0)
+    allowed_templates = symbol_risk.get("allowed_templates") or []
+    risk_template_ok = not allowed_templates or profile.get("template") in set(allowed_templates)
+    template_position_factor = _num(profile.get("position_size_factor"), 1.0)
+    template_probe_factor = _num(profile.get("probe_position_size_factor"), template_position_factor)
+    risk_position_factor = max(0.0, min(1.0, _num(symbol_risk.get("max_position_factor"), 1.0)))
+    risk_probe_factor = max(0.0, min(1.0, _num(symbol_risk.get("probe_position_factor"), risk_position_factor)))
+    effective_position_factor = round(template_position_factor * risk_position_factor, 4)
+    effective_probe_factor = round(template_probe_factor * risk_probe_factor, 4)
 
     confirmations: list[dict] = []
+    confirmations.append(_confirmation(
+        "风险分类模板",
+        risk_template_ok,
+        f"risk_class {symbol_risk.get('class')} allows {profile.get('template')}",
+        f"risk_class {symbol_risk.get('class')} does not allow template {profile.get('template')}",
+        kind="risk",
+    ))
     confirmations.append(_confirmation("综合分", score >= min_score, f"评分 {score:.1f} 已达到 {min_score:g}", f"评分 {score:.1f} 未达到 {min_score:g}", kind="base"))
     confirmations.append(_confirmation("开仓信号", entry_alpha >= min_entry_alpha, f"Entry Alpha {entry_alpha:.1f} 已达到 {min_entry_alpha:g}", f"Entry Alpha {entry_alpha:.1f} 未达到 {min_entry_alpha:g}", kind="base"))
 
@@ -260,16 +279,27 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
         "missing": missing,
         "confirmations": confirmations,
         "thresholds": {
-            "min_score": profile.get("min_score"),
-            "min_entry_alpha": profile.get("min_entry_alpha"),
+            "min_score": min_score,
+            "min_entry_alpha": min_entry_alpha,
+            "base_min_score": base_min_score,
+            "base_min_entry_alpha": base_min_entry_alpha,
+            "effective_min_score": min_score,
+            "effective_min_entry_alpha": min_entry_alpha,
             "volume_multiplier": profile.get("volume_multiplier"),
             "min_rr": profile.get("min_rr"),
             "probe_min_rr": profile.get("probe_min_rr"),
             "require_breakout": require_breakout,
-            "position_size_factor": profile.get("position_size_factor", 1.0),
-            "probe_position_size_factor": profile.get("probe_position_size_factor"),
+            "position_size_factor": effective_position_factor,
+            "probe_position_size_factor": effective_probe_factor,
+            "base_position_size_factor": template_position_factor,
+            "base_probe_position_size_factor": template_probe_factor,
+            "risk_position_factor": risk_position_factor,
+            "risk_probe_position_factor": risk_probe_factor,
+            "effective_position_size_factor": effective_position_factor,
+            "effective_probe_position_size_factor": effective_probe_factor,
             "confirmations_required_for_full_entry": confirmations_required,
         },
+        "risk_profile": symbol_risk,
         "metrics": {
             "score": score,
             "entry_alpha": entry_alpha,
