@@ -39,7 +39,8 @@ async def trading_loop():
         logger.error("Binance API credentials missing: %s", ", ".join(missing_vars))
         return
 
-    logger.info("=== 启动实盘交易引擎 (Testnet) ===")
+    network = "Testnet" if EXCHANGE_CONFIG.get("testnet") else "Mainnet"
+    logger.info("=== 启动实盘交易引擎 (%s) ===", network)
 
     # 初始化
     ex = BinanceFutures()

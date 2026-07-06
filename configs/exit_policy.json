@@ -1,0 +1,43 @@
+{
+  "version": "2026-07-06-category-momentum-exit-v1",
+  "default_class": "narrative",
+  "classes": {
+    "core_bluechip": {
+      "hold_alpha_exit": 38,
+      "small_profit_pct": 2.0,
+      "partial_close_pct": 0.25,
+      "strong_partial_close_pct": 0.5,
+      "require_trend_broken": true,
+      "full_close_only_if_loss": true
+    },
+    "large_cap": {
+      "hold_alpha_exit": 42,
+      "small_profit_pct": 2.0,
+      "partial_close_pct": 0.35,
+      "strong_partial_close_pct": 0.5,
+      "require_trend_broken": true,
+      "full_close_only_if_loss": false
+    },
+    "fundamental": {
+      "hold_alpha_exit": 45,
+      "small_profit_pct": 2.5,
+      "partial_close_pct": 0.5,
+      "confirm_rounds_for_full_close": 2
+    },
+    "narrative": {
+      "hold_alpha_exit": 50,
+      "small_profit_pct": 2.0,
+      "partial_close_pct": 0.5,
+      "allow_full_close_on_small_profit": true
+    },
+    "meme": {
+      "hold_alpha_exit": 55,
+      "small_profit_pct": 3.0,
+      "partial_close_pct": 0.5,
+      "allow_full_close_on_small_profit": true
+    },
+    "alpha": {
+      "use_normal_momentum_exit": false
+    }
+  }
+}

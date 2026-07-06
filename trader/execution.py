@@ -1,6 +1,7 @@
 ﻿"""Live execution engine."""
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from trader.exchange import BinanceFutures
@@ -16,6 +17,10 @@ from trader.selection import BluechipTrendSelector, CandidateSelector  # V5: 鍊
 from trader.symbol_risk import get_symbol_risk
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 logger = logging.getLogger("execution")
+
+
+EXIT_POLICY_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "configs", "exit_policy.json"))
+_EXIT_POLICY_CACHE = {"mtime": None, "data": None}
 
 
 def _row_to_dict(row):
@@ -115,6 +120,59 @@ def _compute_entry_v3_signals(symbol, row):
 
 def _bluechip_cfg():
     return TRADING_CONFIG.get("bluechip_trend") or {}
+
+
+def _load_exit_policy() -> dict:
+    if not os.path.exists(EXIT_POLICY_PATH):
+        return {"default_class": "narrative", "classes": {}}
+    try:
+        mtime = os.path.getmtime(EXIT_POLICY_PATH)
+        if _EXIT_POLICY_CACHE["mtime"] == mtime and _EXIT_POLICY_CACHE["data"] is not None:
+            return _EXIT_POLICY_CACHE["data"]
+        with open(EXIT_POLICY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        _EXIT_POLICY_CACHE["mtime"] = mtime
+        _EXIT_POLICY_CACHE["data"] = data
+        return data
+    except Exception as e:
+        logger.warning("exit policy unavailable: %s", e)
+        return {"default_class": "narrative", "classes": {}}
+
+
+def _exit_policy_for_symbol(symbol: str, strategy_source: str | None = None) -> tuple[str, dict]:
+    if strategy_source == "alpha":
+        key = "alpha"
+    else:
+        risk = get_symbol_risk(symbol)
+        key = risk.get("class") or "narrative"
+    policy = _load_exit_policy()
+    classes = policy.get("classes") or {}
+    default_key = policy.get("default_class") or "narrative"
+    return key, dict(classes.get(key) or classes.get(default_key) or {})
+
+
+def _recent_momentum_exit_count(symbol: str, class_key: str, limit: int = 2) -> int:
+    try:
+        from shared.db import get_conn
+
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                """SELECT filter_reason
+                   FROM strategy_decisions
+                   WHERE symbol = ?
+                     AND decision_stage = 'position_management'
+                     AND decision_result IN ('planned_partial_close', 'planned_close')
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (symbol, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        needle = f"category_momentum_reversal class={class_key}"
+        return sum(1 for r in rows if needle in str(r["filter_reason"] or ""))
+    except Exception:
+        return 0
 
 
 def _bluechip_tp_levels(entry_price: float, side: str) -> dict:
@@ -553,6 +611,110 @@ class ExecutionEngine:
         )
         return None
 
+    def _build_category_momentum_exit(
+        self,
+        sym: str,
+        side: str,
+        close_side: str,
+        mark_price: float,
+        pnl_pct: float,
+        hold_alpha: float,
+        ret_6h: float,
+        ret_24h: float,
+        score: float,
+        score_decay: float,
+        tech: dict,
+        hist: dict,
+    ) -> dict | None:
+        strategy_source = hist.get("strategy_source") or "normal"
+        if strategy_source == "alpha":
+            return None
+
+        is_long_reversal = side == "LONG" and ret_6h < 0 and ret_24h < 0
+        is_short_reversal = side == "SHORT" and ret_6h > 0 and ret_24h > 0
+        if not (is_long_reversal or is_short_reversal):
+            return None
+
+        class_key, policy = _exit_policy_for_symbol(sym, strategy_source)
+        if policy.get("use_normal_momentum_exit") is False:
+            return None
+
+        hold_exit = float(policy.get("hold_alpha_exit", 50))
+        if hold_alpha >= hold_exit:
+            return None
+
+        small_profit = float(policy.get("small_profit_pct", 2.0))
+        partial_pct = float(policy.get("partial_close_pct", 0.5))
+        strong_partial_pct = float(policy.get("strong_partial_close_pct", partial_pct))
+        ema_ratio = float(tech.get("ema20_50_ratio") or 1.0)
+        ema_slope = float(tech.get("ema20_slope") or 0)
+        oi_change = float(tech.get("oi_change_pct") or tech.get("oi_change") or 0)
+        if side == "LONG":
+            trend_broken = ema_ratio < 1.0 or ema_slope < 0
+            oi_weak = oi_change < 0
+        else:
+            trend_broken = ema_ratio > 1.0 or ema_slope > 0
+            oi_weak = oi_change > 0
+        score_fade = score_decay >= 20
+        reason_base = (
+            f"category_momentum_reversal class={class_key} hold_alpha={hold_alpha:.1f} "
+            f"pnl={pnl_pct:.1f}% ret6h={ret_6h:.2%} ret24h={ret_24h:.2%}"
+        )
+
+        def action(kind: str, reason: str, close_pct: float | None = None) -> dict:
+            item = {
+                "action": kind,
+                "symbol": sym,
+                "side": close_side,
+                "reason": reason,
+                "close_price": mark_price,
+                "score": score,
+                "strategy_source": strategy_source,
+                "signal_source": hist.get("signal_source"),
+            }
+            if close_pct is not None:
+                item["close_pct"] = max(0.05, min(1.0, close_pct))
+            return item
+
+        if class_key == "core_bluechip":
+            if pnl_pct <= 0 and trend_broken:
+                return action("close", f"{reason_base} bluechip_loss_trend_broken")
+            if 0 < pnl_pct <= small_profit:
+                if trend_broken and (oi_weak or score_fade):
+                    return action("partial_close", f"{reason_base} bluechip_strong_warning", strong_partial_pct)
+                if trend_broken:
+                    return action("partial_close", f"{reason_base} bluechip_trend_warning", partial_pct)
+            return None
+
+        if class_key == "large_cap":
+            if pnl_pct <= 0 and trend_broken:
+                return action("close", f"{reason_base} large_cap_loss_trend_broken")
+            if 0 < pnl_pct <= small_profit and trend_broken:
+                pct = strong_partial_pct if (oi_weak or score_fade) else partial_pct
+                return action("partial_close", f"{reason_base} large_cap_trend_warning", pct)
+            return None
+
+        if class_key == "fundamental":
+            if pnl_pct <= 0:
+                return action("close", f"{reason_base} fundamental_loss")
+            if 0 < pnl_pct <= small_profit:
+                rounds = _recent_momentum_exit_count(sym, class_key, limit=3)
+                if rounds >= int(policy.get("confirm_rounds_for_full_close", 2)) - 1:
+                    return action("close", f"{reason_base} fundamental_confirmed_weakness")
+                return action("partial_close", f"{reason_base} fundamental_first_warning", partial_pct)
+            if trend_broken or score_fade:
+                return action("partial_close", f"{reason_base} fundamental_profit_protect", partial_pct)
+            return None
+
+        if class_key in {"narrative", "meme"}:
+            if pnl_pct <= small_profit and policy.get("allow_full_close_on_small_profit", True):
+                return action("close", f"{reason_base} {class_key}_fast_exit")
+            return action("partial_close", f"{reason_base} {class_key}_profit_protect", partial_pct)
+
+        if pnl_pct <= small_profit:
+            return action("close", f"{reason_base} default_exit")
+        return action("partial_close", f"{reason_base} default_profit_protect", partial_pct)
+
     def _build_position_actions(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
         from shared.db import get_position_history
 
@@ -603,6 +765,8 @@ class ExecutionEngine:
                     "reason": reason,
                     "close_price": mark_price,
                     "score": score,
+                    "strategy_source": hist.get("strategy_source") or "normal",
+                    "signal_source": hist.get("signal_source"),
                 }
                 if close_pct is not None:
                     item["close_pct"] = close_pct
@@ -643,7 +807,10 @@ class ExecutionEngine:
                     add("close", f"bluechip_entry_alpha_fade {hold_alpha:.1f}")
                     continue
                 if side == "LONG" and (ema_ratio < 1.0 or ema_slope < 0) and pnl_pct <= 2:
-                    add("close", f"bluechip_trend_invalid ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f}")
+                    if pnl_pct <= 0:
+                        add("close", f"bluechip_trend_invalid ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f}")
+                    else:
+                        add("partial_close", f"bluechip_trend_warning ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f} pnl={pnl_pct:.1f}%", 0.25)
                     continue
                 if pnl_pct >= float(bluechip_cfg.get("tp2_target_pct", 0.070)) * 100 and not int(hist.get("tp2_hit") or 0):
                     add("partial_close", f"bluechip_TP2 pnl={pnl_pct:.1f}%", float(bluechip_cfg.get("tp2_pct", 0.30)))
@@ -689,11 +856,22 @@ class ExecutionEngine:
             if age_h is not None and age_h >= time_stop_h and pnl_pct < min_ret:
                 add("close", f"time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
                 continue
-            if side == "LONG" and (ret_6h < 0 and ret_24h < 0) and hold_alpha < 50 and pnl_pct <= 2:
-                add("close", f"long_momentum_reversal hold={hold_alpha:.1f}")
-                continue
-            if side == "SHORT" and (ret_6h > 0 and ret_24h > 0) and hold_alpha < 50 and pnl_pct <= 2:
-                add("close", f"short_momentum_reversal hold={hold_alpha:.1f}")
+            category_exit = self._build_category_momentum_exit(
+                sym,
+                side,
+                close_side,
+                mark_price,
+                pnl_pct,
+                hold_alpha,
+                ret_6h,
+                ret_24h,
+                score,
+                score_decay,
+                tech,
+                hist,
+            )
+            if category_exit:
+                actions.append(category_exit)
                 continue
             if pnl_pct >= float(self.cfg.get("tp2_target_pct", 0.10)) * 100 and not int(hist.get("tp2_hit") or 0):
                 add("partial_close", f"TP2 pnl={pnl_pct:.1f}%", float(self.cfg.get("tp2_pct", 0.50)))

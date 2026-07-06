@@ -6,8 +6,14 @@ from datetime import datetime, timezone
 import httpx
 
 from shared.db import (
+    insert_candles_1h,
+    insert_candles_15m,
+    insert_candles_6h,
+    insert_candles_24h,
+    insert_futures,
     insert_alpha_candles,
     insert_alpha_orderbook_snapshot,
+    purge_old_kline_data,
     upsert_alpha_symbols,
 )
 
@@ -97,7 +103,7 @@ class AlphaCollector:
             status = (info or {}).get("status") or ("TRADING" if alpha_trade_symbol else "WATCH")
 
             futures_symbol = f"{base_asset}USDT" if f"{base_asset}USDT" in futures_symbols else None
-            if futures_symbol:
+            if info and futures_symbol:
                 tradeability = "alpha_futures_mapped"
 
             volume_24h = _f(token.get("volume24h"))
@@ -120,7 +126,7 @@ class AlphaCollector:
                 _f(token.get("marketCap")),
                 json.dumps(token, ensure_ascii=False),
             ))
-            if tradeability != "inactive":
+            if info and futures_symbol and tradeability != "inactive":
                 universe.append({
                     "alpha_symbol": alpha_trade_symbol,
                     "base_asset": base_asset,
@@ -130,17 +136,23 @@ class AlphaCollector:
                 })
 
         rows.sort(key=lambda r: float(r[10] or 0), reverse=True)
+        universe.sort(key=lambda r: float(r.get("volume_24h") or 0), reverse=True)
         if limit:
-            keep = {r[0] for r in rows[:limit]}
-            rows = [r for r in rows if r[0] in keep]
-            universe = [u for u in universe if u["alpha_symbol"] in keep]
+            rows = rows[:limit]
+            universe = universe[:limit]
         if rows:
             upsert_alpha_symbols(rows)
         logger.info("alpha universe refreshed: %s symbols", len(rows))
         return universe
 
     async def collect_market_data(self, universe, top_n=80):
-        selected = sorted(universe, key=lambda x: -float(x.get("volume_24h") or 0))[:top_n]
+        selected = sorted(
+            (item for item in universe if item.get("alpha_symbol") and item.get("futures_symbol")),
+            key=lambda x: -float(x.get("volume_24h") or 0),
+        )[:top_n]
+        if not selected:
+            logger.info("alpha market data skipped: no futures-mapped alpha symbols")
+            return
         rows_by_table = {
             "alpha_candles_1h": [],
             "alpha_candles_15m": [],
@@ -206,11 +218,106 @@ class AlphaCollector:
                 insert_alpha_candles(table, rows)
         if depth_rows:
             insert_alpha_orderbook_snapshot(depth_rows)
+        purge_old_kline_data(days=90)
         logger.info(
             "alpha market data: %s 1h, %s 15m, %s depth",
             len(rows_by_table["alpha_candles_1h"]),
             len(rows_by_table["alpha_candles_15m"]),
             len(depth_rows),
+        )
+        await self.collect_mapped_futures_data(selected)
+
+    async def collect_mapped_futures_data(self, selected):
+        futures_symbols = sorted({
+            item.get("futures_symbol")
+            for item in selected
+            if item.get("futures_symbol")
+        })
+        if not futures_symbols:
+            return
+
+        rows_by_table = {
+            "candles_1h": [],
+            "candles_15m": [],
+            "candles_6h": [],
+            "candles_24h": [],
+        }
+        rows_fut = []
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        semaphore = asyncio.Semaphore(4)
+
+        interval_map = {
+            "candles_15m": ("15m", 48),
+            "candles_1h": ("1h", 96),
+            "candles_6h": ("6h", 56),
+            "candles_24h": ("1d", 35),
+        }
+
+        try:
+            premium_resp = await self.client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+            premium_resp.raise_for_status()
+            premium_map = {p.get("symbol"): p for p in premium_resp.json()}
+        except Exception as exc:
+            logger.warning("mapped futures premiumIndex failed: %s", exc)
+            premium_map = {}
+
+        async def fetch_one(symbol):
+            async with semaphore:
+                try:
+                    for table, (interval, limit) in interval_map.items():
+                        resp = await self.client.get(
+                            "https://fapi.binance.com/fapi/v1/klines",
+                            params={"symbol": symbol, "interval": interval, "limit": limit},
+                        )
+                        if resp.status_code != 200:
+                            logger.debug("mapped futures klines failed %s %s: %s", symbol, interval, resp.status_code)
+                            continue
+                        for o in resp.json() or []:
+                            rows_by_table[table].append((
+                                _utc(o[0]),
+                                symbol,
+                                _f(o[1]), _f(o[2]), _f(o[3]), _f(o[4]),
+                                _f(o[5]), _f(o[7]), _i(o[8]),
+                            ))
+
+                    prem = premium_map.get(symbol) or {}
+                    funding = _f(prem.get("lastFundingRate"))
+                    mark_price = _f(prem.get("markPrice"))
+                    oi = 0.0
+                    try:
+                        oi_resp = await self.client.get(
+                            "https://fapi.binance.com/fapi/v1/openInterest",
+                            params={"symbol": symbol},
+                        )
+                        if oi_resp.status_code == 200:
+                            oi = _f(oi_resp.json().get("openInterest"))
+                    except Exception as exc:
+                        logger.debug("mapped futures openInterest failed %s: %s", symbol, exc)
+                    rows_fut.append((now_utc, symbol, oi, funding, mark_price))
+                except Exception as exc:
+                    logger.warning("mapped futures fetch failed %s: %s", symbol, exc)
+
+        for i in range(0, len(futures_symbols), 10):
+            await asyncio.gather(*(fetch_one(symbol) for symbol in futures_symbols[i:i + 10]))
+            await asyncio.sleep(0.4)
+
+        if rows_by_table["candles_1h"]:
+            insert_candles_1h(rows_by_table["candles_1h"])
+        if rows_by_table["candles_15m"]:
+            insert_candles_15m(rows_by_table["candles_15m"])
+        if rows_by_table["candles_6h"]:
+            insert_candles_6h(rows_by_table["candles_6h"])
+        if rows_by_table["candles_24h"]:
+            insert_candles_24h(rows_by_table["candles_24h"])
+        if rows_fut:
+            insert_futures(rows_fut)
+
+        logger.info(
+            "mapped futures data: %s symbols, %s 1h, %s 15m, %s futures",
+            len(futures_symbols),
+            len(rows_by_table["candles_1h"]),
+            len(rows_by_table["candles_15m"]),
+            len(rows_fut),
         )
 
     async def collect_all(self, universe_limit=200, market_top_n=80):

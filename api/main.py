@@ -1417,6 +1417,18 @@ _trading_status_cache = {"data": None, "time": 0}
 _CACHE_TTL = 10  # 10绉掔紦瀛?
 
 
+def _safe_trading_runtime_controls():
+    try:
+        return get_trading_runtime_controls()
+    except Exception as e:
+        return {
+            "normal_trading_enabled": True,
+            "alpha_trading_enabled": False,
+            "updated_at": {},
+            "warning": str(e),
+        }
+
+
 def _clear_trading_caches():
     _trading_status_cache["data"] = None
     _trading_status_cache["time"] = 0
@@ -1512,7 +1524,7 @@ def _build_local_trading_status(error=None):
     from shared.db import fetch_position_trade_groups, get_conn
     from trader.config import TRADING_CONFIG
 
-    controls = get_trading_runtime_controls()
+    controls = _safe_trading_runtime_controls()
     conn = get_conn()
     try:
         excluded = ("historical_import", "閸樺棗褰剁悰銉ョ秿(閹靛濮╅獮鍏呯波)")
@@ -1643,7 +1655,7 @@ async def get_trading_status(user=Depends(get_user)):
             "positions": [],
             "recent_trades": [],
             "total_pnl": 0,
-            "trading_controls": get_trading_runtime_controls(),
+            "trading_controls": _safe_trading_runtime_controls(),
         }
 
     EXCLUDED_REASONS = ("historical_import", "鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)")
@@ -1651,7 +1663,7 @@ async def get_trading_status(user=Depends(get_user)):
     from trader.exchange import BinanceFutures
     from trader.config import TRADING_CONFIG
     INITIAL_CAPITAL = TRADING_CONFIG.get("total_capital", 5000)
-    controls = get_trading_runtime_controls()
+    controls = _safe_trading_runtime_controls()
     ex = BinanceFutures()
     try:
         margin_data = ex.get_margin_balance()
@@ -1967,7 +1979,7 @@ async def get_trading_status(user=Depends(get_user)):
             "positions": [],
             "recent_trades": [],
             "total_pnl": 0,
-            "trading_controls": get_trading_runtime_controls(),
+            "trading_controls": _safe_trading_runtime_controls(),
         }
     finally:
         ex.close()

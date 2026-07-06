@@ -98,8 +98,15 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
     if not raw or not returns or not volume:
         return _state("insufficient_data", "observe", reasons=["alpha volume data insufficient"], metrics=metrics)
 
-    if spread_pct > 0.12:
-        return _state("wide_spread", "observe", reasons=[f"alpha spread {spread_pct:.3f}% > 0.12%"], metrics=metrics)
+    soft_spread_pct = 0.12
+    hard_spread_pct = 0.35
+    spread_degraded = spread_pct > soft_spread_pct
+    metrics["spread_degraded"] = spread_degraded
+    metrics["soft_spread_pct"] = soft_spread_pct
+    metrics["hard_spread_pct"] = hard_spread_pct
+
+    if spread_pct > hard_spread_pct:
+        return _state("wide_spread", "observe", reasons=[f"alpha spread {spread_pct:.3f}% > {hard_spread_pct:.2f}%"], metrics=metrics)
 
     if (
         volume_regime in {"overheated", "extreme", "suspicious"}
@@ -149,7 +156,20 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         and (oi_change_4h >= 0.03 or oi_change_24h >= 0.06)
         and abs(funding_rate) <= 0.0012
     )
-    if trend_state in {"probe", "trend_candidate", "trend_confirmed"} and not futures_ok:
+    futures_probe_ok = (
+        bool(futures_sync.get("available"))
+        and futures_volume_growth_6h >= 0.9
+        and (oi_change_4h >= -0.002 or oi_change_24h >= -0.005 or futures_sync_score >= 35)
+        and abs(funding_rate) <= 0.0015
+    )
+    degraded_reasons = []
+    if spread_degraded:
+        degraded_reasons.append(f"alpha spread {spread_pct:.3f}% soft-degraded")
+    if futures_probe_ok and not futures_ok:
+        degraded_reasons.append(
+            f"early futures sync: futures volume {futures_volume_growth_6h:.1f}x, OI4h {oi_change_4h:.2%}, OI24h {oi_change_24h:.2%}"
+        )
+    if trend_state in {"probe", "trend_candidate", "trend_confirmed"} and not futures_probe_ok:
         return _state(
             "alpha_trend_watch_no_futures_sync",
             "observe",
@@ -161,30 +181,33 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         )
 
     if trend_state == "trend_confirmed":
+        factor = 0.22 if (spread_degraded or not futures_ok) else 0.35
         return _state(
-            "alpha_trend_confirmed",
-            "normal_review",
+            "alpha_trend_confirmed" if futures_ok and not spread_degraded else "alpha_trend_confirmed_probe",
+            "normal_review" if futures_ok and not spread_degraded else "normal_review_probe",
             allow_long=True,
-            max_position_factor=0.35,
-            reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha trend confirmed with futures sync"],
+            max_position_factor=factor,
+            reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha trend confirmed"] + degraded_reasons,
             metrics=metrics,
         )
     if trend_state == "trend_candidate":
+        factor = 0.16 if (spread_degraded or not futures_ok) else 0.25
         return _state(
-            "alpha_trend_candidate",
-            "normal_review",
+            "alpha_trend_candidate" if futures_ok and not spread_degraded else "alpha_trend_candidate_probe",
+            "normal_review" if futures_ok and not spread_degraded else "normal_review_probe",
             allow_long=True,
-            max_position_factor=0.25,
-            reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha trend candidate with futures sync"],
+            max_position_factor=factor,
+            reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha trend candidate"] + degraded_reasons,
             metrics=metrics,
         )
     if trend_state == "probe":
+        factor = 0.08 if spread_degraded else 0.12
         return _state(
             "alpha_trend_probe",
             "normal_review_probe",
             allow_long=True,
-            max_position_factor=0.12,
-            reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha probe with futures sync"],
+            max_position_factor=factor,
+            reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha probe"] + degraded_reasons,
             metrics=metrics,
         )
 
@@ -196,14 +219,15 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         and -2 <= ret_1h <= 5
         and range_24h_pct < 32
         and 1.0 <= imbalance <= 4.0
-        and futures_ok
+        and futures_probe_ok
     ):
+        factor = 0.12 if (spread_degraded or not futures_ok) else 0.20
         return _state(
-            "breakout_pullback",
-            "normal_review",
+            "breakout_pullback" if futures_ok and not spread_degraded else "breakout_pullback_probe",
+            "normal_review" if futures_ok and not spread_degraded else "normal_review_probe",
             allow_long=True,
-            max_position_factor=0.20,
-            reasons=[f"breakout pullback: alpha volume {alpha_volume_growth_6h:.1f}x", "futures sync confirmed"],
+            max_position_factor=factor,
+            reasons=[f"breakout pullback: alpha volume {alpha_volume_growth_6h:.1f}x"] + (["futures sync confirmed"] if futures_ok else degraded_reasons),
             metrics=metrics,
         )
 
@@ -215,14 +239,15 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         and 4 <= pullback_from_high_pct <= 12
         and range_24h_pct < 28
         and 0.8 <= imbalance <= 3.5
-        and futures_ok
+        and futures_probe_ok
     ):
+        factor = 0.08 if (spread_degraded or not futures_ok) else 0.12
         return _state(
-            "accumulation_volume",
+            "accumulation_volume" if futures_ok and not spread_degraded else "accumulation_volume_probe",
             "normal_review_probe",
             allow_long=True,
-            max_position_factor=0.12,
-            reasons=[f"warm accumulation: alpha volume {alpha_volume_growth_6h:.1f}x", "futures sync confirmed"],
+            max_position_factor=factor,
+            reasons=[f"warm accumulation: alpha volume {alpha_volume_growth_6h:.1f}x"] + (["futures sync confirmed"] if futures_ok else degraded_reasons),
             metrics=metrics,
         )
 

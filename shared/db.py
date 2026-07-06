@@ -670,6 +670,14 @@ def init_db():
         """INSERT OR IGNORE INTO trading_runtime_controls(key, value)
            VALUES ('alpha_trading_enabled', 'false')"""
     )
+    conn.execute(
+        """DELETE FROM alpha_trade_candidates
+           WHERE futures_symbol IS NULL OR futures_symbol = ''"""
+    )
+    conn.execute(
+        """DELETE FROM alpha_scan_scores
+           WHERE futures_symbol IS NULL OR futures_symbol = ''"""
+    )
     conn.commit()
 
 
@@ -787,21 +795,17 @@ def get_trading_runtime_controls():
     }
     conn = get_conn()
     try:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS trading_runtime_controls (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT DEFAULT (datetime('now'))
-            )"""
-        )
-        for key, enabled in defaults.items():
-            conn.execute(
-                """INSERT OR IGNORE INTO trading_runtime_controls(key, value)
-                   VALUES (?, ?)""",
-                (key, "true" if enabled else "false"),
-            )
-        rows = conn.execute("SELECT key, value, updated_at FROM trading_runtime_controls").fetchall()
-        conn.commit()
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trading_runtime_controls'"
+        ).fetchone()
+        if not exists:
+            rows = []
+        else:
+            rows = conn.execute("SELECT key, value, updated_at FROM trading_runtime_controls").fetchall()
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e).lower():
+            raise
+        rows = []
     finally:
         conn.close()
 
@@ -884,6 +888,30 @@ def insert_candles_24h(rows):
     conn.commit()
 
 
+def purge_old_kline_data(days=90):
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tables = (
+        "candles_1h",
+        "candles_15m",
+        "candles_6h",
+        "candles_24h",
+        "alpha_candles_1h",
+        "alpha_candles_15m",
+        "alpha_candles_6h",
+        "alpha_candles_24h",
+    )
+    conn = get_conn()
+    try:
+        deleted = {}
+        for table in tables:
+            cur = conn.execute(f"DELETE FROM {table} WHERE time < ?", (cutoff,))
+            deleted[table] = cur.rowcount
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
 def upsert_alpha_symbols(rows):
     conn = get_conn()
     conn.executemany(
@@ -943,13 +971,11 @@ def fetch_active_alpha_symbols(limit=200):
         """SELECT *
            FROM alpha_symbols
            WHERE status = 'TRADING'
-             AND tradeability != 'inactive'
+             AND tradeability = 'alpha_futures_mapped'
+             AND futures_symbol IS NOT NULL
+             AND futures_symbol != ''
              AND COALESCE(volume_24h, 0) > 0
-           ORDER BY
-             CASE tradeability WHEN 'alpha_futures_mapped' THEN 0
-                               WHEN 'alpha_tradeable' THEN 1
-                               ELSE 2 END,
-             volume_24h DESC
+           ORDER BY volume_24h DESC
            LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -1493,6 +1519,9 @@ def fetch_latest_alpha_scan():
            FROM alpha_scan_scores s
            LEFT JOIN alpha_symbols a ON a.alpha_symbol = s.alpha_symbol
            WHERE s.scan_id = ?
+             AND a.tradeability = 'alpha_futures_mapped'
+             AND s.futures_symbol IS NOT NULL
+             AND s.futures_symbol != ''
            ORDER BY s.alpha_score DESC""",
         (scan["scan_id"],),
     ).fetchall()
@@ -1628,6 +1657,8 @@ def fetch_latest_alpha_trade_candidates(limit=200):
         rows = conn.execute(
             """SELECT *
                FROM alpha_trade_candidates
+               WHERE futures_symbol IS NOT NULL
+                 AND futures_symbol != ''
                ORDER BY time DESC, updated_at DESC, id DESC
                LIMIT ?""",
             (limit,),

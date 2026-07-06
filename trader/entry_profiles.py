@@ -140,6 +140,11 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     min_rr = _num(profile.get("min_rr"), 0)
     probe_min_rr = _num(profile.get("probe_min_rr"), 0)
     require_breakout = bool(profile.get("require_breakout"))
+    allow_early_probe = bool(profile.get("allow_early_probe"))
+    early_probe_max_distance = _num(profile.get("early_probe_max_distance_pct"), 0)
+    early_probe_min_vol = _num(profile.get("early_probe_min_volume_multiplier"), min_vol)
+    early_probe_min_score = _num(profile.get("early_probe_min_score"), min_score)
+    early_probe_min_entry_alpha = _num(profile.get("early_probe_min_entry_alpha"), min_entry_alpha)
 
     is_low = _has(context_text, "低位", "偏低", "low")
     is_high = _has(context_text, "高位", "偏高", "high")
@@ -161,6 +166,21 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     risk_probe_factor = max(0.0, min(1.0, _num(symbol_risk.get("probe_position_factor"), risk_position_factor)))
     effective_position_factor = round(template_position_factor * risk_position_factor, 4)
     effective_probe_factor = round(template_probe_factor * risk_probe_factor, 4)
+    distance_to_breakout = _num(breakout.get("distance_to_breakout_pct"), 999)
+    early_probe_ok = (
+        allow_early_probe
+        and profile.get("template") == "breakout"
+        and side != "SHORT"
+        and not breakout_ok
+        and score >= early_probe_min_score
+        and entry_alpha >= early_probe_min_entry_alpha
+        and volume_ratio >= early_probe_min_vol
+        and rr_used >= probe_min_rr
+        and distance_to_breakout > 0
+        and (not early_probe_max_distance or distance_to_breakout <= early_probe_max_distance)
+        and depth_long_ok
+        and oi_change >= 0
+    )
 
     confirmations: list[dict] = []
     confirmations.append(_confirmation(
@@ -194,6 +214,16 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
         confirmations.append(_confirmation("成交量", volume_ok, f"成交量 {volume_ratio:.2f}x 已达到 {min_vol:.2f}x", f"成交量 {volume_ratio:.2f}x 未达到 {min_vol:.2f}x", required=False if profile.get("allow_probe") else True, kind="template"))
     if min_rr:
         confirmations.append(_confirmation("结构 R:R", rr_used >= min_rr, f"R:R {rr_used:.2f} 已达到 {min_rr:.2f}", f"R:R {rr_used:.2f} 未达到正常仓 {min_rr:.2f}", required=not (profile.get("allow_probe") and rr_used >= probe_min_rr), kind="template"))
+
+    if allow_early_probe:
+        confirmations.append(_confirmation(
+            "early_probe",
+            early_probe_ok,
+            f"early probe ok: distance {distance_to_breakout * 100:.1f}%, vol {volume_ratio:.2f}x, R:R {rr_used:.2f}",
+            f"early probe missing: distance {distance_to_breakout * 100:.1f}%, vol {volume_ratio:.2f}x, R:R {rr_used:.2f}",
+            required=False,
+            kind="template",
+        ))
 
     max_atr = profile.get("max_atr_ratio")
     if max_atr is not None and atr_ratio:
@@ -240,17 +270,28 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     elif profile.get("allow_probe") and base_ok:
         probe_blockers = [
             x for x in hard_missing
-            if not (x["label"] == "结构 R:R" and rr_used >= probe_min_rr)
+            if not (
+                (x["label"] == "结构 R:R" and rr_used >= probe_min_rr)
+                or (
+                    early_probe_ok
+                    and x["kind"] == "template"
+                    and x["label"] in {profile.get("breakout_label") or "breakout", "结构 R:R"}
+                )
+            )
         ]
         if not probe_blockers:
             status = "probe"
-            reason = f"{profile['template_name']}达到试探仓条件，但还不到正常仓。"
+            if early_probe_ok:
+                reason = f"{profile['template_name']} early probe: 20-period breakout not confirmed, but score/volume/OI/R:R meet probe conditions."
+            else:
+                reason = f"{profile['template_name']} reached probe conditions, but not full entry yet."
         elif profile.get("allow_observe_only"):
             status = "observe"
-            reason = f"{profile['template_name']}基础条件接近，但还缺关键确认，先观察。"
+            reason = f"{profile['template_name']} basic conditions are close, but key confirmations are still missing."
         else:
             status = "block"
-            reason = f"{profile['template_name']}条件不足，暂不开仓。"
+            reason = f"{profile['template_name']} conditions are insufficient; no entry."
+
     elif profile.get("allow_observe_only") and base_ok:
         status = "observe"
         reason = f"{profile['template_name']}基础条件成立，但还缺确认，进入观察。"
@@ -298,6 +339,11 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
             "effective_position_size_factor": effective_position_factor,
             "effective_probe_position_size_factor": effective_probe_factor,
             "confirmations_required_for_full_entry": confirmations_required,
+            "allow_early_probe": allow_early_probe,
+            "early_probe_max_distance_pct": profile.get("early_probe_max_distance_pct"),
+            "early_probe_min_volume_multiplier": profile.get("early_probe_min_volume_multiplier"),
+            "early_probe_min_score": profile.get("early_probe_min_score"),
+            "early_probe_min_entry_alpha": profile.get("early_probe_min_entry_alpha"),
         },
         "risk_profile": symbol_risk,
         "metrics": {
@@ -314,6 +360,8 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
             "depth_ratio": depth_ratio,
             "support_score": support_score,
             "confirmation_count": confirmation_count,
+            "distance_to_breakout_pct": distance_to_breakout,
+            "early_probe_ok": early_probe_ok,
             "side": side,
         },
     }

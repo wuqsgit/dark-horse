@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from alpha_pipeline.collector import AlphaCollector
-from shared.db import init_db
+from shared.db import init_db, purge_old_kline_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +23,7 @@ ALPHA_COLLECT_INTERVAL_MIN = int(os.getenv("ALPHA_COLLECT_INTERVAL_MIN", "10"))
 async def collect_alpha(collector):
     logger.info("=== Alpha collect ===")
     try:
+        purge_old_kline_data(days=90)
         await collector.collect_all(
             universe_limit=ALPHA_UNIVERSE_LIMIT,
             market_top_n=ALPHA_MARKET_TOP_N,

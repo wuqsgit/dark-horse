@@ -20,10 +20,12 @@ def _load_local_env():
 
 _load_local_env()
 
+_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
+
 EXCHANGE_CONFIG = {
-    "api_key": os.getenv("BINANCE_API_KEY") or os.getenv("TESTNET_API_KEY", ""),
-    "api_secret": os.getenv("BINANCE_API_SECRET") or os.getenv("TESTNET_API_SECRET", ""),
-    "testnet": os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on"),
+    "api_key": os.getenv("TESTNET_API_KEY" if _TESTNET else "BINANCE_API_KEY", ""),
+    "api_secret": os.getenv("TESTNET_API_SECRET" if _TESTNET else "BINANCE_API_SECRET", ""),
+    "testnet": _TESTNET,
 }
 
 TRADING_CONFIG = {
@@ -41,7 +43,7 @@ TRADING_CONFIG = {
     # ── 评分阈值（统一标准） ──
     "min_score": 60,                    # 🔧 统一开仓门槛从 50→60
     "consecutive_scans_required": 2,    # 🔧 连续 2 轮评分确认
-    "max_signal_age_minutes": 15,       # V5: only trade fresh scan signals
+    "max_signal_age_minutes": 45,       # V5: keep fresh enough without skipping normal scan cadence
 
     # ── 时间止损（alpha-prd.md §5.4.3） ──
     "time_stop_hours": 12,              # 🔧 持仓超 12h 检查
@@ -105,12 +107,12 @@ TRADING_CONFIG = {
         "confirmed_size_factor": 0.40,
         "min_score": 55,
         "min_entry_alpha": 45,
-        "min_relative_strength": 50,
-        "min_return_24h": 0.025,
-        "min_ema20_50_ratio": 1.004,
+        "min_relative_strength": 45,
+        "min_return_24h": 0.005,
+        "min_ema20_50_ratio": 1.001,
         "min_support_score": 55,
-        "min_depth_score": 35,
-        "min_big_order_score": 40,
+        "min_depth_score": 20,
+        "min_big_order_score": 25,
         "max_funding_rate": 0.001,
         "max_rsi": 82,
         "max_price_position_value": 0.95,
@@ -129,15 +131,15 @@ TRADING_CONFIG = {
     },
     "alpha_trading": {
         "enabled": True,
-        "testnet_only": True,
+        "testnet_only": False,
         "allow_short": False,
         "max_account_exposure": 0.30,
         "max_positions": 3,
         "max_normal_reviews_per_loop": 2,
         "min_score": 68,
-        "signal_ttl_minutes": 45,
-        "volume_price_ttl_minutes": 20,
-        "normal_score_ttl_minutes": 15,
+        "signal_ttl_minutes": 75,
+        "volume_price_ttl_minutes": 45,
+        "normal_score_ttl_minutes": 45,
         "probe_max_position_pct": 0.30,
         "candidate_max_position_pct": 0.50,
         "cooldown_minutes": 30,

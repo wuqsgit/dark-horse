@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from alpha_engine.scoring import AlphaScoringEngine
-from shared.db import init_db
+from shared.db import init_db, purge_old_kline_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +21,7 @@ ALPHA_SCORE_LIMIT = int(os.getenv("ALPHA_SCORE_LIMIT", "200"))
 
 async def score_alpha():
     try:
+        purge_old_kline_data(days=90)
         engine = AlphaScoringEngine()
         rows = engine.score_all(limit=ALPHA_SCORE_LIMIT)
         logger.info("Alpha scored %s symbols", len(rows))
