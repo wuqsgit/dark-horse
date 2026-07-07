@@ -1178,17 +1178,23 @@ class ExecutionEngine:
                 continue
 
             alpha_execution_score = float(discovery_score or 0)
-            pos_info = calculate_position(self.ex, symbol, price, balance, alpha_execution_score)
-            lev = min(int(pos_info.get("leverage") or self.cfg.get("leverage_max", 3)), 3)
-            source_factor = 0.25 if entry_profile.get("status") == "probe" else 0.50
-            quality_factor = 1.0
-            symbol_risk_factor = max(0.0, min(1.0, float(symbol_risk.get("max_position_factor") or 1.0)))
-            qty = float(pos_info.get("quantity") or 0) * source_factor * quality_factor * vp_factor * symbol_risk_factor
+            alpha_entry_mode = "probe" if entry_profile.get("status") == "probe" else ("strong" if vp_factor >= 0.30 else "confirmed")
+            size_multiplier = 0.75 if ob_info.get("spread_degraded") else 1.0
+            pos_info = calculate_position(
+                self.ex,
+                symbol,
+                price,
+                balance,
+                alpha_execution_score,
+                category="alpha",
+                entry_mode=alpha_entry_mode,
+                size_multiplier=size_multiplier,
+            )
+            lev = int(pos_info.get("leverage") or self.cfg.get("leverage_max", 3))
+            qty = float(pos_info.get("quantity") or 0)
             qty = self.ex.adjust_quantity(symbol, qty)
-            if ob_info.get("spread_degraded"):
-                qty = self.ex.adjust_quantity(symbol, qty * 0.5)
             if qty <= 0:
-                reject("quantity <= 0", {"pos_info": pos_info, "source_factor": source_factor, "quality_factor": quality_factor, "volume_price_factor": vp_factor, "symbol_risk_factor": symbol_risk_factor, "symbol_risk": symbol_risk})
+                reject("quantity <= 0", {"pos_info": pos_info, "volume_price_factor": vp_factor, "symbol_risk": symbol_risk})
                 continue
 
             atr = float(pos_info.get("atr_value") or 0)
@@ -1226,7 +1232,7 @@ class ExecutionEngine:
                 "alpha_profile": profile,
                 "alpha_entry_level": entry_profile.get("status"),
                 "alpha_score": discovery_score,
-                "alpha_suggested_position_pct": source_factor * quality_factor * vp_factor * symbol_risk_factor,
+                "alpha_suggested_position_pct": round(float(pos_info.get("margin") or 0) / balance, 4) if balance else 0,
             }
             actions.append(action)
             record_candidate(None, status="planned_open")
@@ -1254,13 +1260,11 @@ class ExecutionEngine:
                     "adapter_quality": adapter_quality,
                     "missing_fields": missing_fields,
                     "entry_profile": entry_profile,
-                    "source_factor": source_factor,
-                    "quality_factor": quality_factor,
                     "volume_price_factor": vp_factor,
-                    "symbol_risk_factor": symbol_risk_factor,
                     "symbol_risk": symbol_risk,
                     "volume_price": volume_price,
                     "leverage": lev,
+                    "sizing": pos_info,
                     "stop_loss": stop_price,
                     "tp1_price": tp_levels["tp1_price"],
                     "tp2_price": tp_levels["tp2_price"],
@@ -1826,16 +1830,20 @@ class ExecutionEngine:
                     )
                     continue
 
-                # V5: fixed leverage and minimum position sizing
-                pos_info = calculate_position(self.ex, sym, price, balance, score)
-                if entry_profile.get("status") == "probe":
-                    size_factor = float(entry_profile.get("thresholds", {}).get("probe_position_size_factor") or 0.3)
-                else:
-                    size_factor = float(entry_profile.get("thresholds", {}).get("position_size_factor") or 1.0)
-                if ob_info.get("spread_degraded"):
-                    size_factor *= 0.5
-                pos_info["quantity"] = round(float(pos_info.get("quantity") or 0) * size_factor, 3)
-                pos_info["profile_position_size_factor"] = size_factor
+                symbol_risk = entry_profile.get("risk_profile") or get_symbol_risk(sym)
+                sizing_mode = "probe" if entry_profile.get("status") == "probe" else "confirmed"
+                size_multiplier = 0.75 if ob_info.get("spread_degraded") else 1.0
+                pos_info = calculate_position(
+                    self.ex,
+                    sym,
+                    price,
+                    balance,
+                    score,
+                    category=symbol_risk.get("class"),
+                    entry_mode=sizing_mode,
+                    size_multiplier=size_multiplier,
+                )
+                pos_info["profile_position_size_factor"] = size_multiplier
                 pos_info["symbol_risk"] = entry_profile.get("risk_profile")
                 pos_info["spread_degraded"] = bool(ob_info.get("spread_degraded"))
                 qty = pos_info["quantity"]
@@ -1902,6 +1910,7 @@ class ExecutionEngine:
                         "gate_mode": "per_symbol_entry_profile",
                         "regime_gate_note": profile_gate_note,
                         "score_layers": score_layers,
+                        "sizing": pos_info,
                     },
                     reason={"reason": f"score {score:.1f} {side}", "regime": regime, "entry_profile": entry_profile.get("template")},
                     market_regime=regime,
@@ -2032,11 +2041,18 @@ class ExecutionEngine:
                     continue
 
                 score = float(s.get("bluechip_trend_score") or s.get("composite_score") or 0)
-                pos_info = calculate_position(self.ex, sym, price, balance, score)
-                size_factor = float(s.get("bluechip_size_factor") or bluechip_cfg.get("probe_size_factor", 0.25))
-                if ob_info.get("spread_degraded"):
-                    size_factor *= 0.5
-                pos_info["quantity"] = round(float(pos_info.get("quantity") or 0) * size_factor, 3)
+                bluechip_mode = "strong" if s.get("bluechip_entry_mode") == "trend_confirmed" else "probe"
+                size_multiplier = 0.75 if ob_info.get("spread_degraded") else 1.0
+                pos_info = calculate_position(
+                    self.ex,
+                    sym,
+                    price,
+                    balance,
+                    score,
+                    category="core_bluechip",
+                    entry_mode=bluechip_mode,
+                    size_multiplier=size_multiplier,
+                )
                 qty = pos_info["quantity"]
                 if qty <= 0:
                     self._record_decision(
@@ -2091,8 +2107,9 @@ class ExecutionEngine:
                     entry_price=price,
                     risk_params={
                         "metrics": s.get("bluechip_metrics"),
-                        "size_factor": size_factor,
+                        "size_factor": size_multiplier,
                         "leverage": pos_info.get("leverage", 3),
+                        "sizing": pos_info,
                         "stop_loss": stop_price,
                         "tp1_price": tp_levels["tp1_price"],
                         "tp2_price": tp_levels["tp2_price"],

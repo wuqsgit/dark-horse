@@ -46,23 +46,86 @@ def _age_minutes(value: Any) -> float | None:
     return None
 
 
-def calculate_position(exchange, symbol: str, price: float, balance: float, score: float | None = None) -> dict:
+def _symbol_class(symbol: str, fallback: str = "narrative") -> str:
+    try:
+        from trader.symbol_risk import get_symbol_risk
+
+        return str((get_symbol_risk(symbol) or {}).get("class") or fallback)
+    except Exception:
+        return fallback
+
+
+def _position_sizing_config(symbol: str, category: str | None = None) -> tuple[str, dict]:
+    sizing = TRADING_CONFIG.get("position_sizing") or {}
+    class_key = category or _symbol_class(symbol)
+    return class_key, dict(sizing.get(class_key) or sizing.get("narrative") or {})
+
+
+def _dynamic_leverage(atr_pct: float, sizing: dict) -> int:
+    lev = int(sizing.get("leverage_base") or TRADING_CONFIG.get("leverage_max", 3) or 3)
+    for threshold, candidate in sizing.get("atr_leverage_steps") or []:
+        if atr_pct < float(threshold):
+            lev = int(candidate)
+            break
+    lev = max(int(sizing.get("leverage_min", 1)), lev)
+    lev = min(int(sizing.get("leverage_max", lev)), lev)
+    lev = min(int(TRADING_CONFIG.get("leverage_max", lev)), lev)
+    return max(1, lev)
+
+
+def calculate_position(
+    exchange,
+    symbol: str,
+    price: float,
+    balance: float,
+    score: float | None = None,
+    category: str | None = None,
+    entry_mode: str | None = None,
+    size_multiplier: float = 1.0,
+) -> dict:
     cfg = TRADING_CONFIG
-    leverage = min(int(cfg.get("leverage_max", 3)), 3)
     try:
         atr = float(exchange.get_atr(symbol))
     except Exception:
         atr = price * 0.02
     if atr <= 0:
         atr = price * 0.02
+    atr_pct = atr / price if price > 0 else 0.02
+    class_key, sizing = _position_sizing_config(symbol, category)
+    leverage = _dynamic_leverage(atr_pct, sizing)
     stop_distance = min(atr * 1.5, price * float(cfg.get("hard_stop_pct", 0.05)))
     stop_pct = max(stop_distance / price, 0.003) if price > 0 else 0.003
-    base_margin = balance * float(cfg.get("position_size_pct", 0.20))
-    score_adj = 0.75 if score is None else min(1.15, max(0.45, float(score) / 80.0))
-    max_notional = base_margin * leverage * score_adj
-    risk_budget = balance * float(cfg.get("risk_per_trade_pct", 0.015))
+
+    mode = str(entry_mode or "confirmed").lower()
+    if mode in {"probe", "normal_review_probe", "trend_probe"}:
+        margin_pct = float(sizing.get("probe_margin_pct", cfg.get("position_size_pct", 0.20)))
+    elif mode in {"strong", "trend_confirmed", "confirmed_strong"}:
+        margin_pct = float(sizing.get("strong_margin_pct", sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20))))
+    else:
+        margin_pct = float(sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20)))
+
+    score_adj = 1.0 if score is None else min(1.15, max(0.85, float(score) / 80.0))
+    margin_pct *= score_adj * max(0.1, min(1.5, float(size_multiplier or 1.0)))
+    max_margin_pct = float(sizing.get("max_margin_pct", margin_pct))
+    margin_pct = min(margin_pct, max_margin_pct)
+    target_margin = balance * margin_pct
+    target_notional = target_margin * leverage
+
+    risk_budget = balance * float(sizing.get("risk_per_trade_pct", cfg.get("risk_per_trade_pct", 0.015)))
     risk_notional = risk_budget / stop_pct
-    position_value = min(max_notional, risk_notional)
+    capped_notional = min(target_notional, risk_notional)
+
+    min_margin_pct = float(sizing.get("min_effective_margin_pct", 0))
+    min_stop_pct = float(sizing.get("min_effective_stop_pct", 0))
+    min_notional = balance * min_margin_pct * leverage
+    if min_notional > 0 and stop_pct <= min_stop_pct:
+        position_value = max(capped_notional, min(target_notional, min_notional))
+    else:
+        position_value = capped_notional
+
+    max_notional = balance * max_margin_pct * leverage
+    position_value = min(position_value, max_notional)
+    margin = position_value / leverage if leverage else 0
     quantity = position_value / price if price > 0 else 0.0
     return {
         "quantity": round(quantity, 3),
@@ -71,8 +134,16 @@ def calculate_position(exchange, symbol: str, price: float, balance: float, scor
         "tp1_distance": round(atr * 2, 8),
         "tp2_distance": round(atr * 4, 8),
         "atr_value": atr,
+        "atr_pct": round(atr_pct, 6),
         "leverage": leverage,
-        "margin": position_value / leverage if leverage else 0,
+        "margin": margin,
+        "target_margin": target_margin,
+        "target_margin_pct": margin_pct,
+        "target_notional": target_notional,
+        "risk_notional": risk_notional,
+        "position_value": position_value,
+        "sizing_class": class_key,
+        "entry_mode": mode,
         "risk_budget": risk_budget,
     }
 

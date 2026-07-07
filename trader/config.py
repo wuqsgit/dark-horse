@@ -74,7 +74,87 @@ TRADING_CONFIG = {
 
     # ── 调度 ──
     "rebalance_interval_min": 5,
-    "leverage_max": 3,
+    "leverage_max": 8,
+    "position_sizing": {
+        "core_bluechip": {
+            "leverage_min": 4,
+            "leverage_base": 6,
+            "leverage_max": 8,
+            "atr_leverage_steps": [[0.008, 8], [0.015, 7], [0.025, 6], [0.040, 5]],
+            "probe_margin_pct": 0.06,
+            "confirmed_margin_pct": 0.12,
+            "strong_margin_pct": 0.18,
+            "max_margin_pct": 0.20,
+            "risk_per_trade_pct": 0.025,
+            "min_effective_margin_pct": 0.05,
+            "min_effective_stop_pct": 0.035
+        },
+        "large_cap": {
+            "leverage_min": 3,
+            "leverage_base": 4,
+            "leverage_max": 5,
+            "atr_leverage_steps": [[0.010, 5], [0.020, 4], [0.040, 3]],
+            "probe_margin_pct": 0.04,
+            "confirmed_margin_pct": 0.08,
+            "strong_margin_pct": 0.10,
+            "max_margin_pct": 0.12,
+            "risk_per_trade_pct": 0.020,
+            "min_effective_margin_pct": 0.035,
+            "min_effective_stop_pct": 0.040
+        },
+        "fundamental": {
+            "leverage_min": 2,
+            "leverage_base": 3,
+            "leverage_max": 4,
+            "atr_leverage_steps": [[0.012, 4], [0.025, 3], [0.050, 2]],
+            "probe_margin_pct": 0.03,
+            "confirmed_margin_pct": 0.06,
+            "strong_margin_pct": 0.08,
+            "max_margin_pct": 0.10,
+            "risk_per_trade_pct": 0.018,
+            "min_effective_margin_pct": 0.025,
+            "min_effective_stop_pct": 0.045
+        },
+        "narrative": {
+            "leverage_min": 2,
+            "leverage_base": 2,
+            "leverage_max": 3,
+            "atr_leverage_steps": [[0.015, 3], [0.040, 2]],
+            "probe_margin_pct": 0.025,
+            "confirmed_margin_pct": 0.05,
+            "strong_margin_pct": 0.06,
+            "max_margin_pct": 0.08,
+            "risk_per_trade_pct": 0.015,
+            "min_effective_margin_pct": 0.020,
+            "min_effective_stop_pct": 0.050
+        },
+        "meme": {
+            "leverage_min": 1,
+            "leverage_base": 1,
+            "leverage_max": 2,
+            "atr_leverage_steps": [[0.020, 2]],
+            "probe_margin_pct": 0.015,
+            "confirmed_margin_pct": 0.03,
+            "strong_margin_pct": 0.035,
+            "max_margin_pct": 0.05,
+            "risk_per_trade_pct": 0.010,
+            "min_effective_margin_pct": 0.010,
+            "min_effective_stop_pct": 0.055
+        },
+        "alpha": {
+            "leverage_min": 2,
+            "leverage_base": 2,
+            "leverage_max": 3,
+            "atr_leverage_steps": [[0.015, 3], [0.050, 2]],
+            "probe_margin_pct": 0.02,
+            "confirmed_margin_pct": 0.05,
+            "strong_margin_pct": 0.06,
+            "max_margin_pct": 0.07,
+            "risk_per_trade_pct": 0.012,
+            "min_effective_margin_pct": 0.018,
+            "min_effective_stop_pct": 0.050
+        },
+    },
     "spread_limits": {
         "prod": {
             "default": 0.0030,
