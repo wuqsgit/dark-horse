@@ -1,10 +1,9 @@
 -- Dark Horse SQLite schema
 -- Generated from alphadog.db; schema only, no data.
--- Generated at 2026-07-05T15:22:06Z
+-- Generated at 2026-07-08T00:13:37Z
 
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
-
 
 -- TABLES
 CREATE TABLE alpha_candles_15m (
@@ -140,43 +139,6 @@ CREATE TABLE alpha_trade_candidates (
             UNIQUE(scan_id, alpha_symbol)
         );
 
-CREATE TABLE backtest_results (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_time TEXT DEFAULT (datetime('now')),
-    symbol TEXT NOT NULL,
-    grade TEXT,
-    grade_score REAL,
-    grade_time TEXT,
-    price_at_grade REAL,
-    return_6h REAL,
-    return_12h REAL,
-    return_24h REAL,
-    return_48h REAL,
-    max_drawdown REAL,
-    win_12h INTEGER,
-    win_24h INTEGER
-);
-
-CREATE TABLE backtest_review (
-    run_time TEXT NOT NULL,
-    review_json TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE backtest_summary_cache (
-            grade TEXT PRIMARY KEY,
-            latest_run TEXT,
-            count INTEGER,
-            avg_return_12h REAL,
-            avg_return_24h REAL,
-            avg_return_48h REAL,
-            win_rate_12h REAL,
-            win_rate_24h REAL,
-            avg_drawdown REAL,
-            avg_score REAL,
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
 CREATE TABLE candles_15m (
     time TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -207,7 +169,67 @@ CREATE TABLE candles_6h (
     PRIMARY KEY (time, symbol)
 );
 
-CREATE TABLE factor_analysis (run_time TEXT, result TEXT);
+CREATE TABLE decision_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id TEXT UNIQUE,
+            source_decision_id TEXT,
+            source_trade_id INTEGER,
+            run_id TEXT,
+            time TEXT DEFAULT (datetime('now')),
+            symbol TEXT NOT NULL,
+            category TEXT,
+            strategy_source TEXT DEFAULT 'normal',
+            action_type TEXT,
+            action_result TEXT,
+            side TEXT,
+            price REAL,
+            score REAL,
+            entry_alpha REAL,
+            hold_alpha REAL,
+            grade TEXT,
+            reason_code TEXT,
+            reason_text TEXT,
+            reason_json TEXT,
+            features_json TEXT,
+            risk_params_json TEXT,
+            position_params_json TEXT,
+            policy_version TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+CREATE TABLE decision_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            category TEXT,
+            action_type TEXT,
+            action_result TEXT,
+            signal_time TEXT,
+            entry_price REAL,
+            side TEXT,
+            return_1h REAL,
+            return_4h REAL,
+            return_12h REAL,
+            return_24h REAL,
+            return_48h REAL,
+            return_72h REAL,
+            max_favorable_return REAL,
+            max_adverse_return REAL,
+            max_favorable_time TEXT,
+            max_adverse_time TEXT,
+            atr_at_signal REAL,
+            mfe_atr_multiple REAL,
+            mae_atr_multiple REAL,
+            missed_big_move INTEGER DEFAULT 0,
+            early_exit INTEGER DEFAULT 0,
+            good_block INTEGER DEFAULT 0,
+            bad_block INTEGER DEFAULT 0,
+            small_profit_exit INTEGER DEFAULT 0,
+            trend_capture_ratio REAL,
+            bars_observed INTEGER DEFAULT 0,
+            is_complete INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        , churn_trade INTEGER DEFAULT 0, probe_failed INTEGER DEFAULT 0, weak_after_entry INTEGER DEFAULT 0, holding_minutes REAL);
 
 CREATE TABLE factor_effectiveness (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,20 +246,6 @@ CREATE TABLE factor_effectiveness (
             avg_drawdown REAL,
             ev REAL,
             ic REAL
-        );
-
-CREATE TABLE factor_performance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_time TEXT DEFAULT (datetime('now')),
-            factor_name TEXT NOT NULL,
-            bucket TEXT NOT NULL,
-            samples INTEGER,
-            win_rate REAL,
-            avg_return REAL,
-            avg_drawdown REAL,
-            ev REAL,
-            ic REAL,
-            ir REAL
         );
 
 CREATE TABLE fills (
@@ -318,6 +326,66 @@ CREATE TABLE orders (
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         , source TEXT DEFAULT 'system', position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL);
+
+CREATE TABLE policy_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT UNIQUE,
+            policy_version TEXT,
+            category TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            sample_size INTEGER DEFAULT 0,
+            before_return REAL,
+            after_return REAL,
+            before_trend_capture REAL,
+            after_trend_capture REAL,
+            before_early_exit_rate REAL,
+            after_early_exit_rate REAL,
+            before_missed_big_move_rate REAL,
+            after_missed_big_move_rate REAL,
+            result TEXT,
+            rollback_triggered INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+CREATE TABLE policy_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id TEXT UNIQUE,
+            run_time TEXT DEFAULT (datetime('now')),
+            category TEXT,
+            strategy_source TEXT,
+            target_type TEXT,
+            target_name TEXT,
+            sample_size INTEGER DEFAULT 0,
+            avg_return REAL,
+            median_return REAL,
+            total_return REAL,
+            avg_mfe REAL,
+            avg_mae REAL,
+            trend_capture_ratio REAL,
+            missed_big_move_count INTEGER DEFAULT 0,
+            early_exit_count INTEGER DEFAULT 0,
+            small_profit_exit_count INTEGER DEFAULT 0,
+            bad_block_count INTEGER DEFAULT 0,
+            good_block_count INTEGER DEFAULT 0,
+            diagnosis TEXT,
+            recommendation_json TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        , churn_trade_count INTEGER DEFAULT 0, probe_failed_count INTEGER DEFAULT 0, weak_after_entry_count INTEGER DEFAULT 0);
+
+CREATE TABLE policy_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id TEXT UNIQUE,
+            created_at TEXT DEFAULT (datetime('now')),
+            category TEXT,
+            strategy_source TEXT,
+            target_type TEXT,
+            policy_json TEXT,
+            source_candidate_id INTEGER,
+            status TEXT DEFAULT 'active',
+            activated_at TEXT,
+            replaced_version_id TEXT
+        );
 
 CREATE TABLE position_history (
     symbol TEXT PRIMARY KEY,
@@ -555,8 +623,10 @@ CREATE TABLE users (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- VIEWS
+-- No views.
 
--- INDEXS
+-- INDEXES
 CREATE INDEX idx_alpha_c15m_sym_time ON alpha_candles_15m(alpha_symbol, time DESC);
 
 CREATE INDEX idx_alpha_c15m_time_symbol ON alpha_candles_15m(time DESC, alpha_symbol);
@@ -643,28 +713,6 @@ CREATE INDEX idx_as_score ON alpha_scores(composite_score DESC);
 
 CREATE INDEX idx_as_sym ON alpha_scores(symbol, time);
 
-CREATE INDEX idx_backtest_grade ON backtest_results(grade);
-
-CREATE INDEX idx_backtest_grade_score ON backtest_results(grade, grade_score);
-
-CREATE INDEX idx_backtest_grade_time ON backtest_results(grade, grade_time DESC);
-
-CREATE INDEX idx_backtest_review_run_time ON backtest_review(run_time DESC);
-
-CREATE INDEX idx_backtest_run_grade ON backtest_results(run_time DESC, grade);
-
-CREATE INDEX idx_backtest_run_symbol ON backtest_results(run_time DESC, symbol);
-
-CREATE INDEX idx_backtest_runtime ON backtest_results(run_time);
-
-CREATE INDEX idx_backtest_summary_updated ON backtest_summary_cache(updated_at DESC);
-
-CREATE INDEX idx_backtest_symbol_time ON backtest_results(symbol, grade_time DESC);
-
-CREATE INDEX idx_bt_grade ON backtest_results(grade);
-
-CREATE INDEX idx_bt_sym ON backtest_results(symbol);
-
 CREATE INDEX idx_c15m_sym ON candles_15m(symbol, time);
 
 CREATE INDEX idx_c15m_time_symbol ON candles_15m(time DESC, symbol);
@@ -681,21 +729,25 @@ CREATE INDEX idx_c6h_sym_time ON candles_6h(symbol, time DESC);
 
 CREATE INDEX idx_c6h_time_symbol ON candles_6h(time DESC, symbol);
 
-CREATE INDEX idx_factor_analysis_run ON factor_analysis(run_time DESC);
+CREATE INDEX idx_decision_actions_category ON decision_actions(category, time DESC);
+
+CREATE INDEX idx_decision_actions_symbol ON decision_actions(symbol, time DESC);
+
+CREATE INDEX idx_decision_actions_time ON decision_actions(time DESC);
+
+CREATE INDEX idx_decision_actions_type ON decision_actions(action_type, action_result, time DESC);
+
+CREATE INDEX idx_decision_outcomes_category ON decision_outcomes(category, signal_time DESC);
+
+CREATE INDEX idx_decision_outcomes_flags ON decision_outcomes(missed_big_move, early_exit, bad_block);
+
+CREATE INDEX idx_decision_outcomes_symbol ON decision_outcomes(symbol, signal_time DESC);
 
 CREATE INDEX idx_factor_effectiveness_bucket ON factor_effectiveness(bucket, run_time DESC);
 
 CREATE INDEX idx_factor_effectiveness_factor ON factor_effectiveness(factor_name, layer, profile);
 
 CREATE INDEX idx_factor_effectiveness_run ON factor_effectiveness(run_time DESC);
-
-CREATE INDEX idx_factor_perf_bucket_run ON factor_performance(bucket, run_time DESC);
-
-CREATE INDEX idx_factor_perf_name ON factor_performance(factor_name);
-
-CREATE INDEX idx_factor_perf_name_run ON factor_performance(factor_name, run_time DESC);
-
-CREATE INDEX idx_factor_perf_run ON factor_performance(run_time);
 
 CREATE INDEX idx_fills_alpha_symbol ON fills(alpha_symbol, created_at DESC);
 
@@ -747,6 +799,14 @@ CREATE INDEX idx_policy_candidates_status ON strategy_policy_candidates(status);
 
 CREATE INDEX idx_policy_candidates_target_status ON strategy_policy_candidates(target, status);
 
+CREATE INDEX idx_policy_experiments_version ON policy_experiments(policy_version, created_at DESC);
+
+CREATE INDEX idx_policy_reviews_category ON policy_reviews(category, target_type, run_time DESC);
+
+CREATE INDEX idx_policy_reviews_run ON policy_reviews(run_time DESC);
+
+CREATE INDEX idx_policy_versions_status ON policy_versions(status, category, target_type);
+
 CREATE INDEX idx_position_history_alpha ON position_history(alpha_symbol);
 
 CREATE INDEX idx_position_history_strategy ON position_history(strategy_source);
@@ -764,8 +824,6 @@ CREATE INDEX idx_positions_symbol ON positions_history(symbol);
 CREATE INDEX idx_positions_symbol_time ON positions_history(symbol, time DESC);
 
 CREATE INDEX idx_positions_time ON positions_history(time);
-
-CREATE INDEX idx_review_run_time ON backtest_review(run_time);
 
 CREATE INDEX idx_shadow_candidate ON shadow_decisions(candidate_id);
 
@@ -849,5 +907,7 @@ CREATE INDEX idx_train_sym_time ON training_samples(symbol, timestamp);
 
 CREATE INDEX idx_user_favorites_symbol ON user_favorites(symbol);
 
+-- TRIGGERS
+-- No triggers.
+
 COMMIT;
-PRAGMA foreign_keys=ON;
