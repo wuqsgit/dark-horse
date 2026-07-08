@@ -15,13 +15,16 @@ from shared.db import (
     fetch_latest_scan_meta,
     fetch_symbol_detail,
     fetch_score_history,
-    fetch_backtest_summary,
-    fetch_recent_signals,
-    fetch_factor_performance,
     fetch_signal_outcome_summary,
     get_trading_runtime_controls,
     set_trading_runtime_control,
     init_db,
+)
+from shared.policy_loop import (
+    fetch_policy_loop_summary,
+    generate_and_activate_policies,
+    label_decision_outcomes,
+    clear_legacy_backtest_data,
 )
 
 def plain_reason(reason):
@@ -340,19 +343,9 @@ async def startup():
         await asyncio.to_thread(_refresh_scan_payload_sync)
         if _scan_refresh_task is None:
             _scan_refresh_task = asyncio.create_task(_scan_cache_refresher())
-        seed_response_cache("/api/backtest/summary", await get_backtest_summary(user="admin"))
-        rows = fetch_recent_signals("S1", 50)
-        seed_response_cache("/api/backtest/recent?grade=S1&limit=50", [
-            {
-                "symbol": r["symbol"], "time": r["grade_time"], "grade": r["grade"],
-                "score": float(r["grade_score"] or 0), "price": float(r["price_at_grade"] or 0),
-                "return_12h": float(r["return_12h"] or 0) if r["return_12h"] is not None else None,
-                "return_24h": float(r["return_24h"] or 0) if r["return_24h"] is not None else None,
-                "win_12h": bool(r["win_12h"]) if r["win_12h"] is not None else None,
-                "win_24h": bool(r["win_24h"]) if r["win_24h"] is not None else None,
-            }
-            for r in rows
-        ])
+        summary = await get_backtest_summary(user="admin")
+        seed_response_cache("/api/backtest/summary", summary)
+        seed_response_cache("/api/backtest/recent?grade=S1&limit=50", (summary.get("actions") or [])[:50])
         weights_path = os.path.join(os.path.dirname(__file__), "..", "engine", "factor_weights.json")
         with open(weights_path, encoding="utf-8") as f:
             seed_response_cache("/api/backtest/factor_weights", json.load(f))
@@ -667,228 +660,6 @@ async def get_alpha_symbol_detail(alpha_symbol: str, user=Depends(get_user)):
     }
 
 
-def _build_factor_analysis_from_performance(conn):
-    run_row = conn.execute(
-        "SELECT DISTINCT run_time FROM factor_performance ORDER BY run_time DESC LIMIT 1"
-    ).fetchone()
-    if not run_row:
-        return {"error": "no analysis data", "recommendations": [], "candidate_recommendations": []}
-    run_time = run_row["run_time"]
-    rows = conn.execute(
-        """SELECT factor_name, bucket, samples, win_rate, avg_return,
-                  avg_drawdown, ev, ic, ir
-           FROM factor_performance
-           WHERE run_time = ?
-           ORDER BY factor_name, bucket""",
-        (run_time,),
-    ).fetchall()
-    by_factor = {}
-    for row in rows:
-        by_factor.setdefault(row["factor_name"], []).append(dict(row))
-
-    current_factors = []
-    recommendations = []
-    category_stats = {}
-    for name, buckets in by_factor.items():
-        usable = [b for b in buckets if int(b.get("samples") or 0) >= 3 and b.get("win_rate") is not None]
-        category_stats[name] = {
-            "buckets": buckets,
-            "samples": sum(int(b.get("samples") or 0) for b in buckets),
-        }
-        if not usable:
-            continue
-        high = max(usable, key=lambda b: (float(b.get("win_rate") or 0), float(b.get("avg_return") or 0)))
-        low = min(usable, key=lambda b: (float(b.get("win_rate") or 0), float(b.get("avg_return") or 0)))
-        discrimination = (float(high["win_rate"] or 0) - float(low["win_rate"] or 0)) * 100
-        factor_item = {
-            "name": name,
-            "discrimination": round(discrimination, 1),
-            "high_bucket": high["bucket"],
-            "low_bucket": low["bucket"],
-            "high_win_rate": round(float(high["win_rate"] or 0) * 100, 1),
-            "low_win_rate": round(float(low["win_rate"] or 0) * 100, 1),
-            "high_avg_return": round(float(high.get("avg_return") or 0) * 100, 2),
-            "low_avg_return": round(float(low.get("avg_return") or 0) * 100, 2),
-            "samples": sum(int(b.get("samples") or 0) for b in usable),
-        }
-        current_factors.append(factor_item)
-        if abs(discrimination) >= 3:
-            recommendations.append({
-                "factor": name,
-                "description": f"{name} 的 {high['bucket']} 桶胜率 {factor_item['high_win_rate']}%，明显优于 {low['bucket']} 桶 {factor_item['low_win_rate']}%",
-                "correlation": high.get("ev"),
-                "discrimination": round(discrimination, 1),
-                "suggestion": f"优先提高 {name}={high['bucket']} 的权重，降低 {low['bucket']} 的开仓优先级。",
-            })
-
-    current_factors.sort(key=lambda x: abs(x["discrimination"]), reverse=True)
-    recommendations.sort(key=lambda x: abs(x["discrimination"]), reverse=True)
-    high_scores = [x["high_win_rate"] for x in current_factors]
-    low_scores = [x["low_win_rate"] for x in current_factors]
-    overall = (sum(high_scores) / len(high_scores) - sum(low_scores) / len(low_scores)) if high_scores and low_scores else 0
-    return {
-        "run_time": run_time,
-        "source": "factor_performance_fallback",
-        "total_signals": sum(int(r["samples"] or 0) for r in rows),
-        "current_factors": current_factors,
-        "recommendations": recommendations[:10],
-        "candidate_recommendations": recommendations[:10],
-        "category_stats": category_stats,
-        "overall_discrimination": round(overall, 1),
-    }
-
-
-def _enrich_backtest_review(conn, review):
-    review = review or {}
-    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
-    rows = conn.execute(
-        """SELECT symbol, grade, grade_score, grade_time, max_drawdown,
-                  return_6h, return_12h, return_24h, return_48h, win_12h, win_24h
-           FROM backtest_results
-           WHERE grade_time >= ?
-           ORDER BY grade_time DESC
-           LIMIT 5000"""
-        ,
-        (cutoff,),
-    ).fetchall()
-    trades = conn.execute(
-        """SELECT symbol, side, pnl_pct, pnl, exit_reason, entry_time, exit_time,
-                  grade_at_entry, score_at_entry
-           FROM trades
-           WHERE exit_time >= ?
-           ORDER BY exit_time DESC
-           LIMIT 200"""
-        ,
-        (cutoff,),
-    ).fetchall()
-    entry_issues = []
-    exit_issues = []
-    good_exits = []
-    for r in rows:
-        returns = [float(v) for v in (r["return_6h"], r["return_12h"], r["return_24h"], r["return_48h"]) if v is not None]
-        if not returns:
-            continue
-        max_gain = max(returns)
-        final_ret = next((float(v) for v in (r["return_24h"], r["return_12h"], r["return_6h"]) if v is not None), returns[-1])
-        max_dd = float(r["max_drawdown"] or 0)
-        item = {
-            "symbol": r["symbol"],
-            "grade": r["grade"],
-            "score": round(float(r["grade_score"] or 0), 1),
-            "grade_time": r["grade_time"],
-            "max_gain_pct": round(max_gain * 100, 2),
-            "max_dd_pct": round(max_dd * 100, 2),
-            "ret_6h_pct": round(float(r["return_6h"] or 0) * 100, 2),
-            "ret_24h_pct": round(final_ret * 100, 2),
-        }
-        if max_gain < 0.015 or final_ret < -0.02 or max_dd <= -0.035:
-            severity = abs(min(final_ret, 0)) * 100 + abs(min(max_dd, 0)) * 50 + max(0, 0.015 - max_gain) * 100
-            entry_issues.append({**item, "entry_quality": "需要改进", "exit_quality": "观察", "reason": "最近 24h 入场后空间不足或回撤偏大", "_severity": severity, "_type": "entry"})
-        elif max_gain >= 0.035 and final_ret >= 0.015:
-            severity = max_gain * 100 + final_ret * 50
-            exit_issues.append({**item, "entry_quality": "基本正确", "exit_quality": "可能偏早", "reason": "最近 24h 信号后仍有上行空间", "_severity": severity, "_type": "exit"})
-        if max_dd <= -0.04 or final_ret <= -0.025:
-            good_exits.append({**item, "entry_quality": "风险偏高", "exit_quality": "保护有效", "reason": "最近 24h 后续回撤或转负明显，保护退出有价值", "_severity": abs(min(max_dd, final_ret)) * 100})
-
-    live_good = []
-    for t in trades:
-        pnl_pct = float(t["pnl_pct"] or 0)
-        reason = str(t["exit_reason"] or "")
-        if pnl_pct > 0 or any(x in reason for x in ("TP1", "TP2", "trailing_stop")):
-            live_good.append({
-                "symbol": t["symbol"],
-                "grade": t["grade_at_entry"] or "-",
-                "score": round(float(t["score_at_entry"] or 0), 1),
-                "grade_time": t["exit_time"],
-                "max_gain_pct": round(max(pnl_pct, 0), 2),
-                "max_dd_pct": 0,
-                "ret_6h_pct": round(pnl_pct, 2),
-                "ret_24h_pct": round(pnl_pct, 2),
-                "entry_quality": "实盘验证",
-                "exit_quality": "有效做法",
-                "reason": reason or "最近 24h 盈利退出",
-                "_severity": abs(pnl_pct),
-            })
-
-    issue_pool = entry_issues + exit_issues
-    issue_pool.sort(key=lambda x: x.get("_severity", 0), reverse=True)
-    unique_issues = []
-    seen_symbols = set()
-    for item in issue_pool:
-        symbol_key = item.get("symbol")
-        if symbol_key in seen_symbols:
-            continue
-        seen_symbols.add(symbol_key)
-        unique_issues.append(item)
-        if len(unique_issues) >= 10:
-            break
-    if len(unique_issues) < 10:
-        seen_ids = {(x.get("symbol"), x.get("grade_time"), x.get("_type")) for x in unique_issues}
-        for item in issue_pool:
-            item_id = (item.get("symbol"), item.get("grade_time"), item.get("_type"))
-            if item_id in seen_ids:
-                continue
-            unique_issues.append(item)
-            seen_ids.add(item_id)
-            if len(unique_issues) >= 10:
-                break
-    issue_pool = unique_issues
-    review["entry_issues"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in issue_pool if x["_type"] == "entry"]
-    review["exit_issues"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in issue_pool if x["_type"] == "exit"]
-    good_pool = live_good + good_exits
-    good_pool.sort(key=lambda x: x.get("_severity", 0), reverse=True)
-    unique_good = []
-    seen_good_symbols = set()
-    for item in good_pool:
-        symbol_key = item.get("symbol")
-        if symbol_key in seen_good_symbols:
-            continue
-        seen_good_symbols.add(symbol_key)
-        unique_good.append(item)
-        if len(unique_good) >= 5:
-            break
-    review["good_exits"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in unique_good]
-    overview = (review.setdefault("summary", {}).setdefault("overview", {}))
-    overview["total_samples"] = len(rows)
-    overview["gave_space_5pct"] = sum(
-        1 for r in rows
-        if max([float(v) for v in (r["return_6h"], r["return_12h"], r["return_24h"], r["return_48h"]) if v is not None] or [0]) >= 0.05
-    )
-    overview["had_drawdown_8pct"] = sum(1 for r in rows if abs(float(r["max_drawdown"] or 0)) >= 0.08)
-    overview["trade_count"] = len(trades)
-    overview["review_window"] = "最近 1 天"
-    overview["grade_time_min"] = min((r["grade_time"] for r in rows), default=None)
-    overview["grade_time_max"] = max((r["grade_time"] for r in rows), default=None)
-    review["total_signals"] = len(rows)
-    review["total_trades"] = len(trades)
-    review["live_trades"] = [
-        {
-            "symbol": t["symbol"],
-            "side": t["side"],
-            "pnl_pct": round(float(t["pnl_pct"] or 0), 2),
-            "pnl": round(float(t["pnl"] or 0), 2),
-            "exit_reason": t["exit_reason"],
-            "entry_time": t["entry_time"],
-            "exit_time": t["exit_time"],
-            "grade": t["grade_at_entry"],
-            "score": t["score_at_entry"],
-        }
-        for t in trades
-    ]
-    overview["generated_issue_count"] = len(review["entry_issues"]) + len(review["exit_issues"])
-    review["rules"] = [
-        {
-            "section": "总体判断",
-            "text": f"本轮只看最近 1 天样本 {len(rows)} 个；重点问题只展示 {len(issue_pool)} 个，其中开仓问题 {len(review['entry_issues'])} 个、可能偏早退出 {len(review['exit_issues'])} 个；有效做法 {len(review['good_exits'])} 个。",
-        },
-        {"section": "开仓问题", "text": "最近需要特别注意的是入场后最大浮盈不足、或先出现较大回撤的信号。"},
-        {"section": "平仓问题", "text": "如果最近样本仍有上行空间，尾仓应更多依赖移动止盈和多因子同步转弱。"},
-        {"section": "有效做法", "text": "最近 1 天盈利退出、TP 或保护型退出会进入有效做法，用来保留真正有用的规则。"},
-    ]
-    return review
-
-
-@app.get("/api/alpha/trade_candidates")
 async def get_alpha_trade_candidates(user=Depends(get_user)):
     version = await asyncio.to_thread(_alpha_dashboard_version)
     cached = versioned_response_get("alpha_trade_candidates", version)
@@ -1032,198 +803,53 @@ async def export_csv(user=Depends(get_user)):
 
 @app.get("/api/backtest/summary")
 async def get_backtest_summary(user=Depends(get_user)):
-    cached = cache_get("backtest_summary", 60)
+    cached = cache_get("policy_loop_summary", 30)
     if cached is not None:
         return cached
-    grades, latest = fetch_backtest_summary()
-    results = []
-    for r in grades:
-        results.append({
-            "grade": r["grade"], "count": r["count"],
-            "avg_return_12h": float(r["avg_return_12h"] or 0),
-            "avg_return_24h": float(r["avg_return_24h"] or 0),
-            "avg_return_48h": float(r["avg_return_48h"] or 0),
-            "win_rate_12h": float(r["win_rate_12h"] or 0),
-            "win_rate_24h": float(r["win_rate_24h"] or 0),
-            "avg_drawdown": float(r["avg_drawdown"] or 0),
-            "avg_score": float(r["avg_score"] or 0),
+    try:
+        data = fetch_policy_loop_summary()
+        overview = data.get("overview") or {}
+        return cache_set("policy_loop_summary", {
+            "mode": "policy_loop",
+            "latest_run": data.get("latest_review_time"),
+            "generated_at": data.get("generated_at"),
+            "overview": overview,
+            "categories": data.get("categories", []),
+            "reviews": data.get("reviews", []),
+            "candidates": data.get("candidates", []),
+            "versions": data.get("versions", []),
+            "actions": data.get("actions", [])[:80],
+            "entry_policy": data.get("entry_policy", {}),
+            "exit_policy": data.get("exit_policy", {}),
+            "grades": [],
+            "decision_summary": {
+                "total": int(overview.get("samples") or 0),
+                "latest_run_id": data.get("latest_review_time"),
+                "latest_time": data.get("generated_at"),
+                "stage_counts": [],
+                "result_counts": [],
+                "top_filter_reasons": [],
+                "recent": data.get("actions", [])[:12],
+            },
+            "outcome_summary": overview,
+            "backtest_status": {
+                "plain": "旧回测已替换为策略闭环复盘：重点看收益、错过大波段、过早平仓、自动生效策略。",
+                "backtest_rows": 0,
+                "review_rows": len(data.get("reviews", [])),
+                "factor_rows": 0,
+            },
         })
-    decision_summary = {
-        "total": 0,
-        "latest_run_id": None,
-        "latest_time": None,
-        "stage_counts": [],
-        "result_counts": [],
-        "top_filter_reasons": [],
-        "recent": [],
-    }
-    try:
-        from shared.db import get_conn
-        conn = get_conn()
-        latest_decision = conn.execute(
-            """SELECT run_id, time
-               FROM strategy_decisions
-               ORDER BY time DESC, id DESC
-               LIMIT 1"""
-        ).fetchone()
-        if latest_decision:
-            run_id = latest_decision["run_id"]
-            decision_summary["latest_run_id"] = run_id
-            decision_summary["latest_time"] = latest_decision["time"]
-            decision_summary["total"] = conn.execute(
-                "SELECT COUNT(*) FROM strategy_decisions WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()[0]
-            decision_summary["stage_counts"] = [
-                dict(r) for r in conn.execute(
-                    """SELECT decision_stage AS stage, COUNT(*) AS count
-                       FROM strategy_decisions
-                       WHERE run_id = ?
-                       GROUP BY decision_stage
-                       ORDER BY count DESC""",
-                    (run_id,),
-                ).fetchall()
-            ]
-            decision_summary["result_counts"] = [
-                dict(r) for r in conn.execute(
-                    """SELECT decision_result AS result, COUNT(*) AS count
-                       FROM strategy_decisions
-                       WHERE run_id = ?
-                       GROUP BY decision_result
-                       ORDER BY count DESC""",
-                    (run_id,),
-                ).fetchall()
-            ]
-            decision_summary["top_filter_reasons"] = [
-                dict(r) for r in conn.execute(
-                    """SELECT filter_reason AS reason, COUNT(*) AS count
-                       FROM strategy_decisions
-                       WHERE run_id = ?
-                         AND filter_reason IS NOT NULL
-                         AND filter_reason != ''
-                       GROUP BY filter_reason
-                       ORDER BY count DESC
-                       LIMIT 8""",
-                    (run_id,),
-                ).fetchall()
-            ]
-            decision_summary["recent"] = [
-                dict(r) for r in conn.execute(
-                    """SELECT time, symbol, side, decision_stage, decision_result,
-                              filter_reason, composite_score
-                       FROM strategy_decisions
-                       WHERE run_id = ?
-                       ORDER BY id DESC
-                       LIMIT 12""",
-                    (run_id,),
-                ).fetchall()
-            ]
-        conn.close()
     except Exception as e:
-        decision_summary["error"] = str(e)
-    outcome_summary = {"total": 0, "complete": 0, "by_best_side": []}
-    try:
-        run_id = decision_summary.get("latest_run_id")
-        summary_row, by_side = fetch_signal_outcome_summary(run_id=run_id)
-        outcome_summary = {
-            "total": int(summary_row.get("total") or 0),
-            "complete": int(summary_row.get("complete") or 0),
-            "avg_return_1h": float(summary_row.get("avg_return_1h") or 0),
-            "avg_return_4h": float(summary_row.get("avg_return_4h") or 0),
-            "avg_return_12h": float(summary_row.get("avg_return_12h") or 0),
-            "avg_return_24h": float(summary_row.get("avg_return_24h") or 0),
-            "avg_mfe": float(summary_row.get("avg_mfe") or 0),
-            "avg_mae": float(summary_row.get("avg_mae") or 0),
-            "direction_accuracy": (
-                float(summary_row["direction_accuracy"])
-                if summary_row.get("direction_accuracy") is not None else None
-            ),
-            "by_best_side": by_side,
-        }
-    except Exception as e:
-        outcome_summary["error"] = str(e)
-    backtest_status = {
-        "backtest_rows": 0,
-        "review_rows": 0,
-        "factor_rows": 0,
-        "score_count": 0,
-        "score_min_time": None,
-        "score_max_time": None,
-        "latest_price_time": None,
-        "latest_review_time": None,
-        "latest_factor_time": None,
-        "waiting_for_mature_returns": False,
-        "plain": "暂无成熟回测结果。",
-    }
-    try:
-        from shared.db import get_conn
-
-        conn = get_conn()
-        bt = conn.execute(
-            "SELECT COUNT(*) AS count, MAX(run_time) AS latest_run FROM backtest_results"
-        ).fetchone()
-        review_row = conn.execute(
-            "SELECT COUNT(*) AS count, MAX(run_time) AS latest_run FROM backtest_review"
-        ).fetchone()
-        factor_row = conn.execute(
-            "SELECT COUNT(*) AS count, MAX(run_time) AS latest_run FROM factor_performance"
-        ).fetchone()
-        score_row = conn.execute(
-            "SELECT COUNT(*) AS count, MIN(time) AS min_time, MAX(time) AS max_time FROM alpha_scores"
-        ).fetchone()
-        price_row = conn.execute(
-            "SELECT MAX(time) AS max_time FROM candles_1h"
-        ).fetchone()
-
-        backtest_rows = int(bt["count"] or 0)
-        score_count = int(score_row["count"] or 0)
-        latest_price_time = price_row["max_time"] if price_row else None
-        waiting = backtest_rows == 0 and score_count > 0 and bool(latest_price_time)
-        if waiting:
-            plain = (
-                "扫描评分和行情已经有数据，但当前信号还没走完 6h/12h/24h "
-                "未来收益验证窗口，所以暂时不会生成等级收益概览。"
-            )
-        elif score_count == 0:
-            plain = "暂无扫描评分样本，回测还没有可验证的信号来源。"
-        elif not latest_price_time:
-            plain = "暂无 1h 行情数据，回测无法计算未来收益。"
-        else:
-            plain = "暂无成熟回测结果，等待下一轮回测任务产出。"
-
-        backtest_status = {
-            "backtest_rows": backtest_rows,
-            "review_rows": int(review_row["count"] or 0),
-            "factor_rows": int(factor_row["count"] or 0),
-            "score_count": score_count,
-            "score_min_time": score_row["min_time"],
-            "score_max_time": score_row["max_time"],
-            "latest_price_time": latest_price_time,
-            "latest_review_time": review_row["latest_run"],
-            "latest_factor_time": factor_row["latest_run"],
-            "waiting_for_mature_returns": waiting,
-            "plain": plain,
-        }
-        conn.close()
-    except Exception as e:
-        backtest_status["error"] = str(e)
-    return cache_set("backtest_summary", {
-        "latest_run": latest,
-        "grades": results,
-        "decision_summary": decision_summary,
-        "outcome_summary": outcome_summary,
-        "backtest_status": backtest_status,
-    })
+        return {"mode": "policy_loop", "error": str(e), "overview": {}, "categories": [], "reviews": [], "actions": []}
 
 
 @app.get("/api/factor/performance")
 async def get_factor_performance(factor: str = None, user=Depends(get_user)):
-    """馃敡 鍥犲瓙褰掑洜鍒嗘瀽缁撴灉"""
+    """Policy-loop diagnostics kept on the old path for compatibility."""
     try:
-        rows = fetch_factor_performance(limit=200)
-        payload = [dict(r) for r in rows]
+        payload = fetch_policy_loop_summary(limit=200).get("reviews", [])
         if factor:
-            payload = [r for r in payload if r.get("factor_name") == factor]
+            payload = [r for r in payload if r.get("target_name") == factor or r.get("target_type") == factor]
         return {"rows": payload, "count": len(payload)}
     except Exception as e:
         return {"error": str(e), "rows": []}
@@ -1231,92 +857,101 @@ async def get_factor_performance(factor: str = None, user=Depends(get_user)):
 
 @app.get("/api/backtest/recent")
 async def get_recent_signals(grade: str = "S1", limit: int = 50, user=Depends(get_user)):
-    cache_key = f"backtest_recent:{grade}:{limit}"
-    cached = cache_get(cache_key, 60)
-    if cached is not None:
-        return cached
-    rows = fetch_recent_signals(grade, limit)
-    return cache_set(cache_key, format_backtest_signals(rows))
+    data = fetch_policy_loop_summary(limit=limit)
+    return data.get("actions", [])[:limit]
 
 
 @app.get("/api/backtest/signals")
 async def get_backtest_signals(grade: str = "all", limit: int = 200, user=Depends(get_user)):
-    cache_key = f"backtest_signals:{grade}:{limit}"
-    cached = cache_get(cache_key, 60)
-    if cached is not None:
-        return cached
-    rows = fetch_recent_signals(grade, limit)
-    return cache_set(cache_key, format_backtest_signals(rows))
+    data = fetch_policy_loop_summary(limit=limit)
+    return data.get("actions", [])[:limit]
 # ---- 瀹炵洏浜ゆ槗 API ----
 
 
 @app.get("/api/backtest/factor_analysis")
 async def get_factor_analysis(user=Depends(get_user)):
-    """Return factor analysis result."""
-    from shared.db import get_conn
-    conn = get_conn()
+    """Return policy-loop factor/category diagnostics."""
     try:
-        version_row = conn.execute(
-            """SELECT
-                   (SELECT MAX(rowid) FROM factor_analysis) AS analysis_rowid,
-                   (SELECT MAX(run_time) FROM factor_performance) AS performance_run"""
-        ).fetchone()
-        version = (
-            version_row["analysis_rowid"] if version_row else None,
-            version_row["performance_run"] if version_row else None,
-        )
-        cached = versioned_cache_get("backtest_factor_analysis", version)
-        if cached is not None:
-            return cached
-        row = conn.execute(
-            "SELECT result FROM factor_analysis ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-        if row and row["result"]:
-            return versioned_cache_set("backtest_factor_analysis", version, json.loads(row["result"]))
-        return versioned_cache_set("backtest_factor_analysis", version, _build_factor_analysis_from_performance(conn))
+        data = fetch_policy_loop_summary()
+        return {
+            "mode": "policy_loop",
+            "run_time": data.get("latest_review_time"),
+            "total_signals": (data.get("overview") or {}).get("samples", 0),
+            "category_stats": data.get("categories", []),
+            "current_factors": data.get("reviews", []),
+            "candidate_recommendations": data.get("candidates", []),
+            "overall_discrimination": 0,
+        }
     except Exception as e:
         return {"error": str(e), "recommendations": [], "candidate_recommendations": []}
-    finally:
-        conn.close()
 
 
 @app.get("/api/backtest/review")
 async def get_backtest_review(user=Depends(get_user)):
-    """Return latest persisted backtest review."""
-    from shared.db import get_conn
-    conn = get_conn()
+    """Return latest policy-loop review."""
     try:
-        row = conn.execute(
-            "SELECT run_time, review_json FROM backtest_review ORDER BY run_time DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
-            version_row = conn.execute(
-                """SELECT
-                       (SELECT MAX(grade_time) FROM backtest_results WHERE grade_time >= ?) AS latest_grade_time,
-                       (SELECT COUNT(*) FROM backtest_results WHERE grade_time >= ?) AS recent_grade_count,
-                       (SELECT MAX(exit_time) FROM trades WHERE exit_time >= ?) AS latest_trade_exit,
-                       (SELECT COUNT(*) FROM trades WHERE exit_time >= ?) AS recent_trade_count""",
-                (cutoff, cutoff, cutoff, cutoff),
-            ).fetchone()
-            version = (
-                row["run_time"],
-                version_row["latest_grade_time"],
-                version_row["recent_grade_count"],
-                version_row["latest_trade_exit"],
-                version_row["recent_trade_count"],
-            )
-            cached = versioned_cache_get("backtest_review", version)
-            if cached is not None:
-                return cached
-            data = json.loads(row["review_json"])
-            data["_run_time"] = row["run_time"]
-            return versioned_cache_set("backtest_review", version, _enrich_backtest_review(conn, data))
-        return {"error": "鏆傛棤澶嶇洏鏁版嵁锛岃杩愯鍥炴祴"}
+        data = fetch_policy_loop_summary()
+        return {
+            "mode": "policy_loop",
+            "_run_time": data.get("latest_review_time"),
+            "summary": {"overview": data.get("overview", {})},
+            "reviews": data.get("reviews", []),
+            "entry_issues": [r for r in data.get("reviews", []) if r.get("target_type") == "entry_filter" and (r.get("bad_block_count") or 0) > 0],
+            "exit_issues": [r for r in data.get("reviews", []) if r.get("target_type") == "exit" and (r.get("early_exit_count") or 0) > 0],
+            "good_exits": [r for r in data.get("reviews", []) if r.get("target_type") == "exit" and (r.get("early_exit_count") or 0) == 0],
+            "rules": [
+                {"section": "闭环目标", "text": "优先提高收益率、减少错过大波段、减少频繁小盈利平仓；胜率只作为辅助指标。"},
+                {"section": "自动生效", "text": "满足样本和收益改善条件的策略会自动 active，并写入运行时策略文件。"},
+                {"section": "回滚保护", "text": "新策略如果导致收益转差、过早平仓或误拦截升高，会被 policy guard 自动回滚。"},
+            ],
+            "candidates": data.get("candidates", []),
+            "versions": data.get("versions", []),
+        }
     except Exception as e:
         return {"error": str(e)}
-    finally:
-        conn.close()
+
+
+@app.post("/api/policy/review/run")
+async def run_policy_review_now(user=Depends(get_user)):
+    try:
+        result = generate_and_activate_policies()
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/policy/outcomes/label")
+async def label_policy_outcomes_now(user=Depends(get_user)):
+    try:
+        count = label_decision_outcomes(limit=5000)
+        return {"status": "ok", "updated": count}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/policy/actions")
+async def get_policy_actions(limit: int = 200, user=Depends(get_user)):
+    try:
+        return {"actions": fetch_policy_loop_summary(limit=limit).get("actions", [])}
+    except Exception as e:
+        return {"error": str(e), "actions": []}
+
+
+@app.get("/api/policy/versions")
+async def get_policy_versions(user=Depends(get_user)):
+    try:
+        data = fetch_policy_loop_summary()
+        return {"versions": data.get("versions", []), "entry_policy": data.get("entry_policy", {}), "exit_policy": data.get("exit_policy", {})}
+    except Exception as e:
+        return {"error": str(e), "versions": []}
+
+
+@app.post("/api/policy/legacy/clear")
+async def clear_legacy_backtest(vacuum: bool = False, user=Depends(get_user)):
+    try:
+        return {"status": "ok", **clear_legacy_backtest_data(vacuum=vacuum)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/backtest/factor_weights")
@@ -1357,28 +992,7 @@ async def save_factor_weights(body: dict, user=Depends(get_user)):
 
 # ---- 瀹炵洏浜ゆ槗 API + 缂撳瓨 ----
 def _seed_learning_candidates_from_latest():
-    from shared.db import get_conn
-    from shared.strategy_learning import generate_policy_candidates
-
-    conn = get_conn()
-    try:
-        review = None
-        factor = None
-        row = conn.execute(
-            "SELECT run_time, review_json FROM backtest_review ORDER BY run_time DESC LIMIT 1"
-        ).fetchone()
-        if row and row["review_json"]:
-            review = json.loads(row["review_json"])
-            review["_run_time"] = row["run_time"]
-        frow = conn.execute(
-            "SELECT result FROM factor_analysis ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-        if frow and frow["result"]:
-            factor = json.loads(frow["result"])
-    finally:
-        conn.close()
-    if review or factor:
-        generate_policy_candidates(review=review, factor_result=factor)
+    return generate_and_activate_policies()
 
 
 @app.get("/api/strategy/learning")
@@ -1536,37 +1150,15 @@ def _build_local_trading_status(error=None):
                 (latest_snapshot,),
             ).fetchall()
         recent_trades = fetch_position_trade_groups(100)
-        closed = conn.execute(
-            """SELECT pnl, pnl_pct, exit_reason, entry_time, exit_time
-               FROM trades
-               WHERE exit_time != 'N/A'
-                 AND exit_time IS NOT NULL
-                 AND exit_reason NOT IN (?,?)
-                 AND source='system'""",
-            excluded,
-        ).fetchall()
-        total_trades = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE exit_reason NOT IN (?,?) AND source='system'",
-            excluded,
-        ).fetchone()[0]
-        total_pnl = sum(r["pnl"] or 0 for r in closed)
-        wins = [r for r in closed if (r["pnl"] or 0) > 0]
-        losses = [r for r in closed if (r["pnl"] or 0) <= 0]
-        total_closed = len(closed)
-        win_count = len(wins)
-        loss_count = len(losses)
-        win_rate = round(win_count / total_closed * 100, 2) if total_closed else 0
-        total_win_val = sum(r["pnl"] or 0 for r in wins)
-        total_loss_val = abs(sum(r["pnl"] or 0 for r in losses))
-        profit_ratio = round(abs(total_win_val / total_loss_val), 2) if total_loss_val else 0
-        reason_stats = {}
-        for r in closed:
-            reason = r["exit_reason"] or "unknown"
-            reason_stats.setdefault(reason, {"count": 0, "total_pnl": 0, "wins": 0})
-            reason_stats[reason]["count"] += 1
-            reason_stats[reason]["total_pnl"] += r["pnl"] or 0
-            if (r["pnl"] or 0) > 0:
-                reason_stats[reason]["wins"] += 1
+        grouped_stats = _grouped_trade_stats(recent_trades)
+        total_trades = grouped_stats["total_trades"]
+        total_pnl = grouped_stats["total_pnl"]
+        total_closed = grouped_stats["total_closed"]
+        win_count = grouped_stats["win_count"]
+        loss_count = grouped_stats["loss_count"]
+        win_rate = grouped_stats["win_rate"]
+        profit_ratio = grouped_stats["profit_ratio"]
+        reason_stats = grouped_stats["reason_stats"]
         positions = []
         for p in position_rows:
             entry_price = p["entry_price"] or 0
@@ -1611,19 +1203,46 @@ def _build_local_trading_status(error=None):
             "loss_count": loss_count,
             "win_rate": win_rate,
             "profit_ratio": profit_ratio,
-            "reason_stats": {
-                k: {
-                    "count": v["count"],
-                    "total_pnl": round(v["total_pnl"], 2),
-                    "win_rate": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
-                }
-                for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
-            },
+            "reason_stats": reason_stats,
             "latest_position_snapshot": latest_snapshot,
             "trading_controls": controls,
         }
     finally:
         conn.close()
+
+
+def _grouped_trade_stats(grouped_trades):
+    rows = [r for r in (grouped_trades or []) if r.get("exit_time")]
+    total_pnl = sum(float(r.get("pnl") or 0) for r in rows)
+    wins = [r for r in rows if float(r.get("pnl") or 0) > 0]
+    losses = [r for r in rows if float(r.get("pnl") or 0) <= 0]
+    total_win = sum(float(r.get("pnl") or 0) for r in wins)
+    total_loss = abs(sum(float(r.get("pnl") or 0) for r in losses))
+    reason_stats = {}
+    for r in rows:
+        reason = r.get("exit_reason") or "unknown"
+        reason_stats.setdefault(reason, {"count": 0, "total_pnl": 0.0, "wins": 0})
+        reason_stats[reason]["count"] += 1
+        reason_stats[reason]["total_pnl"] += float(r.get("pnl") or 0)
+        if float(r.get("pnl") or 0) > 0:
+            reason_stats[reason]["wins"] += 1
+    return {
+        "total_trades": len(rows),
+        "total_closed": len(rows),
+        "total_pnl": total_pnl,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": round(len(wins) / len(rows) * 100, 2) if rows else 0,
+        "profit_ratio": round(total_win / total_loss, 2) if total_loss else 0,
+        "reason_stats": {
+            k: {
+                "count": v["count"],
+                "total_pnl": round(v["total_pnl"], 2),
+                "win_rate": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
+            }
+            for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
+        },
+    }
 
 
 @app.get("/api/trading/statu")
@@ -1672,32 +1291,15 @@ async def get_trading_status(user=Depends(get_user)):
         positions = ex.get_positions()
         conn = get_conn()
         recent_trades = fetch_position_trade_groups(100)
-        total_trades = conn.execute("SELECT COUNT(*) FROM trades WHERE exit_reason NOT IN ('historical_import','鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)') AND source='system'").fetchone()[0]
-        
-        # ---- stats 鏁版嵁 ----
-        closed = conn.execute(
-            "SELECT pnl, pnl_pct, exit_reason, entry_time, exit_time FROM trades WHERE exit_time != 'N/A' AND exit_time IS NOT NULL AND exit_reason NOT IN ('historical_import','鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)') AND source='system'"
-        ).fetchall()
-        total_closed = len(closed)
-        total_pnl = sum(r["pnl"] or 0 for r in closed)
-        wins = [r for r in closed if (r["pnl"] or 0) > 0]
-        losses = [r for r in closed if (r["pnl"] or 0) <= 0]
-        win_count = len(wins)
-        loss_count = len(losses)
-        win_rate = round(win_count / total_closed * 100, 2) if total_closed else 0
-        total_win_val = sum(r["pnl"] or 0 for r in wins)
-        total_loss_val = abs(sum(r["pnl"] or 0 for r in losses))
-        profit_ratio = round(abs(total_win_val / total_loss_val), 2) if total_loss_val else 0
-        
-        reason_stats = {}
-        for r in closed:
-            reason = r["exit_reason"] or "鏈煡"
-            if reason not in reason_stats:
-                reason_stats[reason] = {"count": 0, "total_pnl": 0, "wins": 0}
-            reason_stats[reason]["count"] += 1
-            reason_stats[reason]["total_pnl"] += r["pnl"] or 0
-            if (r["pnl"] or 0) > 0:
-                reason_stats[reason]["wins"] += 1
+        grouped_stats = _grouped_trade_stats(recent_trades)
+        total_trades = grouped_stats["total_trades"]
+        total_closed = grouped_stats["total_closed"]
+        total_pnl = grouped_stats["total_pnl"]
+        win_count = grouped_stats["win_count"]
+        loss_count = grouped_stats["loss_count"]
+        win_rate = grouped_stats["win_rate"]
+        profit_ratio = grouped_stats["profit_ratio"]
+        reason_stats = grouped_stats["reason_stats"]
 
         def parse_position_time(value):
             if not value:
@@ -1959,7 +1561,7 @@ async def get_trading_status(user=Depends(get_user)):
                 k: {
                     "count": v["count"],
                     "total_pnl": round(v["total_pnl"], 2),
-                    "win_rate": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
+                    "win_rate": v.get("win_rate", 0),
                     "plain": plain_reason(k),
                 }
                 for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
@@ -1987,27 +1589,16 @@ async def get_trading_status(user=Depends(get_user)):
 
 @app.get("/api/trading/stats")
 async def get_trading_stats(user=Depends(get_user)):
-    from shared.db import get_conn
+    from shared.db import fetch_position_trade_groups, get_conn
     conn = get_conn()
     try:
-        EXCL = ("historical_import", "鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)")
-        # 鎵鏈夊凡骞充粨浜ゆ槗锛堟帓闄ゅ巻鍙插鍏ワ級
-        closed = conn.execute(
-            "SELECT pnl, pnl_pct, exit_reason, entry_time, exit_time FROM trades WHERE exit_time != 'N/A' AND exit_time IS NOT NULL AND exit_reason NOT IN (?,?)",
-            EXCL
-        ).fetchall()
-        
-        total_closed = len(closed)
-        total_pnl = sum(r["pnl"] or 0 for r in closed)
-        wins = [r for r in closed if (r["pnl"] or 0) > 0]
-        losses = [r for r in closed if (r["pnl"] or 0) <= 0]
-        win_count = len(wins)
-        loss_count = len(losses)
-        win_rate = round(win_count / total_closed * 100, 2) if total_closed else 0
-        
-        # 鐩堜簭姣?        total_win = sum(r["pnl"] or 0 for r in wins)
-        total_loss = abs(sum(r["pnl"] or 0 for r in losses))
-        profit_ratio = round(abs(total_win / total_loss), 2) if total_loss else 0
+        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(500))
+        total_closed = grouped_stats["total_closed"]
+        total_pnl = grouped_stats["total_pnl"]
+        win_count = grouped_stats["win_count"]
+        loss_count = grouped_stats["loss_count"]
+        win_rate = grouped_stats["win_rate"]
+        profit_ratio = grouped_stats["profit_ratio"]
         
         # 褰撳墠鎸佷粨鏁?        import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -2017,17 +1608,8 @@ async def get_trading_stats(user=Depends(get_user)):
         current_pos = len(pos)
         ex.close()
         
-        # 鎸夊钩浠撳師鍥犵粺璁?        reason_stats = {}
-        for r in closed:
-            reason = r["exit_reason"] or "鏈煡"
-            if reason not in reason_stats:
-                reason_stats[reason] = {"count": 0, "total_pnl": 0, "wins": 0}
-            reason_stats[reason]["count"] += 1
-            reason_stats[reason]["total_pnl"] += r["pnl"] or 0
-            if (r["pnl"] or 0) > 0:
-                reason_stats[reason]["wins"] += 1
-        
-        # 鎬诲紑浠撴鏁帮紙鎺掗櫎鍘嗗彶瀵煎叆锛?        total_opens = conn.execute("SELECT count(*) FROM trades WHERE exit_reason NOT IN (?,?)", EXCL).fetchone()[0]
+        reason_stats = grouped_stats["reason_stats"]
+        total_opens = grouped_stats["total_trades"]
         
         return {
             "total_pnl": round(total_pnl, 2),
@@ -2039,14 +1621,7 @@ async def get_trading_stats(user=Depends(get_user)):
             "loss_count": loss_count,
             "win_rate": win_rate,
             "profit_ratio": profit_ratio,
-            "reason_stats": {
-                k: {
-                    "count": v["count"],
-                    "total_pnl": round(v["total_pnl"], 2),
-                    "win_rate": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
-                }
-                for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
-            },
+            "reason_stats": reason_stats,
         }
     except Exception as e:
         return {"error": str(e), "total_pnl": 0, "current_positions": 0, "total_opens": 0}

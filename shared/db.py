@@ -1,4 +1,4 @@
-"""Database layer — SQLite backend (fast local dev, swap to PG later)"""
+﻿"""Database layer 鈥?SQLite backend (fast local dev, swap to PG later)"""
 import os
 import json
 import sqlite3
@@ -12,7 +12,7 @@ _local = threading.local()
 
 
 def get_conn():
-    # 每个调用都获取新连接，避免线程安全问题
+    # Open a fresh SQLite connection per call.
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -21,10 +21,10 @@ def get_conn():
 
 
 def init_db():
-    """创建所有表（幂等）—— 首次启动或新表迁移时调用"""
+    """鍒涘缓鎵€鏈夎〃锛堝箓绛夛級鈥斺€?棣栨鍚姩鎴栨柊琛ㄨ縼绉绘椂璋冪敤"""
     conn = get_conn()
     conn.executescript("""
-        -- 已有表：K线、期货、链上
+        -- Core market data tables.
         CREATE TABLE IF NOT EXISTS symbols (
             symbol TEXT PRIMARY KEY,
             is_active INTEGER DEFAULT 1,
@@ -67,7 +67,7 @@ def init_db():
             cex_net_outflow_ratio REAL, window_hours INTEGER DEFAULT 24,
             PRIMARY KEY (time, symbol, chain)
         );
-        -- 评分表
+        -- Score table.
         CREATE TABLE IF NOT EXISTS alpha_scores (
             time TEXT, symbol TEXT,
             composite_score REAL, composite_summary TEXT,
@@ -80,14 +80,13 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_alpha_scores_scan ON alpha_scores(scan_id);
         CREATE INDEX IF NOT EXISTS idx_alpha_scores_time ON alpha_scores(time);
-        -- 交易表
+        -- Trade table.
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL, side TEXT NOT NULL, position_side TEXT,
             quantity REAL, entry_price REAL, exit_price REAL,
             pnl REAL, pnl_pct REAL, exit_reason TEXT,
-            entry_reason TEXT,  -- V3.0 开仓原因
-            entry_time TEXT, exit_time TEXT,
+            entry_reason TEXT,  -- V3.0 寮€浠撳師鍥?            entry_time TEXT, exit_time TEXT,
             grade_at_entry TEXT, score_at_entry REAL,
             created_at TEXT DEFAULT (datetime('now')),
             source TEXT DEFAULT 'system',
@@ -95,7 +94,7 @@ def init_db():
             fill_ids TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
-        -- V3.0 开仓记录表（记录开仓原因，重启不丢）
+        -- Live position entry state.
         CREATE TABLE IF NOT EXISTS position_history (
             symbol TEXT PRIMARY KEY,
             side TEXT, quantity REAL,
@@ -104,41 +103,8 @@ def init_db():
             tp3_price REAL, atr_value REAL,
             update_time TEXT DEFAULT (datetime('now'))
         );
-        CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
-        -- 回测表
-        CREATE TABLE IF NOT EXISTS backtest_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT, grade TEXT, grade_score REAL,
-            grade_time TEXT, price_at_grade REAL,
-            return_6h REAL, return_12h REAL, return_24h REAL, return_48h REAL,
-            max_drawdown REAL, win_12h INTEGER, win_24h INTEGER,
-            run_time TEXT DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_backtest_grade ON backtest_results(grade);
-        CREATE INDEX IF NOT EXISTS idx_backtest_grade_time ON backtest_results(grade, grade_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_backtest_runtime ON backtest_results(run_time);
-        CREATE INDEX IF NOT EXISTS idx_backtest_grade_score ON backtest_results(grade, grade_score);
-        CREATE TABLE IF NOT EXISTS backtest_summary_cache (
-            grade TEXT PRIMARY KEY,
-            latest_run TEXT,
-            count INTEGER,
-            avg_return_12h REAL,
-            avg_return_24h REAL,
-            avg_return_48h REAL,
-            win_rate_12h REAL,
-            win_rate_24h REAL,
-            avg_drawdown REAL,
-            avg_score REAL,
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS backtest_review (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_time TEXT DEFAULT (datetime('now')),
-            review_json TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_backtest_review_run_time ON backtest_review(run_time DESC);
-        -- ===== 新增表 =====
-        -- 持仓快照（每轮循环记录）
+        -- Legacy backtest tables removed; policy-loop tables below are the source of truth.
+        -- 鎸佷粨蹇収锛堟瘡杞惊鐜褰曪級
         CREATE TABLE IF NOT EXISTS positions_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT DEFAULT (datetime('now')),
@@ -155,22 +121,6 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_positions_time ON positions_history(time);
         CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions_history(symbol);
-        -- 因子归因
-        CREATE TABLE IF NOT EXISTS factor_performance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_time TEXT DEFAULT (datetime('now')),
-            factor_name TEXT NOT NULL,
-            bucket TEXT NOT NULL,
-            samples INTEGER,
-            win_rate REAL,
-            avg_return REAL,
-            avg_drawdown REAL,
-            ev REAL,
-            ic REAL,
-            ir REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_factor_perf_run ON factor_performance(run_time);
-        CREATE INDEX IF NOT EXISTS idx_factor_perf_name ON factor_performance(factor_name);
         CREATE TABLE IF NOT EXISTS strategy_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             decision_id TEXT UNIQUE,
@@ -232,6 +182,141 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_signal_outcomes_run_complete ON signal_outcomes(run_id, is_complete);
         CREATE INDEX IF NOT EXISTS idx_signal_outcomes_run_side ON signal_outcomes(run_id, best_side);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_outcomes_decision ON signal_outcomes(decision_id);
+        CREATE TABLE IF NOT EXISTS decision_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id TEXT UNIQUE,
+            source_decision_id TEXT,
+            source_trade_id INTEGER,
+            run_id TEXT,
+            time TEXT DEFAULT (datetime('now')),
+            symbol TEXT NOT NULL,
+            category TEXT,
+            strategy_source TEXT DEFAULT 'normal',
+            action_type TEXT,
+            action_result TEXT,
+            side TEXT,
+            price REAL,
+            score REAL,
+            entry_alpha REAL,
+            hold_alpha REAL,
+            grade TEXT,
+            reason_code TEXT,
+            reason_text TEXT,
+            reason_json TEXT,
+            features_json TEXT,
+            risk_params_json TEXT,
+            position_params_json TEXT,
+            policy_version TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_actions_time ON decision_actions(time DESC);
+        CREATE INDEX IF NOT EXISTS idx_decision_actions_symbol ON decision_actions(symbol, time DESC);
+        CREATE INDEX IF NOT EXISTS idx_decision_actions_category ON decision_actions(category, time DESC);
+        CREATE INDEX IF NOT EXISTS idx_decision_actions_type ON decision_actions(action_type, action_result, time DESC);
+        CREATE TABLE IF NOT EXISTS decision_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            category TEXT,
+            action_type TEXT,
+            action_result TEXT,
+            signal_time TEXT,
+            entry_price REAL,
+            side TEXT,
+            return_1h REAL,
+            return_4h REAL,
+            return_12h REAL,
+            return_24h REAL,
+            return_48h REAL,
+            return_72h REAL,
+            max_favorable_return REAL,
+            max_adverse_return REAL,
+            max_favorable_time TEXT,
+            max_adverse_time TEXT,
+            atr_at_signal REAL,
+            mfe_atr_multiple REAL,
+            mae_atr_multiple REAL,
+            missed_big_move INTEGER DEFAULT 0,
+            early_exit INTEGER DEFAULT 0,
+            good_block INTEGER DEFAULT 0,
+            bad_block INTEGER DEFAULT 0,
+            small_profit_exit INTEGER DEFAULT 0,
+            churn_trade INTEGER DEFAULT 0,
+            probe_failed INTEGER DEFAULT 0,
+            weak_after_entry INTEGER DEFAULT 0,
+            holding_minutes REAL,
+            trend_capture_ratio REAL,
+            bars_observed INTEGER DEFAULT 0,
+            is_complete INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_outcomes_symbol ON decision_outcomes(symbol, signal_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_decision_outcomes_category ON decision_outcomes(category, signal_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_decision_outcomes_flags ON decision_outcomes(missed_big_move, early_exit, bad_block);
+        CREATE TABLE IF NOT EXISTS policy_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id TEXT UNIQUE,
+            run_time TEXT DEFAULT (datetime('now')),
+            category TEXT,
+            strategy_source TEXT,
+            target_type TEXT,
+            target_name TEXT,
+            sample_size INTEGER DEFAULT 0,
+            avg_return REAL,
+            median_return REAL,
+            total_return REAL,
+            avg_mfe REAL,
+            avg_mae REAL,
+            trend_capture_ratio REAL,
+            missed_big_move_count INTEGER DEFAULT 0,
+            early_exit_count INTEGER DEFAULT 0,
+            small_profit_exit_count INTEGER DEFAULT 0,
+            churn_trade_count INTEGER DEFAULT 0,
+            probe_failed_count INTEGER DEFAULT 0,
+            weak_after_entry_count INTEGER DEFAULT 0,
+            bad_block_count INTEGER DEFAULT 0,
+            good_block_count INTEGER DEFAULT 0,
+            diagnosis TEXT,
+            recommendation_json TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_policy_reviews_run ON policy_reviews(run_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_policy_reviews_category ON policy_reviews(category, target_type, run_time DESC);
+        CREATE TABLE IF NOT EXISTS policy_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id TEXT UNIQUE,
+            created_at TEXT DEFAULT (datetime('now')),
+            category TEXT,
+            strategy_source TEXT,
+            target_type TEXT,
+            policy_json TEXT,
+            source_candidate_id INTEGER,
+            status TEXT DEFAULT 'active',
+            activated_at TEXT,
+            replaced_version_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_policy_versions_status ON policy_versions(status, category, target_type);
+        CREATE TABLE IF NOT EXISTS policy_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT UNIQUE,
+            policy_version TEXT,
+            category TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            sample_size INTEGER DEFAULT 0,
+            before_return REAL,
+            after_return REAL,
+            before_trend_capture REAL,
+            after_trend_capture REAL,
+            before_early_exit_rate REAL,
+            after_early_exit_rate REAL,
+            before_missed_big_move_rate REAL,
+            after_missed_big_move_rate REAL,
+            result TEXT,
+            rollback_triggered INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_policy_experiments_version ON policy_experiments(policy_version, created_at DESC);
         CREATE TABLE IF NOT EXISTS strategy_policy_candidates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT DEFAULT (datetime('now')),
@@ -301,7 +386,7 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_factor_effectiveness_run ON factor_effectiveness(run_time DESC);
         CREATE INDEX IF NOT EXISTS idx_factor_effectiveness_factor ON factor_effectiveness(factor_name, layer, profile);
-        -- 订单表（下单意图记录）
+        -- Order intent table.
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
@@ -314,7 +399,7 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         );
-        -- 成交记录表
+        -- Fill table.
         CREATE TABLE IF NOT EXISTS fills (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
@@ -329,7 +414,7 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_trade_id ON fills(trade_id);
-        -- Alpha Score 训练样本表
+        -- Training samples table.
         CREATE TABLE IF NOT EXISTS training_samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scan_id TEXT NOT NULL,
@@ -347,7 +432,7 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_train_sym_time ON training_samples(symbol, timestamp);
         CREATE INDEX IF NOT EXISTS idx_train_scan ON training_samples(scan_id);
-        -- 交易对快照表（幸存者偏差修复）
+        -- 浜ゆ槗瀵瑰揩鐓ц〃锛堝垢瀛樿€呭亸宸慨澶嶏級
         CREATE TABLE IF NOT EXISTS symbol_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
@@ -358,7 +443,7 @@ def init_db():
             active BOOLEAN DEFAULT 1,
             UNIQUE(date, symbol)
         );
-        -- V3.0 交易冷却追踪表
+        -- Trade cooldown table.
         CREATE TABLE IF NOT EXISTS trade_cooldown (
             symbol TEXT PRIMARY KEY,
             last_stop_time TEXT,
@@ -368,7 +453,7 @@ def init_db():
             reason TEXT,
             updated_at TEXT
         );
-        -- V3.0 订单簿快照表
+        -- V3.0 璁㈠崟绨垮揩鐓ц〃
         CREATE TABLE IF NOT EXISTS orderbook_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
@@ -381,7 +466,7 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_ob_timestamp ON orderbook_snapshots(timestamp);
         CREATE INDEX IF NOT EXISTS idx_ob_symbol ON orderbook_snapshots(symbol);
-        -- V4.0 订单簿深度快照表（增强版，含大小单统计）
+        -- V4.0 璁㈠崟绨挎繁搴﹀揩鐓ц〃锛堝寮虹増锛屽惈澶у皬鍗曠粺璁★級
         CREATE TABLE IF NOT EXISTS orderbook_depth (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT NOT NULL,
@@ -639,6 +724,19 @@ def init_db():
     }.items():
         _ensure_column(conn, "signal_outcomes", column, ddl)
     for column, ddl in {
+        "churn_trade": "INTEGER DEFAULT 0",
+        "probe_failed": "INTEGER DEFAULT 0",
+        "weak_after_entry": "INTEGER DEFAULT 0",
+        "holding_minutes": "REAL",
+    }.items():
+        _ensure_column(conn, "decision_outcomes", column, ddl)
+    for column, ddl in {
+        "churn_trade_count": "INTEGER DEFAULT 0",
+        "probe_failed_count": "INTEGER DEFAULT 0",
+        "weak_after_entry_count": "INTEGER DEFAULT 0",
+    }.items():
+        _ensure_column(conn, "policy_reviews", column, ddl)
+    for column, ddl in {
         "source_type": "TEXT",
         "source_run_time": "TEXT",
         "target": "TEXT",
@@ -717,13 +815,7 @@ def _ensure_performance_indexes(conn):
         ("idx_signal_outcomes_complete_time", "signal_outcomes", "is_complete, signal_time DESC"),
         ("idx_signal_outcomes_scan", "signal_outcomes", "scan_id"),
         # Backtests, factors, and learning pages.
-        ("idx_backtest_symbol_time", "backtest_results", "symbol, grade_time DESC"),
-        ("idx_backtest_run_symbol", "backtest_results", "run_time DESC, symbol"),
-        ("idx_backtest_run_grade", "backtest_results", "run_time DESC, grade"),
-        ("idx_factor_perf_name_run", "factor_performance", "factor_name, run_time DESC"),
-        ("idx_factor_perf_bucket_run", "factor_performance", "bucket, run_time DESC"),
         ("idx_factor_effectiveness_bucket", "factor_effectiveness", "bucket, run_time DESC"),
-        ("idx_factor_analysis_run", "factor_analysis", "run_time DESC"),
         ("idx_policy_candidates_target_status", "strategy_policy_candidates", "target, status"),
         ("idx_policy_audit_created", "strategy_policy_audit", "created_at DESC"),
         ("idx_shadow_symbol_created", "shadow_decisions", "symbol, created_at DESC"),
@@ -774,7 +866,6 @@ def _ensure_performance_indexes(conn):
         ("idx_alpha_trade_candidates_vp_state", "alpha_trade_candidates", "volume_price_state, time DESC"),
         ("idx_alpha_cooldowns_source_until", "alpha_cooldowns", "source, cooldown_until"),
         # Miscellaneous small tables still benefit in admin/dashboard lookups.
-        ("idx_backtest_summary_updated", "backtest_summary_cache", "updated_at DESC"),
         ("idx_trading_runtime_updated", "trading_runtime_controls", "updated_at DESC"),
         ("idx_user_favorites_symbol", "user_favorites", "symbol"),
     ]
@@ -1201,7 +1292,7 @@ def upsert_position_history(
     alpha_score=None,
     alpha_suggested_position_pct=None,
 ):
-    """V3.0 记录/更新开仓信息，重启后可恢复"""
+    """V3.0 璁板綍/鏇存柊寮€浠撲俊鎭紝閲嶅惎鍚庡彲鎭㈠"""
     conn = get_conn()
     existing = conn.execute("SELECT position_id FROM position_history WHERE symbol=?", (symbol,)).fetchone()
     position_id = position_id or (existing["position_id"] if existing and "position_id" in existing.keys() else None) or new_position_id(symbol, side)
@@ -1256,7 +1347,7 @@ def upsert_position_history(
 
 
 def get_position_history(symbol):
-    """V3.0 获取开仓信息"""
+    """Fetch persisted live position entry state."""
     conn = get_conn()
     row = conn.execute("SELECT * FROM position_history WHERE symbol=?", (symbol,)).fetchone()
     conn.close()
@@ -1264,7 +1355,7 @@ def get_position_history(symbol):
 
 
 def delete_position_history(symbol):
-    """V3.0 删除开仓记录（平仓后）"""
+    """Delete persisted live position entry state after close."""
     conn = get_conn()
     conn.execute("DELETE FROM position_history WHERE symbol=?", (symbol,))
     conn.commit()
@@ -1340,7 +1431,7 @@ def fetch_position_trade_groups(limit=100):
     conn = get_conn()
     rows = conn.execute(
         """SELECT
-               COALESCE(position_id, symbol || '-' || side || '-' || entry_time) AS position_id,
+               COALESCE(NULLIF(position_id, ''), symbol || '-' || side || '-' || entry_time) AS position_id,
                symbol,
                side,
                MIN(entry_time) AS entry_time,
@@ -1367,7 +1458,7 @@ def fetch_position_trade_groups(limit=100):
            WHERE source='system'
              AND exit_time IS NOT NULL
              AND exit_time != 'N/A'
-           GROUP BY COALESCE(position_id, symbol || '-' || side || '-' || entry_time), symbol, side
+           GROUP BY COALESCE(NULLIF(position_id, ''), symbol || '-' || side || '-' || entry_time), symbol, side
            ORDER BY MAX(COALESCE(exit_time, created_at)) DESC
            LIMIT ?""",
         (limit,),
@@ -1814,84 +1905,10 @@ def fetch_price_history(symbols, hours_back=720):
     return rows
 
 
-def insert_backtest(rows):
-    conn = get_conn()
-    conn.executemany(
-        """INSERT INTO backtest_results
-           (symbol, grade, grade_score, grade_time, price_at_grade,
-            return_6h, return_12h, return_24h, return_48h,
-            max_drawdown, win_12h, win_24h)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        rows,
-    )
-    conn.execute("DELETE FROM backtest_summary_cache")
-    conn.commit()
-
-
-def fetch_backtest_summary():
-    conn = get_conn()
-    latest = conn.execute("SELECT MAX(run_time) FROM backtest_results").fetchone()[0]
-    cached_latest = conn.execute("SELECT MAX(latest_run) FROM backtest_summary_cache").fetchone()[0]
-    if latest and cached_latest != latest:
-        conn.execute("DELETE FROM backtest_summary_cache")
-        conn.execute(
-            """INSERT INTO backtest_summary_cache
-               (grade, latest_run, count, avg_return_12h, avg_return_24h, avg_return_48h,
-                win_rate_12h, win_rate_24h, avg_drawdown, avg_score, updated_at)
-               SELECT grade,
-                      ? AS latest_run,
-                      COUNT(*) as count,
-                      AVG(return_12h) as avg_return_12h,
-                      AVG(return_24h) as avg_return_24h,
-                      AVG(return_48h) as avg_return_48h,
-                      AVG(CASE WHEN win_12h = 1 THEN 1.0 ELSE 0.0 END) as win_rate_12h,
-                      AVG(CASE WHEN win_24h = 1 THEN 1.0 ELSE 0.0 END) as win_rate_24h,
-                      AVG(max_drawdown) as avg_drawdown,
-                      AVG(grade_score) as avg_score,
-                      datetime('now')
-               FROM backtest_results
-               WHERE grade IN ('S1', 'S2', 'A1', 'A2', 'B', 'C', 'D')
-               GROUP BY grade""",
-            (latest,),
-        )
-        conn.commit()
-    rows = conn.execute(
-        """SELECT grade, count, avg_return_12h, avg_return_24h, avg_return_48h,
-                  win_rate_12h, win_rate_24h, avg_drawdown, avg_score
-           FROM backtest_summary_cache
-           ORDER BY avg_score DESC"""
-    ).fetchall()
-    return rows, latest
-
-
-def fetch_recent_signals(grade="S1", limit=50):
-    conn = get_conn()
-    if not grade or str(grade).lower() in ("all", "*"):
-        rows = conn.execute(
-            """SELECT symbol, grade_time, grade, grade_score, price_at_grade,
-                      return_12h, return_24h, win_12h, win_24h
-               FROM backtest_results
-               ORDER BY grade_time DESC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT symbol, grade_time, grade, grade_score, price_at_grade,
-                      return_12h, return_24h, win_12h, win_24h
-               FROM backtest_results
-               WHERE grade = ?
-               ORDER BY grade_time DESC
-               LIMIT ?""",
-            (grade, limit),
-        ).fetchall()
-    return rows
-
-
 # ---- Positions History ----
 
 def insert_position_snapshot(rows):
-    """批量插入持仓快照"""
+    """鎵归噺鎻掑叆鎸佷粨蹇収"""
     conn = get_conn()
     conn.executemany(
         """INSERT INTO positions_history
@@ -2205,37 +2222,6 @@ def fetch_signal_outcome_summary(run_id=None):
 
 # ---- Factor Performance ----
 
-def insert_factor_performance(rows):
-    """批量插入因子归因数据"""
-    conn = get_conn()
-    conn.executemany(
-        """INSERT INTO factor_performance
-           (run_time, factor_name, bucket, samples, win_rate,
-            avg_return, avg_drawdown, ev, ic, ir)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        rows,
-    )
-    conn.commit()
-
-
-def fetch_factor_performance(limit=500):
-    conn = get_conn()
-    rows = conn.execute(
-        """SELECT * FROM factor_performance
-           ORDER BY run_time DESC LIMIT ?""",
-        (limit,),
-    ).fetchall()
-    return rows
-
-
-def fetch_latest_factor_run():
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT DISTINCT run_time FROM factor_performance ORDER BY run_time DESC LIMIT 1"
-    ).fetchone()
-    return row["run_time"] if row else None
-
-
 # ---- Orders ----
 
 def insert_order(
@@ -2350,7 +2336,7 @@ def get_trade_ids_from_fills():
 # ---- Alpha Score Training Samples ----
 
 def insert_training_samples(rows):
-    """批量写入 training_samples
+    """鎵归噺鍐欏叆 training_samples
     rows: list of (scan_id, symbol, timestamp, feature_json, composite_score, market_regime)
     """
     conn = get_conn()
@@ -2364,8 +2350,7 @@ def insert_training_samples(rows):
 
 
 def update_training_sample_returns(scan_id, updates):
-    """回测后更新 training_samples 的未来收益字段
-    updates: list of (return_6h, return_12h, return_24h, return_48h, max_drawdown, symbol, scan_id)
+    """鍥炴祴鍚庢洿鏂?training_samples 鐨勬湭鏉ユ敹鐩婂瓧娈?    updates: list of (return_6h, return_12h, return_24h, return_48h, max_drawdown, symbol, scan_id)
     """
     conn = get_conn()
     conn.executemany(
@@ -2378,9 +2363,8 @@ def update_training_sample_returns(scan_id, updates):
 
 
 def fetch_training_samples(hours_back=720, labeled_only=True):
-    """获取训练样本
-    labeled_only=True 则只返回含 return_12h 标签的样本
-    """
+    """鑾峰彇璁粌鏍锋湰
+    labeled_only=True 鍒欏彧杩斿洖鍚?return_12h 鏍囩鐨勬牱鏈?    """
     conn = get_conn()
     if labeled_only:
         rows = conn.execute(
@@ -2400,10 +2384,10 @@ def fetch_training_samples(hours_back=720, labeled_only=True):
     return rows
 
 
-# ---- Symbol Snapshots（幸存者偏差修复）----
+# ---- Symbol Snapshots锛堝垢瀛樿€呭亸宸慨澶嶏級----
 
 def insert_symbol_snapshot(rows):
-    """批量写入或更新 symbol_snapshots
+    """鎵归噺鍐欏叆鎴栨洿鏂?symbol_snapshots
     rows: list of (date, symbol, status, quote_volume, price_change_24h, active)
     """
     conn = get_conn()
@@ -2417,7 +2401,7 @@ def insert_symbol_snapshot(rows):
 
 
 def fetch_symbol_snapshots(date_str):
-    """获取某日活跃的交易对列表"""
+    """鑾峰彇鏌愭棩娲昏穬鐨勪氦鏄撳鍒楄〃"""
     conn = get_conn()
     rows = conn.execute(
         "SELECT symbol FROM symbol_snapshots WHERE date = ? AND active = 1",
@@ -2429,8 +2413,7 @@ def fetch_symbol_snapshots(date_str):
 # ---- Order Book Depth (V4.0) ----
 
 def insert_orderbook_snapshot(rows):
-    """批量写入订单簿深度快照
-    rows: list of (time, symbol, bid_depth, ask_depth, imbalance_ratio, top_bid_qty, top_ask_qty)
+    """鎵归噺鍐欏叆璁㈠崟绨挎繁搴﹀揩鐓?    rows: list of (time, symbol, bid_depth, ask_depth, imbalance_ratio, top_bid_qty, top_ask_qty)
     """
     conn = get_conn()
     conn.executemany(
@@ -2443,7 +2426,7 @@ def insert_orderbook_snapshot(rows):
 
 
 def fetch_orderbook_depth(symbol, hours=6):
-    """获取最近N小时的订单簿深度数据（用于计算大单因子）"""
+    """鑾峰彇鏈€杩慛灏忔椂鐨勮鍗曠翱娣卞害鏁版嵁锛堢敤浜庤绠楀ぇ鍗曞洜瀛愶級"""
     conn = get_conn()
     rows = conn.execute(
         """SELECT * FROM orderbook_snapshots
@@ -2455,7 +2438,7 @@ def fetch_orderbook_depth(symbol, hours=6):
 
 
 def fetch_24h_quote_volume(symbol):
-    """获取24h成交额（用于计算大单阈值）"""
+    """鑾峰彇24h鎴愪氦棰濓紙鐢ㄤ簬璁＄畻澶у崟闃堝€硷級"""
     conn = get_conn()
     row = conn.execute(
         """SELECT quote_vol FROM candles_1h
@@ -2464,3 +2447,4 @@ def fetch_24h_quote_volume(symbol):
         (symbol,),
     ).fetchone()
     return float(row["quote_vol"]) if row else 0
+
