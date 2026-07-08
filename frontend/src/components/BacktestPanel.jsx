@@ -27,7 +27,13 @@ function num(value, digits = 2) {
 
 function timeText(value) {
   if (!value) return '-';
-  return new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const text = String(value).trim();
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const normalized = hasZone ? text : `${text.replace(' ', 'T')}Z`;
+  return new Date(normalized).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+  });
 }
 
 function tone(value) {
@@ -82,12 +88,24 @@ export default function BacktestPanel() {
     }
   };
 
+  const runExitReview = async () => {
+    setRunning(true);
+    try {
+      await apiPost('/policy/exit-review/run');
+      await load();
+    } finally {
+      setRunning(false);
+    }
+  };
+
   const overview = data?.overview || {};
   const categories = data?.categories || [];
   const reviews = data?.reviews || [];
   const candidates = data?.candidates || [];
   const versions = data?.versions || [];
   const actions = data?.actions || [];
+  const exitReviews = data?.exit_reviews || [];
+  const exitSummaries = data?.exit_summaries || [];
 
   const issueRows = useMemo(() => reviews
     .filter((r) => (r.bad_block_count || 0) > 0 || (r.early_exit_count || 0) > 0 || (r.small_profit_exit_count || 0) > 0)
@@ -113,6 +131,13 @@ export default function BacktestPanel() {
         >
           {running ? '复盘中...' : '立即复盘并自动生效'}
         </button>
+        <button
+          onClick={runExitReview}
+          disabled={running}
+          style={{ background: '#22c55e', color: '#04130a', border: 0, borderRadius: 6, padding: '8px 14px', fontWeight: 700, cursor: running ? 'wait' : 'pointer' }}
+        >
+          {running ? '复盘中...' : '复盘平仓'}
+        </button>
       </div>
 
       <div className="nav" style={{ marginBottom: 16 }}>
@@ -122,6 +147,8 @@ export default function BacktestPanel() {
           ['issues', '问题诊断'],
           ['policies', '自动策略'],
           ['actions', '动作流水'],
+          ['exitFacts', '平仓事实'],
+          ['exitSummary', '平仓总结'],
         ].map(([key, label]) => (
           <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>{label}</button>
         ))}
@@ -296,6 +323,69 @@ export default function BacktestPanel() {
                 </tr>
               ))}
               {actions.length === 0 && <tr><td colSpan={10} style={{ textAlign: 'center', color: '#6b7280' }}>暂无动作流水</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tab === 'exitFacts' && (
+        <div className="trading-section">
+          <h3>平仓事实</h3>
+          <table className="trade-table">
+            <thead>
+              <tr>
+                <th>时间</th><th>币种</th><th>策略</th><th>分类</th><th>平仓原因</th><th>盈亏</th><th>持仓</th><th>后续最大浮盈</th><th>后续最大回撤</th><th>标签</th><th>事实结论</th>
+              </tr>
+            </thead>
+            <tbody>
+              {exitReviews.map((r) => (
+                <tr key={r.position_trade_id || r.id}>
+                  <td style={{ whiteSpace: 'nowrap' }}>{timeText(r.exit_time)}</td>
+                  <td style={{ fontWeight: 700 }}>{r.symbol}</td>
+                  <td>{r.strategy_source || '-'}</td>
+                  <td>{r.category || '-'}</td>
+                  <td style={{ maxWidth: 260, color: '#cbd5e1' }}>{r.exit_reason || '-'}</td>
+                  <td style={tone(r.net_pnl)}>{num(r.net_pnl)}U</td>
+                  <td>{r.holding_minutes != null ? `${num(r.holding_minutes, 0)}m` : '-'}</td>
+                  <td style={tone(r.max_favorable_return)}>{pct(r.max_favorable_return)}</td>
+                  <td style={tone(r.max_adverse_return)}>{pct(r.max_adverse_return)}</td>
+                  <td>{r.review_label || '-'}</td>
+                  <td style={{ maxWidth: 420, color: '#9ca3af' }}>{r.review_summary || '-'}</td>
+                </tr>
+              ))}
+              {exitReviews.length === 0 && <tr><td colSpan={11} style={{ textAlign: 'center', color: '#6b7280' }}>暂无平仓事实复盘</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tab === 'exitSummary' && (
+        <div className="trading-section">
+          <h3>平仓总结</h3>
+          <table className="trade-table">
+            <thead>
+              <tr>
+                <th>策略</th><th>分类</th><th>平仓原因</th><th>样本</th><th>总盈亏</th><th>平均后续浮盈</th><th>有效</th><th>过早</th><th>噪音小亏</th><th>小盈过早</th><th>结论</th><th>总结</th>
+              </tr>
+            </thead>
+            <tbody>
+              {exitSummaries.map((r) => (
+                <tr key={r.summary_id || `${r.strategy_source}-${r.exit_reason}`}>
+                  <td>{r.strategy_source || '-'}</td>
+                  <td>{r.category || '-'}</td>
+                  <td style={{ maxWidth: 280, color: '#cbd5e1' }}>{r.exit_reason || '-'}</td>
+                  <td>{r.sample_size || 0}</td>
+                  <td style={tone(r.total_pnl)}>{num(r.total_pnl)}U</td>
+                  <td style={tone(r.avg_mfe_after_exit)}>{pct(r.avg_mfe_after_exit)}</td>
+                  <td>{r.good_exit_count || 0}</td>
+                  <td>{r.early_exit_count || 0}</td>
+                  <td>{r.noise_loss_exit_count || 0}</td>
+                  <td>{r.small_profit_exit_count || 0}</td>
+                  <td style={{ color: r.action_type === 'improve' ? '#ef4444' : r.action_type === 'keep' ? '#22c55e' : '#fbbf24', fontWeight: 700 }}>{r.conclusion || r.action_type}</td>
+                  <td style={{ minWidth: 360, color: '#9ca3af' }}>{r.summary_text || '-'}</td>
+                </tr>
+              ))}
+              {exitSummaries.length === 0 && <tr><td colSpan={12} style={{ textAlign: 'center', color: '#6b7280' }}>暂无平仓总结</td></tr>}
             </tbody>
           </table>
         </div>

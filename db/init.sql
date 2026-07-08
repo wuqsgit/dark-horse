@@ -1,11 +1,6 @@
--- Dark Horse SQLite schema
--- Generated from alphadog.db; schema only, no data.
--- Generated at 2026-07-08T00:13:37Z
+-- Auto-generated SQLite schema snapshot for DarkHorse.
+-- Generated from shared.db.init_db()/sqlite_master.
 
-PRAGMA foreign_keys=OFF;
-BEGIN TRANSACTION;
-
--- TABLES
 CREATE TABLE alpha_candles_15m (
             time TEXT, alpha_symbol TEXT,
             open REAL, high REAL, low REAL, close REAL,
@@ -231,6 +226,48 @@ CREATE TABLE decision_outcomes (
             updated_at TEXT DEFAULT (datetime('now'))
         , churn_trade INTEGER DEFAULT 0, probe_failed INTEGER DEFAULT 0, weak_after_entry INTEGER DEFAULT 0, holding_minutes REAL);
 
+CREATE TABLE exchange_income_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            income_id TEXT UNIQUE,
+            symbol TEXT,
+            income_type TEXT NOT NULL,
+            income REAL DEFAULT 0,
+            asset TEXT DEFAULT 'USDT',
+            income_time TEXT,
+            trade_id TEXT,
+            order_id TEXT,
+            position_side TEXT,
+            raw_json TEXT,
+            source TEXT DEFAULT 'binance_income',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+CREATE TABLE exit_review_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary_id TEXT UNIQUE,
+            run_time TEXT,
+            window_days INTEGER,
+            category TEXT,
+            strategy_source TEXT,
+            exit_reason TEXT,
+            sample_size INTEGER DEFAULT 0,
+            win_count INTEGER DEFAULT 0,
+            loss_count INTEGER DEFAULT 0,
+            avg_pnl REAL DEFAULT 0,
+            total_pnl REAL DEFAULT 0,
+            avg_mfe_after_exit REAL DEFAULT 0,
+            avg_mae_after_exit REAL DEFAULT 0,
+            good_exit_count INTEGER DEFAULT 0,
+            early_exit_count INTEGER DEFAULT 0,
+            noise_loss_exit_count INTEGER DEFAULT 0,
+            small_profit_exit_count INTEGER DEFAULT 0,
+            late_exit_count INTEGER DEFAULT 0,
+            conclusion TEXT,
+            action_type TEXT,
+            summary_text TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
 CREATE TABLE factor_effectiveness (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_time TEXT,
@@ -394,7 +431,7 @@ CREATE TABLE position_history (
     entry_score REAL, entry_time TEXT,
     tp3_price REAL, atr_value REAL,
     update_time TEXT DEFAULT (datetime('now'))
-, tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, highest_price REAL, last_exit_reason TEXT, position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, roll_layer INTEGER DEFAULT 0, last_roll_time TEXT, roll_parent_trade_id TEXT, protected_profit REAL DEFAULT 0, max_floating_pnl REAL DEFAULT 0, roll_enabled INTEGER DEFAULT 0, roll_block_reason TEXT);
+, tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, highest_price REAL, last_exit_reason TEXT, position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, roll_layer INTEGER DEFAULT 0, last_roll_time TEXT, roll_parent_trade_id TEXT, protected_profit REAL DEFAULT 0, max_floating_pnl REAL DEFAULT 0, roll_enabled INTEGER DEFAULT 0, roll_block_reason TEXT, lowest_price REAL, stop_model TEXT, initial_stop_loss REAL, stop_pct REAL, current_stop_loss REAL, trailing_stop_price REAL, trailing_enabled INTEGER DEFAULT 0, trailing_atr_multiplier REAL, r_multiple REAL DEFAULT 0);
 
 CREATE TABLE position_roll_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -409,6 +446,35 @@ CREATE TABLE position_roll_events (
             risk_before_json TEXT,
             risk_after_json TEXT,
             created_at TEXT DEFAULT (datetime('now'))
+        );
+
+CREATE TABLE position_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_trade_id TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            side TEXT,
+            strategy_source TEXT DEFAULT 'unknown',
+            signal_source TEXT,
+            alpha_symbol TEXT,
+            entry_time TEXT,
+            exit_time TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            quantity REAL,
+            realized_pnl REAL DEFAULT 0,
+            commission REAL DEFAULT 0,
+            funding_fee REAL DEFAULT 0,
+            adjustment REAL DEFAULT 0,
+            net_pnl REAL DEFAULT 0,
+            pnl_pct REAL,
+            income_count INTEGER DEFAULT 0,
+            entry_reason TEXT,
+            exit_reason TEXT,
+            source TEXT DEFAULT 'reconstructed',
+            reconcile_status TEXT DEFAULT 'ok',
+            raw_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
         );
 
 CREATE TABLE positions_history (
@@ -550,6 +616,36 @@ CREATE TABLE trade_cooldown (
             updated_at TEXT
         , created_at TEXT);
 
+CREATE TABLE trade_exit_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_trade_id TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            strategy_source TEXT,
+            alpha_symbol TEXT,
+            side TEXT,
+            category TEXT,
+            entry_time TEXT,
+            exit_time TEXT,
+            exit_reason TEXT,
+            net_pnl REAL DEFAULT 0,
+            pnl_pct REAL,
+            holding_minutes REAL,
+            return_1h REAL,
+            return_4h REAL,
+            return_12h REAL,
+            return_24h REAL,
+            return_72h REAL,
+            max_favorable_return REAL,
+            max_adverse_return REAL,
+            max_favorable_time TEXT,
+            max_adverse_time TEXT,
+            review_label TEXT,
+            review_summary TEXT,
+            evidence_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
 CREATE TABLE trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -623,10 +719,6 @@ CREATE TABLE users (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
--- VIEWS
--- No views.
-
--- INDEXES
 CREATE INDEX idx_alpha_c15m_sym_time ON alpha_candles_15m(alpha_symbol, time DESC);
 
 CREATE INDEX idx_alpha_c15m_time_symbol ON alpha_candles_15m(time DESC, alpha_symbol);
@@ -743,6 +835,10 @@ CREATE INDEX idx_decision_outcomes_flags ON decision_outcomes(missed_big_move, e
 
 CREATE INDEX idx_decision_outcomes_symbol ON decision_outcomes(symbol, signal_time DESC);
 
+CREATE INDEX idx_exit_review_summaries_reason ON exit_review_summaries(exit_reason, run_time DESC);
+
+CREATE INDEX idx_exit_review_summaries_run ON exit_review_summaries(run_time DESC);
+
 CREATE INDEX idx_factor_effectiveness_bucket ON factor_effectiveness(bucket, run_time DESC);
 
 CREATE INDEX idx_factor_effectiveness_factor ON factor_effectiveness(factor_name, layer, profile);
@@ -762,6 +858,12 @@ CREATE UNIQUE INDEX idx_fills_trade_id ON fills(trade_id);
 CREATE INDEX idx_fut_sym ON futures_data(symbol, time);
 
 CREATE INDEX idx_fut_time_symbol ON futures_data(time DESC, symbol);
+
+CREATE INDEX idx_income_ledger_symbol ON exchange_income_ledger(symbol, income_time DESC);
+
+CREATE INDEX idx_income_ledger_time ON exchange_income_ledger(income_time DESC);
+
+CREATE INDEX idx_income_ledger_type ON exchange_income_ledger(income_type, income_time DESC);
 
 CREATE INDEX idx_ob_symbol ON orderbook_snapshots(symbol);
 
@@ -818,6 +920,12 @@ CREATE INDEX idx_position_roll_events_created ON position_roll_events(created_at
 CREATE INDEX idx_position_roll_events_position ON position_roll_events(position_id, created_at DESC);
 
 CREATE INDEX idx_position_roll_events_symbol ON position_roll_events(symbol, created_at DESC);
+
+CREATE INDEX idx_position_trades_exit ON position_trades(exit_time DESC);
+
+CREATE INDEX idx_position_trades_source ON position_trades(source, exit_time DESC);
+
+CREATE INDEX idx_position_trades_symbol ON position_trades(symbol, exit_time DESC);
 
 CREATE INDEX idx_positions_symbol ON positions_history(symbol);
 
@@ -883,6 +991,12 @@ CREATE INDEX idx_symbols_active_last_seen ON symbols(is_active, last_seen DESC);
 
 CREATE INDEX idx_trade_cooldown_until_symbol ON trade_cooldown(cooldown_until, symbol);
 
+CREATE INDEX idx_trade_exit_reviews_exit ON trade_exit_reviews(exit_time DESC);
+
+CREATE INDEX idx_trade_exit_reviews_label ON trade_exit_reviews(review_label, exit_time DESC);
+
+CREATE INDEX idx_trade_exit_reviews_reason ON trade_exit_reviews(exit_reason, exit_time DESC);
+
 CREATE INDEX idx_trades_alpha_symbol ON trades(alpha_symbol, created_at DESC);
 
 CREATE INDEX idx_trades_created ON trades(created_at DESC);
@@ -907,7 +1021,3 @@ CREATE INDEX idx_train_sym_time ON training_samples(symbol, timestamp);
 
 CREATE INDEX idx_user_favorites_symbol ON user_favorites(symbol);
 
--- TRIGGERS
--- No triggers.
-
-COMMIT;

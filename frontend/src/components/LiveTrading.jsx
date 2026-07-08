@@ -12,6 +12,17 @@ function fmt(v, digits = 2) {
   return Number.isFinite(n) ? n.toFixed(digits) : '-';
 }
 
+function timeText(value) {
+  if (!value) return '-';
+  const text = String(value).trim();
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const normalized = hasZone ? text : `${text.replace(' ', 'T')}Z`;
+  return new Date(normalized).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+  });
+}
+
 function sourceText(v) {
   return v === 'alpha' ? 'Alpha 策略' : '普通策略';
 }
@@ -65,7 +76,7 @@ function DecisionPanel({ panel }) {
   const latestDecision = recent[0];
   const lastExecutionTime = panel?.last_execution_time || panel?.latest_time;
   const lastExecutionText = lastExecutionTime
-    ? new Date(lastExecutionTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+    ? timeText(lastExecutionTime)
     : '暂无记录';
 
   return (
@@ -310,6 +321,9 @@ export default function LiveTrading() {
                     <div><b>系统管理</b> 入场评分 {p.entry_score ? fmt(p.entry_score, 1) : '-'}</div>
                     <div>TP1：{p.tp1_hit ? '已减过仓' : '未触发'} · TP2：{p.tp2_hit ? '已减过仓' : '未触发'}</div>
                     <div>最高跟踪价：{p.highest_price ? `$${fmt(p.highest_price, 4)}` : '-'}</div>
+                    <div>止损模型：{p.stop_model || '-'} · 初始止损 {p.stop_pct ? `${fmt(Number(p.stop_pct) * 100, 2)}%` : '-'}</div>
+                    <div>当前R：{p.r_multiple != null ? `${fmt(p.r_multiple, 2)}R` : '-'} · 保护止损：{p.current_stop_loss ? `$${fmt(p.current_stop_loss, 4)}` : '-'}</div>
+                    <div>移动止损：{p.trailing_enabled ? '已启用' : '未启用'} · {p.trailing_stop_price ? `$${fmt(p.trailing_stop_price, 4)}` : '-'}</div>
                     <div>上次系统动作：{p.last_exit_plain || p.last_exit_reason || '暂无'}</div>
                     <div>滚仓层数：{p.roll_layer || 0}/2 · 保护利润：${fmt(p.protected_profit || 0)}</div>
                     <div>最高浮盈：${fmt(p.max_floating_pnl || 0)} · {p.roll_enabled ? '允许滚仓观察' : '暂不滚仓'}</div>
@@ -357,7 +371,7 @@ export default function LiveTrading() {
                     <td style={pnlColor(t.pnl)}>{Number(t.pnl || 0) >= 0 ? '+' : ''}${fmt(t.pnl)}</td>
                     <td style={pnlColor(t.pnl_pct)}>{t.pnl_pct != null ? `${fmt(t.pnl_pct)}%` : '-'}</td>
                     <td>{t.grade_at_entry || '-'} {t.score_at_entry != null ? fmt(t.score_at_entry, 1) : ''}</td>
-                    <td>{t.exit_time || t.entry_time || '-'}</td>
+                    <td>{timeText(t.exit_time || t.entry_time)}</td>
                   </tr>
                 ))}
               </tbody>

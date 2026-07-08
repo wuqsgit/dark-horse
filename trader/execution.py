@@ -175,10 +175,10 @@ def _recent_momentum_exit_count(symbol: str, class_key: str, limit: int = 2) -> 
         return 0
 
 
-def _bluechip_tp_levels(entry_price: float, side: str) -> dict:
+def _bluechip_tp_levels(entry_price: float, side: str, stop_pct: float | None = None) -> dict:
     cfg = _bluechip_cfg()
-    tp1_pct = float(cfg.get("tp1_target_pct", 0.035))
-    tp2_pct = float(cfg.get("tp2_target_pct", 0.070))
+    tp1_pct = float(stop_pct or cfg.get("tp1_target_pct", 0.035))
+    tp2_pct = tp1_pct * 2
     if side == "LONG":
         tp1 = entry_price * (1 + tp1_pct)
         tp2 = entry_price * (1 + tp2_pct)
@@ -243,6 +243,104 @@ def _runtime_controls():
     except Exception as e:
         logger.warning(f"trading runtime controls unavailable: {e}")
         return {"normal_trading_enabled": True, "alpha_trading_enabled": False}
+
+
+def _write_alpha_post_close_cooldown(symbol, pnl=0.0, reason="", is_stop=False, prefix="alpha close"):
+    """Prevent immediate alpha re-entry after a position has just exited."""
+    cfg = _alpha_cfg()
+    pnl = float(pnl or 0)
+    reason_text = str(reason or "")
+    stop_like = bool(is_stop) or "stop" in reason_text.lower() or "止损" in reason_text
+    if stop_like:
+        cooldown_type = "stop"
+        minutes = int(cfg.get("stop_cooldown_minutes", 180))
+        loss_count = 1
+    elif pnl < 0:
+        cooldown_type = "loss"
+        minutes = int(cfg.get("loss_cooldown_minutes", 120))
+        loss_count = 1
+    else:
+        cooldown_type = "post_close"
+        minutes = int(cfg.get("post_close_cooldown_minutes", 45))
+        loss_count = 0
+    try:
+        from shared.db import set_alpha_cooldown
+
+        set_alpha_cooldown(
+            symbol,
+            cooldown_type,
+            f"{prefix}: pnl={pnl:.2f}; {reason_text}"[:240],
+            minutes,
+            loss_count=loss_count,
+        )
+        logger.info("    Alpha cooldown: %s %s %sm", symbol, cooldown_type, minutes)
+    except Exception as e:
+        logger.warning(f"    alpha cooldown write failed: {e}")
+
+
+def _price_return_pct(side, entry_price, mark_price):
+    entry = float(entry_price or 0)
+    mark = float(mark_price or 0)
+    if entry <= 0 or mark <= 0:
+        return 0.0
+    raw = (mark - entry) / entry
+    return -raw if str(side or "").upper() == "SHORT" else raw
+
+
+def _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=None, lowest_price=None):
+    stop_pct = float((hist or {}).get("stop_pct") or 0)
+    entry = float(entry_price or 0)
+    if stop_pct <= 0 and entry > 0:
+        initial_stop = float((hist or {}).get("initial_stop_loss") or 0)
+        if initial_stop > 0:
+            stop_pct = abs(entry - initial_stop) / entry
+    if stop_pct <= 0:
+        stop_pct = 0.10 if (hist or {}).get("strategy_source") == "alpha" else 0.12
+    if stop_pct <= 0:
+        return {"r_multiple": 0.0, "stop_pct": 0.0, "trailing_enabled": False}
+    side_u = str(side or "LONG").upper()
+    mark = float(mark_price or 0)
+    price_ret = _price_return_pct(side_u, entry, mark)
+    r_multiple = price_ret / stop_pct if stop_pct > 0 else 0.0
+    atr_v = float(atr or (entry * stop_pct / 2 if entry else 0))
+    trail_mult = float((hist or {}).get("trailing_atr_multiplier") or (2.0 if (hist or {}).get("strategy_source") == "alpha" else 1.5))
+    current_stop = float((hist or {}).get("current_stop_loss") or (hist or {}).get("initial_stop_loss") or 0)
+    trailing_price = None
+    trailing_enabled = False
+
+    if entry <= 0:
+        return {"r_multiple": r_multiple, "stop_pct": stop_pct, "trailing_enabled": False}
+
+    if side_u == "LONG":
+        if r_multiple >= 1:
+            current_stop = max(current_stop or 0, entry * 1.002)
+        if r_multiple >= 2:
+            current_stop = max(current_stop or 0, entry * (1 + stop_pct))
+            high = float(highest_price or mark or entry)
+            trailing_price = high - atr_v * trail_mult
+            current_stop = max(current_stop or 0, trailing_price)
+            trailing_enabled = True
+        stop_triggered = current_stop > 0 and mark <= current_stop and r_multiple > 0
+    else:
+        if r_multiple >= 1:
+            current_stop = min(current_stop or entry * 10, entry * 0.998)
+        if r_multiple >= 2:
+            current_stop = min(current_stop or entry * 10, entry * (1 - stop_pct))
+            low = float(lowest_price or mark or entry)
+            trailing_price = low + atr_v * trail_mult
+            current_stop = min(current_stop or entry * 10, trailing_price)
+            trailing_enabled = True
+        stop_triggered = current_stop > 0 and mark >= current_stop and r_multiple > 0
+
+    return {
+        "r_multiple": r_multiple,
+        "stop_pct": stop_pct,
+        "current_stop_loss": current_stop or None,
+        "trailing_stop_price": trailing_price,
+        "trailing_enabled": trailing_enabled,
+        "stop_triggered": stop_triggered,
+        "trail_mult": trail_mult,
+    }
 
 
 def _json_or_empty(value):
@@ -413,14 +511,21 @@ class ExecutionEngine:
             sym = p["symbol"]
             hist = get_position_history(sym) or {}
             stored_high = float(hist.get("highest_price") or 0)
+            stored_low = float(hist.get("lowest_price") or 0)
+            mark_price = float(p.get("mark_price") or 0)
             current_high = max(stored_high, float(p.get("mark_price") or 0))
+            current_low = min([v for v in (stored_low, mark_price) if v > 0], default=mark_price)
             if sym in self._pos_tracker:
                 current_high = max(current_high, float(self._pos_tracker[sym].get("highest_price") or 0))
+                tracked_low = float(self._pos_tracker[sym].get("lowest_price") or 0)
+                if tracked_low > 0:
+                    current_low = min(current_low, tracked_low)
             self._pos_tracker[sym] = {
                 "highest_price": current_high,
+                "lowest_price": current_low,
                 "entry_price": p["entry_price"],
             }
-            update_position_management(sym, highest_price=current_high, quantity=p.get("quantity"))
+            update_position_management(sym, highest_price=current_high, lowest_price=current_low, quantity=p.get("quantity"))
 
     def _record_decision(self, row_or_symbol, run_id=None, **kwargs):
         try:
@@ -481,9 +586,9 @@ class ExecutionEngine:
         ctx = self._latest_alpha_position_context(sym, hist)
         entry_score = float(hist.get("alpha_score") or hist.get("entry_score") or 0)
 
-        def add(reason, is_stop=False, score=None):
+        def add(reason, is_stop=False, score=None, action="close", close_pct=None):
             item = {
-                "action": "close",
+                "action": action,
                 "symbol": sym,
                 "side": close_side,
                 "reason": reason,
@@ -497,12 +602,41 @@ class ExecutionEngine:
                 "alpha_score": entry_score,
                 "alpha_suggested_position_pct": hist.get("alpha_suggested_position_pct"),
             }
+            if close_pct is not None:
+                item["close_pct"] = close_pct
             if is_stop:
                 item["is_stop"] = True
             return item
 
-        if pnl_pct <= -float(self.cfg.get("hard_stop_pct", 0.05)) * 100:
-            return add(f"alpha_hard_stop pnl={pnl_pct:.1f}%", is_stop=True)
+        alpha_cfg = _alpha_cfg() or {}
+        alpha_hard_stop_pct = float(alpha_cfg.get("position_hard_stop_pct", self.cfg.get("hard_stop_pct", 0.05))) * 100
+        price_ret_pct = _price_return_pct(side, pos.get("entry_price"), mark_price) * 100
+        if price_ret_pct <= -alpha_hard_stop_pct:
+            return add(f"alpha_hard_stop price_ret={price_ret_pct:.1f}% pnl={pnl_pct:.1f}%", is_stop=True)
+        r_state = _position_r_state(side, pos.get("entry_price"), mark_price, hist, atr, highest_price=highest_price)
+        try:
+            from shared.db import update_position_management
+
+            update_position_management(
+                sym,
+                stop_model=hist.get("stop_model") or "atr_clamped_legacy_default",
+                stop_pct=r_state.get("stop_pct"),
+                current_stop_loss=r_state.get("current_stop_loss"),
+                trailing_stop_price=r_state.get("trailing_stop_price"),
+                trailing_enabled=1 if r_state.get("trailing_enabled") else 0,
+                r_multiple=round(float(r_state.get("r_multiple") or 0), 3),
+            )
+        except Exception:
+            pass
+        if r_state.get("stop_triggered"):
+            return add(
+                f"alpha_trailing_stop r={float(r_state.get('r_multiple') or 0):.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}",
+                score=entry_score,
+            )
+        if float(r_state.get("r_multiple") or 0) >= 2 and not int(hist.get("tp2_hit") or 0):
+            return add("alpha_TP2 r>=2", score=entry_score, action="partial_close", close_pct=0.25)
+        if float(r_state.get("r_multiple") or 0) >= 1 and not int(hist.get("tp1_hit") or 0):
+            return add("alpha_TP1 r>=1", score=entry_score, action="partial_close", close_pct=0.20)
 
         hold_reason = None
         if not ctx:
@@ -550,38 +684,50 @@ class ExecutionEngine:
         trend_score = float(metrics.get("trend_score") or metrics.get("trend_continuation_score") or 0)
         trend_state = str(metrics.get("trend_state") or "").lower()
         volume_regime = str(metrics.get("volume_regime") or "").lower()
-        alpha_cfg = _alpha_cfg() or {}
         max_spread_pct = float(alpha_cfg.get("max_spread_pct", 0.0012)) * 100
 
         weak_states = {"failed_breakout", "distribution", "dumping", "breakdown", "distribution_risk_long_only", "breakdown_volume_long_only"}
-        if vp_state in weak_states and pnl_pct <= 2:
-            return add(f"alpha_volume_price_failed state={vp_state} pnl={pnl_pct:.1f}%", score=current_score)
-        if trend_score and trend_score < float(alpha_cfg.get("position_min_trend_score", 50)) and pnl_pct <= 2:
-            return add(f"alpha_trend_score_fade trend={trend_score:.1f} state={trend_state or '-'} pnl={pnl_pct:.1f}%", score=current_score)
-        if volume_regime in {"suspicious", "overheated", "extreme"} and pnl_pct <= 2:
-            return add(f"alpha_volume_regime_bad regime={volume_regime} pnl={pnl_pct:.1f}%", score=current_score)
+        profit_protect_pct = float(alpha_cfg.get("position_soft_exit_profit_pct", 2.0))
+        profit_protect_close_pct = float(alpha_cfg.get("position_profit_protect_close_pct", 0.25))
+        soft_hold_reason = None
+        if vp_state in weak_states:
+            if pnl_pct >= profit_protect_pct:
+                return add(f"alpha_volume_price_profit_protect state={vp_state} pnl={pnl_pct:.1f}%", score=current_score, action="partial_close", close_pct=profit_protect_close_pct)
+            soft_hold_reason = f"alpha soft hold: volume_price={vp_state} pnl={pnl_pct:.1f}%"
+        if trend_score and trend_score < float(alpha_cfg.get("position_min_trend_score", 50)):
+            if pnl_pct >= profit_protect_pct:
+                return add(f"alpha_trend_profit_protect trend={trend_score:.1f} state={trend_state or '-'} pnl={pnl_pct:.1f}%", score=current_score, action="partial_close", close_pct=profit_protect_close_pct)
+            soft_hold_reason = f"alpha soft hold: trend_score_fade trend={trend_score:.1f} pnl={pnl_pct:.1f}%"
+        if volume_regime in {"suspicious", "overheated", "extreme"}:
+            if pnl_pct >= profit_protect_pct:
+                return add(f"alpha_volume_regime_profit_protect regime={volume_regime} pnl={pnl_pct:.1f}%", score=current_score, action="partial_close", close_pct=profit_protect_close_pct)
+            soft_hold_reason = f"alpha soft hold: volume_regime={volume_regime} pnl={pnl_pct:.1f}%"
         if hist.get("alpha_entry_level") == "probe" and age_h is not None:
             probe_timeout_h = float(alpha_cfg.get("position_probe_timeout_hours", 1.0))
             probe_min_progress = float(alpha_cfg.get("position_probe_min_progress_pct", 3.0))
             if age_h >= probe_timeout_h and pnl_pct < probe_min_progress:
-                return add(f"alpha_probe_timeout age={age_h:.1f}h pnl={pnl_pct:.1f}% trend={trend_score:.1f}", score=current_score)
+                soft_hold_reason = f"alpha soft hold: probe_timeout age={age_h:.1f}h pnl={pnl_pct:.1f}% trend={trend_score:.1f}"
         if vp_action in {"observe", "cooldown"} and pnl_pct <= 0 and (ret_15m < 0 or ret_1h < 0):
-            return add(f"alpha_volume_price_weak action={vp_action} state={vp_state} pnl={pnl_pct:.1f}%", score=current_score)
+            soft_hold_reason = f"alpha soft hold: volume_price_weak action={vp_action} state={vp_state} pnl={pnl_pct:.1f}%"
         if spread_pct > max_spread_pct and pnl_pct <= 0:
-            return add(f"alpha_spread_widened spread={spread_pct:.3f}% pnl={pnl_pct:.1f}%", score=current_score)
-        if side == "LONG" and ret_15m < 0 and ret_1h < 0 and ret_6h < 0 and pnl_pct <= 1:
-            return add(f"alpha_long_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}%", score=current_score)
-        if side == "SHORT" and ret_15m > 0 and ret_1h > 0 and ret_6h > 0 and pnl_pct <= 1:
-            return add(f"alpha_short_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}%", score=current_score)
+            soft_hold_reason = f"alpha soft hold: spread_widened spread={spread_pct:.3f}% pnl={pnl_pct:.1f}%"
+        if side == "LONG" and ret_15m < 0 and ret_1h < 0 and ret_6h < 0:
+            if pnl_pct >= profit_protect_pct:
+                return add(f"alpha_long_momentum_profit_protect ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}%", score=current_score, action="partial_close", close_pct=profit_protect_close_pct)
+            soft_hold_reason = f"alpha soft hold: long_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}% pnl={pnl_pct:.1f}%"
+        if side == "SHORT" and ret_15m > 0 and ret_1h > 0 and ret_6h > 0:
+            if pnl_pct >= profit_protect_pct:
+                return add(f"alpha_short_momentum_profit_protect ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}%", score=current_score, action="partial_close", close_pct=profit_protect_close_pct)
+            soft_hold_reason = f"alpha soft hold: short_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}% pnl={pnl_pct:.1f}%"
 
         time_stop_h = float(self.cfg.get("time_stop_hours", 12))
         min_ret = float(self.cfg.get("time_stop_min_return", 0.02)) * 100
         if age_h is not None and age_h >= time_stop_h and pnl_pct < min_ret and vp_action not in {"normal_review", "normal_review_probe"}:
-            return add(f"alpha_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}% state={vp_state}", score=current_score)
+            soft_hold_reason = f"alpha soft hold: time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}% state={vp_state}"
         if pnl_pct >= float(self.cfg.get("tp2_target_pct", 0.10)) * 100 and calc_trailing_stop(mark_price, highest_price, atr, self.cfg.get("trailing_stop_atr_multiplier", 1.5)):
             return add(f"alpha_trailing_stop high={highest_price:.4f} now={mark_price:.4f}", score=current_score)
 
-        hold_reason = f"alpha hold volume_price={vp_state or '-'} action={vp_action or '-'} score={current_score:.1f}"
+        hold_reason = soft_hold_reason or f"alpha hold volume_price={vp_state or '-'} action={vp_action or '-'} score={current_score:.1f}"
         if reasons:
             hold_reason += f" reason={'; '.join(map(str, reasons[:2]))}"
         self._record_decision(
@@ -678,7 +824,7 @@ class ExecutionEngine:
 
         if class_key == "core_bluechip":
             if pnl_pct <= 0 and trend_broken:
-                return action("close", f"{reason_base} bluechip_loss_trend_broken")
+                return None
             if 0 < pnl_pct <= small_profit:
                 if trend_broken and (oi_weak or score_fade):
                     return action("partial_close", f"{reason_base} bluechip_strong_warning", strong_partial_pct)
@@ -688,7 +834,7 @@ class ExecutionEngine:
 
         if class_key == "large_cap":
             if pnl_pct <= 0 and trend_broken:
-                return action("close", f"{reason_base} large_cap_loss_trend_broken")
+                return None
             if 0 < pnl_pct <= small_profit and trend_broken:
                 pct = strong_partial_pct if (oi_weak or score_fade) else partial_pct
                 return action("partial_close", f"{reason_base} large_cap_trend_warning", pct)
@@ -696,23 +842,25 @@ class ExecutionEngine:
 
         if class_key == "fundamental":
             if pnl_pct <= 0:
-                return action("close", f"{reason_base} fundamental_loss")
+                return None
             if 0 < pnl_pct <= small_profit:
                 rounds = _recent_momentum_exit_count(sym, class_key, limit=3)
                 if rounds >= int(policy.get("confirm_rounds_for_full_close", 2)) - 1:
-                    return action("close", f"{reason_base} fundamental_confirmed_weakness")
+                    return action("partial_close", f"{reason_base} fundamental_confirmed_weakness", strong_partial_pct)
                 return action("partial_close", f"{reason_base} fundamental_first_warning", partial_pct)
             if trend_broken or score_fade:
                 return action("partial_close", f"{reason_base} fundamental_profit_protect", partial_pct)
             return None
 
         if class_key in {"narrative", "meme"}:
-            if pnl_pct <= small_profit and policy.get("allow_full_close_on_small_profit", True):
-                return action("close", f"{reason_base} {class_key}_fast_exit")
+            if pnl_pct <= 0:
+                return None
             return action("partial_close", f"{reason_base} {class_key}_profit_protect", partial_pct)
 
         if pnl_pct <= small_profit:
-            return action("close", f"{reason_base} default_exit")
+            if pnl_pct <= 0:
+                return None
+            return action("partial_close", f"{reason_base} default_exit", partial_pct)
         return action("partial_close", f"{reason_base} default_profit_protect", partial_pct)
 
     def _build_position_actions(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
@@ -755,7 +903,26 @@ class ExecutionEngine:
             robot_signature = bool(depth.get("robot_signature"))
             tracker = self._pos_tracker.get(sym, {})
             highest_price = float(tracker.get("highest_price") or mark_price)
+            lowest_price = float(tracker.get("lowest_price") or mark_price)
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
+            soft_exit_profit_pct = float(self.cfg.get("soft_exit_profit_pct", 2.0))
+            soft_exit_loss_pct = -float(self.cfg.get("soft_exit_max_loss_pct", 3.5))
+            price_ret_pct = _price_return_pct(side, entry_price, mark_price) * 100
+            r_state = _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=highest_price, lowest_price=lowest_price)
+            try:
+                from shared.db import update_position_management
+
+                update_position_management(
+                    sym,
+                    stop_model=hist.get("stop_model") or "atr_clamped_legacy_default",
+                    stop_pct=r_state.get("stop_pct"),
+                    current_stop_loss=r_state.get("current_stop_loss"),
+                    trailing_stop_price=r_state.get("trailing_stop_price"),
+                    trailing_enabled=1 if r_state.get("trailing_enabled") else 0,
+                    r_multiple=round(float(r_state.get("r_multiple") or 0), 3),
+                )
+            except Exception:
+                pass
 
             def add(action, reason, close_pct=None, is_stop=False):
                 item = {
@@ -796,65 +963,98 @@ class ExecutionEngine:
                 min_entry_alpha = float(bluechip_cfg.get("exit_min_entry_alpha", 35))
                 ema_ratio = float(tech.get("ema20_50_ratio") or 1.0)
                 ema_slope = float(tech.get("ema20_slope") or 0)
-                if pnl_pct <= -bluechip_stop:
-                    add("close", f"bluechip_hard_stop pnl={pnl_pct:.1f}%", is_stop=True)
+                if price_ret_pct <= -bluechip_stop:
+                    add("close", f"bluechip_hard_stop price_ret={price_ret_pct:.1f}% pnl={pnl_pct:.1f}%", is_stop=True)
+                    continue
+                if r_state.get("stop_triggered"):
+                    add("close", f"bluechip_trailing_stop r={float(r_state.get('r_multiple') or 0):.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}")
+                    continue
+                if float(r_state.get("r_multiple") or 0) >= 2 and not int(hist.get("tp2_hit") or 0):
+                    add("partial_close", "bluechip_TP2 r>=2", float(bluechip_cfg.get("tp2_pct", 0.25)))
+                    continue
+                if float(r_state.get("r_multiple") or 0) >= 1 and not int(hist.get("tp1_hit") or 0):
+                    add("partial_close", "bluechip_TP1 r>=1", float(bluechip_cfg.get("tp1_pct", 0.25)))
                     continue
                 if age_h is not None and age_h >= float(bluechip_cfg.get("time_stop_hours", 6)):
                     if pnl_pct < float(bluechip_cfg.get("time_stop_min_return", 0.008)) * 100:
-                        add("close", f"bluechip_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
+                        self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_bluechip_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
                         continue
                 if hold_alpha < min_entry_alpha and pnl_pct <= 1:
-                    add("close", f"bluechip_entry_alpha_fade {hold_alpha:.1f}")
+                    self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_bluechip_entry_alpha_fade {hold_alpha:.1f} pnl={pnl_pct:.1f}%")
                     continue
                 if side == "LONG" and (ema_ratio < 1.0 or ema_slope < 0) and pnl_pct <= 2:
                     if pnl_pct <= 0:
-                        add("close", f"bluechip_trend_invalid ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f}")
+                        self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_bluechip_trend_invalid ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f} pnl={pnl_pct:.1f}%")
                     else:
                         add("partial_close", f"bluechip_trend_warning ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f} pnl={pnl_pct:.1f}%", 0.25)
                     continue
-                if pnl_pct >= float(bluechip_cfg.get("tp2_target_pct", 0.070)) * 100 and not int(hist.get("tp2_hit") or 0):
-                    add("partial_close", f"bluechip_TP2 pnl={pnl_pct:.1f}%", float(bluechip_cfg.get("tp2_pct", 0.30)))
-                    continue
-                if pnl_pct >= float(bluechip_cfg.get("tp1_target_pct", 0.035)) * 100 and not int(hist.get("tp1_hit") or 0):
-                    add("partial_close", f"bluechip_TP1 pnl={pnl_pct:.1f}%", float(bluechip_cfg.get("tp1_pct", 0.50)))
-                    continue
-
-            if pnl_pct <= -float(self.cfg.get("hard_stop_pct", 0.05)) * 100:
-                add("close", f"hard_stop pnl={pnl_pct:.1f}%", is_stop=True)
+            if price_ret_pct <= -float(self.cfg.get("hard_stop_pct", 0.05)) * 100:
+                add("close", f"hard_stop price_ret={price_ret_pct:.1f}% pnl={pnl_pct:.1f}%", is_stop=True)
+                continue
+            if r_state.get("stop_triggered"):
+                add("close", f"trailing_stop r={float(r_state.get('r_multiple') or 0):.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}")
+                continue
+            if float(r_state.get("r_multiple") or 0) >= 2 and not int(hist.get("tp2_hit") or 0):
+                add("partial_close", "TP2 r>=2", 0.25)
+                continue
+            if float(r_state.get("r_multiple") or 0) >= 1 and not int(hist.get("tp1_hit") or 0):
+                add("partial_close", "TP1 r>=1", 0.25)
+                continue
+            if robot_signature and hold_alpha < 55 and pnl_pct <= soft_exit_loss_pct:
+                add("partial_close", f"orderbook_robot_signature_risk hold_alpha={hold_alpha:.1f} pnl={pnl_pct:.1f}%", 0.25)
                 continue
             if robot_signature and hold_alpha < 55:
-                add("close", f"orderbook_robot_signature hold_alpha={hold_alpha:.1f}")
+                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_orderbook_robot_signature hold_alpha={hold_alpha:.1f} pnl={pnl_pct:.1f}%")
+                continue
+            if hold_alpha <= 25 and pnl_pct <= soft_exit_loss_pct:
+                add("partial_close", f"hold_alpha_collapse_risk {hold_alpha:.1f} pnl={pnl_pct:.1f}%", 0.25)
                 continue
             if hold_alpha <= 25:
-                add("close", f"hold_alpha_collapse {hold_alpha:.1f}")
+                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_alpha_collapse {hold_alpha:.1f} pnl={pnl_pct:.1f}%")
                 continue
-            if hold_alpha <= 35 and pnl_pct < 2:
-                add("close", f"hold_alpha_weak {hold_alpha:.1f}, pnl={pnl_pct:.1f}%")
+            if hold_alpha <= 35 and pnl_pct >= soft_exit_profit_pct:
+                add("partial_close", f"hold_alpha_weak_profit_protect {hold_alpha:.1f}, pnl={pnl_pct:.1f}%", 0.25)
                 continue
             if score_decay >= float(self.cfg.get("score_decay_exit_full", 40)):
-                add("close", f"score_decay_full entry={entry_score:.1f} now={score:.1f}")
+                if pnl_pct >= soft_exit_profit_pct:
+                    add("partial_close", f"score_decay_profit_protect entry={entry_score:.1f} now={score:.1f} pnl={pnl_pct:.1f}%", 0.50)
+                elif pnl_pct <= soft_exit_loss_pct:
+                    add("partial_close", f"score_decay_risk_reduce entry={entry_score:.1f} now={score:.1f} pnl={pnl_pct:.1f}%", 0.25)
+                else:
+                    self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_score_decay_full entry={entry_score:.1f} now={score:.1f} pnl={pnl_pct:.1f}%")
                 continue
             if score_decay >= float(self.cfg.get("score_decay_exit_half", 30)) and not int(hist.get("tp2_hit") or 0):
-                add("partial_close", f"score_decay_half entry={entry_score:.1f} now={score:.1f}", 0.50)
+                if pnl_pct >= soft_exit_profit_pct:
+                    add("partial_close", f"score_decay_half entry={entry_score:.1f} now={score:.1f}", 0.50)
+                else:
+                    self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_score_decay_half entry={entry_score:.1f} now={score:.1f} pnl={pnl_pct:.1f}%")
                 continue
             if score_decay >= float(self.cfg.get("score_decay_exit_qtr", 20)) and not int(hist.get("tp1_hit") or 0):
-                add("partial_close", f"score_decay_qtr entry={entry_score:.1f} now={score:.1f}", 0.25)
+                if pnl_pct >= soft_exit_profit_pct:
+                    add("partial_close", f"score_decay_qtr entry={entry_score:.1f} now={score:.1f}", 0.25)
+                else:
+                    self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_score_decay_qtr entry={entry_score:.1f} now={score:.1f} pnl={pnl_pct:.1f}%")
                 continue
             if int(hist_perf.get("total") or 0) >= 5 and (expectancy <= 0 or total_pnl < 0 or profit_factor < 1):
-                if hold_alpha < 45 or pnl_pct <= 0:
-                    add("close", f"history_expectancy_turns_bad exp={expectancy:.4f} pf={profit_factor:.2f}")
-                    continue
-            if p_drawdown >= 0.60 and pnl_pct <= 1:
-                add("close", f"drawdown_risk {p_drawdown:.2f}, pnl={pnl_pct:.1f}%")
+                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_history_expectancy_bad exp={expectancy:.4f} pf={profit_factor:.2f} pnl={pnl_pct:.1f}%")
                 continue
-            if depth_score < 35 and pnl_pct <= 1:
-                add("close", f"orderbook_depth_weak score={depth_score:.1f}")
+            if p_drawdown >= 0.60 and pnl_pct <= soft_exit_loss_pct:
+                add("partial_close", f"drawdown_risk_reduce {p_drawdown:.2f}, pnl={pnl_pct:.1f}%", 0.25)
+                continue
+            if p_drawdown >= 0.60 and pnl_pct < soft_exit_profit_pct:
+                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_drawdown_risk {p_drawdown:.2f} pnl={pnl_pct:.1f}%")
+                continue
+            if depth_score < 35 and pnl_pct <= soft_exit_loss_pct:
+                add("partial_close", f"orderbook_depth_weak_reduce score={depth_score:.1f} pnl={pnl_pct:.1f}%", 0.25)
+                continue
+            if depth_score < 35 and pnl_pct < soft_exit_profit_pct:
+                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_orderbook_depth_weak score={depth_score:.1f} pnl={pnl_pct:.1f}%")
                 continue
 
             time_stop_h = float(self.cfg.get("time_stop_hours", 12))
             min_ret = float(self.cfg.get("time_stop_min_return", 0.02)) * 100
             if age_h is not None and age_h >= time_stop_h and pnl_pct < min_ret:
-                add("close", f"time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
+                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
                 continue
             category_exit = self._build_category_momentum_exit(
                 sym,
@@ -873,15 +1073,6 @@ class ExecutionEngine:
             if category_exit:
                 actions.append(category_exit)
                 continue
-            if pnl_pct >= float(self.cfg.get("tp2_target_pct", 0.10)) * 100 and not int(hist.get("tp2_hit") or 0):
-                add("partial_close", f"TP2 pnl={pnl_pct:.1f}%", float(self.cfg.get("tp2_pct", 0.50)))
-                continue
-            if pnl_pct >= float(self.cfg.get("tp1_target_pct", 0.05)) * 100 and not int(hist.get("tp1_hit") or 0):
-                add("partial_close", f"TP1 pnl={pnl_pct:.1f}%", float(self.cfg.get("tp1_pct", 0.50)))
-                continue
-            if pnl_pct > 0 and calc_trailing_stop(mark_price, highest_price, atr, self.cfg.get("trailing_stop_atr_multiplier", 1.5)):
-                add("close", f"trailing_stop high={highest_price:.4f} now={mark_price:.4f}")
-
         return actions
 
     def _spread_limit_for_profile(self, entry_profile: dict | None = None) -> tuple[float, float, str, str]:
@@ -1200,8 +1391,9 @@ class ExecutionEngine:
             atr = float(pos_info.get("atr_value") or 0)
             if atr <= 0:
                 atr = price * 0.02
-            stop_price = (price * 0.95) if side == "LONG" else (price * 1.05)
-            tp_levels = calc_tp_levels(price, side, atr)
+            stop_distance = float(pos_info.get("stop_loss") or price * float(pos_info.get("stop_pct") or 0.05))
+            stop_price = (price - stop_distance) if side == "LONG" else (price + stop_distance)
+            tp_levels = calc_tp_levels(price, side, pos_info.get("stop_pct"))
             invested = round(price * qty, 2)
 
             reason = f"alpha_volume_price->{entry_profile.get('template')} alpha_score={alpha_execution_score:.1f} {side}"
@@ -1219,6 +1411,9 @@ class ExecutionEngine:
                 "tp1_qty_pct": tp_levels["tp1_qty_pct"],
                 "tp2_qty_pct": tp_levels["tp2_qty_pct"],
                 "atr_value": atr,
+                "stop_model": pos_info.get("stop_model"),
+                "stop_pct": pos_info.get("stop_pct"),
+                "trailing_atr_multiplier": pos_info.get("trailing_atr_multiplier"),
                 "reason": reason,
                 "grade": normal_row.get("composite_summary") or normal_row.get("grade", ""),
                 "score": alpha_execution_score,
@@ -1860,8 +2055,9 @@ class ExecutionEngine:
                     continue
 
                 lev = pos_info.get("leverage", 3)
-                stop_price = (price * 0.95) if side == "LONG" else (price * 1.05)  # 鍥哄畾5%姝㈡崯
-                tp_levels = calc_tp_levels(price, side, pos_info["atr_value"])
+                stop_distance = float(pos_info.get("stop_loss") or price * float(pos_info.get("stop_pct") or 0.05))
+                stop_price = (price - stop_distance) if side == "LONG" else (price + stop_distance)
+                tp_levels = calc_tp_levels(price, side, pos_info.get("stop_pct"))
                 tp_price = tp_levels["tp2_price"]
                 invested = round(price * qty, 2)
                 
@@ -1882,6 +2078,9 @@ class ExecutionEngine:
                     "tp1_qty_pct": tp_levels["tp1_qty_pct"],
                     "tp2_qty_pct": tp_levels["tp2_qty_pct"],
                     "atr_value": pos_info["atr_value"],
+                    "stop_model": pos_info.get("stop_model"),
+                    "stop_pct": pos_info.get("stop_pct"),
+                    "trailing_atr_multiplier": pos_info.get("trailing_atr_multiplier"),
                     "reason": f"{'probe_entry:' if entry_profile.get('status') == 'probe' else ''}璇勫垎{score:.1f} {side}",
                     "grade": s.get("grade", ""),
                     "score": score,
@@ -2068,8 +2267,9 @@ class ExecutionEngine:
                     )
                     continue
 
-                stop_price = price * (1 - float(bluechip_cfg.get("hard_stop_pct", 0.03)))
-                tp_levels = _bluechip_tp_levels(price, side)
+                stop_distance = float(pos_info.get("stop_loss") or price * float(pos_info.get("stop_pct") or 0.03))
+                stop_price = (price - stop_distance) if side == "LONG" else (price + stop_distance)
+                tp_levels = _bluechip_tp_levels(price, side, pos_info.get("stop_pct"))
                 invested = round(price * qty, 2)
                 action = {
                     "action": "open",
@@ -2085,6 +2285,9 @@ class ExecutionEngine:
                     "tp1_qty_pct": tp_levels["tp1_qty_pct"],
                     "tp2_qty_pct": tp_levels["tp2_qty_pct"],
                     "atr_value": pos_info["atr_value"],
+                    "stop_model": pos_info.get("stop_model"),
+                    "stop_pct": pos_info.get("stop_pct"),
+                    "trailing_atr_multiplier": pos_info.get("trailing_atr_multiplier"),
                     "reason": f"bluechip_trend:{s.get('bluechip_entry_mode')} score={score:.1f}",
                     "grade": s.get("grade") or s.get("composite_summary") or "",
                     "score": score,
@@ -2215,6 +2418,10 @@ class ExecutionEngine:
                 alpha_entry_level=act.get("alpha_entry_level"),
                 alpha_score=act.get("alpha_score"),
                 alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
+                stop_model=act.get("stop_model"),
+                initial_stop_loss=act.get("stop_loss"),
+                stop_pct=act.get("stop_pct"),
+                trailing_atr_multiplier=act.get("trailing_atr_multiplier"),
             )
         except Exception as e:
             logger.warning(f"    local order write failed: {e}")
@@ -2295,6 +2502,7 @@ class ExecutionEngine:
         # 杩借釜鐘舵佸垵濮嬪寲
         self._pos_tracker[act["symbol"]] = {
             "highest_price": act["entry_price"],
+            "lowest_price": act["entry_price"],
             "entry_price": act["entry_price"],
         }
         results.append({"status": "ok", **act})
@@ -2432,12 +2640,14 @@ class ExecutionEngine:
             alpha_score=hist.get("alpha_score") or act.get("alpha_score"),
             alpha_suggested_position_pct=hist.get("alpha_suggested_position_pct") or act.get("alpha_suggested_position_pct"),
         )
-        if (hist.get("strategy_source") or act.get("strategy_source")) == "alpha" and pnl < 0:
-            try:
-                from shared.db import set_alpha_cooldown
-                set_alpha_cooldown(act["symbol"], "loss", f"alpha loss pnl={pnl:.2f}", 120, loss_count=1)
-            except Exception as e:
-                logger.warning(f"    alpha cooldown write failed: {e}")
+        if (hist.get("strategy_source") or act.get("strategy_source")) == "alpha":
+            _write_alpha_post_close_cooldown(
+                act["symbol"],
+                pnl=pnl,
+                reason=act.get("reason", ""),
+                is_stop=bool(act.get("is_stop")),
+                prefix="alpha execution close",
+            )
         self._record_decision(
             act["symbol"],
             run_id=act.get("run_id"),

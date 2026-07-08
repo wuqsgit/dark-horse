@@ -93,8 +93,12 @@ def calculate_position(
     atr_pct = atr / price if price > 0 else 0.02
     class_key, sizing = _position_sizing_config(symbol, category)
     leverage = _dynamic_leverage(atr_pct, sizing)
-    stop_distance = min(atr * 1.5, price * float(cfg.get("hard_stop_pct", 0.05)))
-    stop_pct = max(stop_distance / price, 0.003) if price > 0 else 0.003
+    hard_stop_pct = float(sizing.get("hard_stop_pct", cfg.get("hard_stop_pct", 0.05)))
+    min_stop_pct = float(sizing.get("min_stop_pct", sizing.get("min_effective_stop_pct", 0.003)))
+    atr_multiplier = float(sizing.get("atr_stop_multiplier", 2.5))
+    raw_stop_pct = atr_pct * atr_multiplier
+    stop_pct = min(max(raw_stop_pct, min_stop_pct), hard_stop_pct)
+    stop_distance = price * stop_pct
 
     mode = str(entry_mode or "confirmed").lower()
     if mode in {"probe", "normal_review_probe", "trend_probe"}:
@@ -130,9 +134,16 @@ def calculate_position(
     return {
         "quantity": round(quantity, 3),
         "stop_loss": round(stop_distance, 8),
-        "take_profit": round(atr * 2, 8),
-        "tp1_distance": round(atr * 2, 8),
-        "tp2_distance": round(atr * 4, 8),
+        "take_profit": round(stop_distance * 2, 8),
+        "tp1_distance": round(stop_distance, 8),
+        "tp2_distance": round(stop_distance * 2, 8),
+        "stop_model": "atr_clamped",
+        "stop_pct": round(stop_pct, 6),
+        "raw_stop_pct": round(raw_stop_pct, 6),
+        "min_stop_pct": round(min_stop_pct, 6),
+        "hard_stop_pct": round(hard_stop_pct, 6),
+        "atr_stop_multiplier": atr_multiplier,
+        "trailing_atr_multiplier": float(sizing.get("trailing_atr_multiplier", cfg.get("trailing_stop_atr_multiplier", 1.5))),
         "atr_value": atr,
         "atr_pct": round(atr_pct, 6),
         "leverage": leverage,
@@ -150,8 +161,13 @@ def calculate_position(
 
 def calc_tp_levels(entry_price: float, side: str, atr_value: float) -> dict:
     cfg = TRADING_CONFIG
-    tp1_pct = float(cfg.get("tp1_target_pct", 0.05))
-    tp2_pct = float(cfg.get("tp2_target_pct", 0.10))
+    stop_pct = float(atr_value or 0)
+    if stop_pct > 0.5:
+        stop_pct = stop_pct / entry_price if entry_price > 0 else float(cfg.get("tp1_target_pct", 0.05))
+    if stop_pct <= 0:
+        stop_pct = float(cfg.get("tp1_target_pct", 0.05))
+    tp1_pct = stop_pct
+    tp2_pct = stop_pct * 2
     if side == "LONG":
         tp1 = entry_price * (1 + tp1_pct)
         tp2 = entry_price * (1 + tp2_pct)

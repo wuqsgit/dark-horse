@@ -414,6 +414,114 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_trade_id ON fills(trade_id);
+        CREATE TABLE IF NOT EXISTS exchange_income_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            income_id TEXT UNIQUE,
+            symbol TEXT,
+            income_type TEXT NOT NULL,
+            income REAL DEFAULT 0,
+            asset TEXT DEFAULT 'USDT',
+            income_time TEXT,
+            trade_id TEXT,
+            order_id TEXT,
+            position_side TEXT,
+            raw_json TEXT,
+            source TEXT DEFAULT 'binance_income',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_income_ledger_time ON exchange_income_ledger(income_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_income_ledger_symbol ON exchange_income_ledger(symbol, income_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_income_ledger_type ON exchange_income_ledger(income_type, income_time DESC);
+        CREATE TABLE IF NOT EXISTS position_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_trade_id TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            side TEXT,
+            strategy_source TEXT DEFAULT 'unknown',
+            signal_source TEXT,
+            alpha_symbol TEXT,
+            entry_time TEXT,
+            exit_time TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            quantity REAL,
+            realized_pnl REAL DEFAULT 0,
+            commission REAL DEFAULT 0,
+            funding_fee REAL DEFAULT 0,
+            adjustment REAL DEFAULT 0,
+            net_pnl REAL DEFAULT 0,
+            pnl_pct REAL,
+            income_count INTEGER DEFAULT 0,
+            entry_reason TEXT,
+            exit_reason TEXT,
+            source TEXT DEFAULT 'reconstructed',
+            reconcile_status TEXT DEFAULT 'ok',
+            raw_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_position_trades_exit ON position_trades(exit_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_position_trades_symbol ON position_trades(symbol, exit_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_position_trades_source ON position_trades(source, exit_time DESC);
+        CREATE TABLE IF NOT EXISTS trade_exit_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_trade_id TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            strategy_source TEXT,
+            alpha_symbol TEXT,
+            side TEXT,
+            category TEXT,
+            entry_time TEXT,
+            exit_time TEXT,
+            exit_reason TEXT,
+            net_pnl REAL DEFAULT 0,
+            pnl_pct REAL,
+            holding_minutes REAL,
+            return_1h REAL,
+            return_4h REAL,
+            return_12h REAL,
+            return_24h REAL,
+            return_72h REAL,
+            max_favorable_return REAL,
+            max_adverse_return REAL,
+            max_favorable_time TEXT,
+            max_adverse_time TEXT,
+            review_label TEXT,
+            review_summary TEXT,
+            evidence_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_trade_exit_reviews_exit ON trade_exit_reviews(exit_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_trade_exit_reviews_reason ON trade_exit_reviews(exit_reason, exit_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_trade_exit_reviews_label ON trade_exit_reviews(review_label, exit_time DESC);
+        CREATE TABLE IF NOT EXISTS exit_review_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary_id TEXT UNIQUE,
+            run_time TEXT,
+            window_days INTEGER,
+            category TEXT,
+            strategy_source TEXT,
+            exit_reason TEXT,
+            sample_size INTEGER DEFAULT 0,
+            win_count INTEGER DEFAULT 0,
+            loss_count INTEGER DEFAULT 0,
+            avg_pnl REAL DEFAULT 0,
+            total_pnl REAL DEFAULT 0,
+            avg_mfe_after_exit REAL DEFAULT 0,
+            avg_mae_after_exit REAL DEFAULT 0,
+            good_exit_count INTEGER DEFAULT 0,
+            early_exit_count INTEGER DEFAULT 0,
+            noise_loss_exit_count INTEGER DEFAULT 0,
+            small_profit_exit_count INTEGER DEFAULT 0,
+            late_exit_count INTEGER DEFAULT 0,
+            conclusion TEXT,
+            action_type TEXT,
+            summary_text TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_exit_review_summaries_run ON exit_review_summaries(run_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_exit_review_summaries_reason ON exit_review_summaries(exit_reason, run_time DESC);
         -- Training samples table.
         CREATE TABLE IF NOT EXISTS training_samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -669,6 +777,7 @@ def init_db():
         "tp1_hit": "INTEGER DEFAULT 0",
         "tp2_hit": "INTEGER DEFAULT 0",
         "highest_price": "REAL",
+        "lowest_price": "REAL",
         "last_exit_reason": "TEXT",
         "roll_layer": "INTEGER DEFAULT 0",
         "last_roll_time": "TEXT",
@@ -677,6 +786,14 @@ def init_db():
         "max_floating_pnl": "REAL DEFAULT 0",
         "roll_enabled": "INTEGER DEFAULT 0",
         "roll_block_reason": "TEXT",
+        "stop_model": "TEXT",
+        "initial_stop_loss": "REAL",
+        "stop_pct": "REAL",
+        "current_stop_loss": "REAL",
+        "trailing_stop_price": "REAL",
+        "trailing_enabled": "INTEGER DEFAULT 0",
+        "trailing_atr_multiplier": "REAL",
+        "r_multiple": "REAL DEFAULT 0",
     }.items():
         _ensure_column(conn, "position_history", column, ddl)
     for column, ddl in {
@@ -1240,6 +1357,10 @@ def record_trade(
     alpha_entry_level=None,
     alpha_score=None,
     alpha_suggested_position_pct=None,
+    stop_model=None,
+    initial_stop_loss=None,
+    stop_pct=None,
+    trailing_atr_multiplier=None,
 ):
     conn = get_conn()
     conn.execute(
@@ -1291,6 +1412,10 @@ def upsert_position_history(
     alpha_entry_level=None,
     alpha_score=None,
     alpha_suggested_position_pct=None,
+    stop_model=None,
+    initial_stop_loss=None,
+    stop_pct=None,
+    trailing_atr_multiplier=None,
 ):
     """V3.0 璁板綍/鏇存柊寮€浠撲俊鎭紝閲嶅惎鍚庡彲鎭㈠"""
     conn = get_conn()
@@ -1300,8 +1425,10 @@ def upsert_position_history(
         """INSERT INTO position_history
            (symbol, side, quantity, entry_price, entry_reason, entry_score, entry_time, tp3_price, atr_value,
             highest_price, position_id, strategy_source, signal_source, alpha_symbol,
-            alpha_profile, alpha_entry_level, alpha_score, alpha_suggested_position_pct, update_time)
-           VALUES (?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+            alpha_profile, alpha_entry_level, alpha_score, alpha_suggested_position_pct,
+            lowest_price, stop_model, initial_stop_loss, stop_pct, current_stop_loss,
+            trailing_atr_multiplier, update_time)
+           VALUES (?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
            ON CONFLICT(symbol) DO UPDATE SET
              side=excluded.side,
              quantity=excluded.quantity,
@@ -1320,6 +1447,12 @@ def upsert_position_history(
              alpha_score=excluded.alpha_score,
              alpha_suggested_position_pct=excluded.alpha_suggested_position_pct,
              highest_price=COALESCE(position_history.highest_price, excluded.highest_price),
+             lowest_price=COALESCE(position_history.lowest_price, excluded.lowest_price),
+             stop_model=excluded.stop_model,
+             initial_stop_loss=excluded.initial_stop_loss,
+             stop_pct=excluded.stop_pct,
+             current_stop_loss=COALESCE(position_history.current_stop_loss, excluded.current_stop_loss),
+             trailing_atr_multiplier=excluded.trailing_atr_multiplier,
              update_time=datetime('now')""",
         (
             symbol,
@@ -1339,6 +1472,12 @@ def upsert_position_history(
             alpha_entry_level,
             alpha_score,
             alpha_suggested_position_pct,
+            entry_price,
+            stop_model,
+            initial_stop_loss,
+            stop_pct,
+            initial_stop_loss,
+            trailing_atr_multiplier,
         )
     )
     conn.commit()
@@ -1368,6 +1507,7 @@ def update_position_management(symbol, **fields):
         "quantity",
         "entry_price",
         "highest_price",
+        "lowest_price",
         "tp1_hit",
         "tp2_hit",
         "last_exit_reason",
@@ -1377,6 +1517,14 @@ def update_position_management(symbol, **fields):
         "max_floating_pnl",
         "roll_enabled",
         "roll_block_reason",
+        "stop_model",
+        "initial_stop_loss",
+        "stop_pct",
+        "current_stop_loss",
+        "trailing_stop_price",
+        "trailing_enabled",
+        "trailing_atr_multiplier",
+        "r_multiple",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -1427,8 +1575,456 @@ def record_position_roll_event(
     conn.close()
 
 
+def _parse_db_time(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        try:
+            return datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+
+def _format_db_time(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _income_id_from_payload(item):
+    trade_id = str(item.get("tradeId") or item.get("tranId") or item.get("incomeId") or "").strip()
+    income_type = str(item.get("incomeType") or item.get("income_type") or "").strip()
+    symbol = str(item.get("symbol") or "").strip().upper()
+    income = str(item.get("income") or "0")
+    ts = str(item.get("time") or item.get("income_time") or "").strip()
+    return trade_id or f"{income_type}:{symbol}:{ts}:{income}"
+
+
+def upsert_exchange_income(item, source="binance_income"):
+    conn = get_conn()
+    try:
+        income_type = str(item.get("incomeType") or item.get("income_type") or "").strip() or "UNKNOWN"
+        symbol = str(item.get("symbol") or "").strip().upper()
+        income = float(item.get("income") or 0)
+        asset = str(item.get("asset") or "USDT")
+        raw_time = item.get("time") or item.get("income_time")
+        if isinstance(raw_time, (int, float)):
+            income_time = datetime.fromtimestamp(float(raw_time) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            income_time = str(raw_time) if raw_time else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        trade_id = str(item.get("tradeId") or item.get("trade_id") or "") or None
+        order_id = str(item.get("orderId") or item.get("order_id") or "") or None
+        position_side = str(item.get("positionSide") or item.get("position_side") or "") or None
+        income_id = _income_id_from_payload(item)
+        conn.execute(
+            """INSERT INTO exchange_income_ledger
+               (income_id, symbol, income_type, income, asset, income_time, trade_id,
+                order_id, position_side, raw_json, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(income_id) DO UPDATE SET
+                 symbol=excluded.symbol,
+                 income_type=excluded.income_type,
+                 income=excluded.income,
+                 asset=excluded.asset,
+                 income_time=excluded.income_time,
+                 trade_id=excluded.trade_id,
+                 order_id=excluded.order_id,
+                 position_side=excluded.position_side,
+                 raw_json=excluded.raw_json,
+                 source=excluded.source""",
+            (
+                income_id,
+                symbol,
+                income_type,
+                income,
+                asset,
+                income_time,
+                trade_id,
+                order_id,
+                position_side,
+                json.dumps(item, ensure_ascii=False),
+                source,
+            ),
+        )
+        conn.commit()
+        return income_id
+    finally:
+        conn.close()
+
+
+def backfill_income_ledger_from_fills():
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT *
+               FROM fills
+               WHERE side='REALIZED_PNL'
+                 AND trade_id IS NOT NULL
+                 AND trade_id != ''"""
+        ).fetchall()
+        count = 0
+        for r in rows:
+            income_id = f"fill:{r['trade_id']}"
+            exists = conn.execute(
+                """SELECT 1
+                   FROM exchange_income_ledger
+                   WHERE income_id=?
+                      OR (income_type='REALIZED_PNL' AND trade_id=? AND trade_id IS NOT NULL AND trade_id!='')""",
+                (income_id, r["trade_id"]),
+            ).fetchone()
+            if exists:
+                continue
+            raw = dict(r)
+            conn.execute(
+                """INSERT INTO exchange_income_ledger
+                   (income_id, symbol, income_type, income, asset, income_time,
+                    trade_id, position_side, raw_json, source)
+                   VALUES (?, ?, 'REALIZED_PNL', ?, ?, ?, ?, NULL, ?, 'legacy_fills')""",
+                (
+                    income_id,
+                    r["symbol"],
+                    float(r["realized_pnl"] or 0),
+                    r["fee_asset"] or "USDT",
+                    r["created_at"],
+                    r["trade_id"],
+                    json.dumps(raw, ensure_ascii=False),
+                ),
+            )
+            count += 1
+        conn.commit()
+        return count
+    finally:
+        conn.close()
+
+
+def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, unrealized_pnl=0):
+    """Rebuild the position-level ledger from exchange income rows.
+
+    Binance income is the factual ledger, but it arrives as many small rows.
+    Consecutive realized PnL rows for the same symbol are grouped into a
+    position-level record. Fees/funding and any final account reconciliation
+    difference are kept as non-win-rate rows.
+    """
+    backfill_income_ledger_from_fills()
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT *
+               FROM exchange_income_ledger
+               ORDER BY income_time ASC, id ASC"""
+        ).fetchall()
+        deduped_rows = []
+        seen_income = set()
+        for r in rows:
+            trade_id = str(r["trade_id"] or "")
+            if trade_id:
+                key = (r["income_type"], (r["symbol"] or "").upper(), trade_id)
+            else:
+                key = (r["income_type"], (r["symbol"] or "").upper(), r["income_time"], round(float(r["income"] or 0), 8))
+            if key in seen_income:
+                continue
+            seen_income.add(key)
+            deduped_rows.append(r)
+        rows = deduped_rows
+        open_times_by_symbol = {}
+        for r in conn.execute(
+            """SELECT symbol, created_at
+               FROM orders
+               WHERE order_type='MARKET'
+               ORDER BY created_at ASC"""
+        ).fetchall():
+            dt = _parse_db_time(r["created_at"])
+            if dt:
+                open_times_by_symbol.setdefault((r["symbol"] or "").upper(), []).append(dt)
+
+        def has_open_between(symbol, start_dt, end_dt):
+            if not start_dt or not end_dt:
+                return False
+            lo, hi = (start_dt, end_dt) if start_dt <= end_dt else (end_dt, start_dt)
+            for open_dt in open_times_by_symbol.get((symbol or "").upper(), []):
+                if lo < open_dt <= hi:
+                    return True
+            return False
+
+        conn.execute("DELETE FROM position_trades")
+        groups = []
+        real_by_symbol = {}
+        side_income_rows = []
+        gap = timedelta(minutes=group_gap_minutes)
+
+        for r in rows:
+            income_type = r["income_type"]
+            symbol = (r["symbol"] or "ACCOUNT").upper()
+            income = float(r["income"] or 0)
+            dt = _parse_db_time(r["income_time"])
+            if income_type != "REALIZED_PNL" or not symbol or symbol == "ACCOUNT":
+                side_income_rows.append((dt, dict(r), income))
+                continue
+            raw = dict(r)
+            real_by_symbol.setdefault(symbol, []).append((dt, raw, income))
+
+        for symbol, items in real_by_symbol.items():
+            current = None
+            for dt, raw, income in sorted(items, key=lambda x: ((x[0] or datetime.min.replace(tzinfo=timezone.utc)), x[1].get("id") or 0)):
+                if (
+                    current
+                    and dt
+                    and current["last_dt"]
+                    and dt - current["last_dt"] <= gap
+                    and not has_open_between(symbol, current["last_dt"], dt)
+                ):
+                    current["rows"].append(raw)
+                    current["pnl"] += income
+                    current["last_dt"] = dt
+                    if raw.get("trade_id"):
+                        current["trade_ids"].add(str(raw.get("trade_id")))
+                else:
+                    if current:
+                        groups.append(current)
+                    current = {
+                        "symbol": symbol,
+                        "first_dt": dt,
+                        "last_dt": dt,
+                        "pnl": income,
+                        "commission": 0.0,
+                        "funding_fee": 0.0,
+                        "adjustment": 0.0,
+                        "trade_ids": {str(raw.get("trade_id"))} if raw.get("trade_id") else set(),
+                        "rows": [raw],
+                    }
+            if (
+                current
+                and current["first_dt"] is None
+                and current["last_dt"] is None
+            ):
+                current["first_dt"] = current["last_dt"] = datetime.now(timezone.utc)
+            if current:
+                groups.append(current)
+
+        unmatched_side_income = 0.0
+        side_attach_gap = timedelta(minutes=max(group_gap_minutes * 2, 30))
+        for dt, raw, income in side_income_rows:
+            income_type = raw.get("income_type")
+            symbol = (raw.get("symbol") or "ACCOUNT").upper()
+            trade_id = str(raw.get("trade_id") or "")
+            best = None
+            best_distance = None
+            for g in groups:
+                if g["symbol"] != symbol:
+                    continue
+                if trade_id and trade_id in g.get("trade_ids", set()):
+                    best = g
+                    best_distance = 0
+                    break
+                if not dt or not g.get("first_dt") or not g.get("last_dt"):
+                    continue
+                if dt > g["last_dt"] and has_open_between(symbol, g["last_dt"], dt):
+                    continue
+                if dt < g["first_dt"] and has_open_between(symbol, dt, g["first_dt"]):
+                    continue
+                if g["first_dt"] <= dt <= g["last_dt"]:
+                    distance = 0
+                else:
+                    distance = min(abs((dt - g["first_dt"]).total_seconds()), abs((dt - g["last_dt"]).total_seconds()))
+                if distance <= side_attach_gap.total_seconds() and (best_distance is None or distance < best_distance):
+                    best = g
+                    best_distance = distance
+            if best is None:
+                unmatched_side_income += income
+                continue
+            if income_type == "COMMISSION":
+                best["commission"] += income
+            elif income_type == "FUNDING_FEE":
+                best["funding_fee"] += income
+            else:
+                best["adjustment"] += income
+            best["rows"].append(raw)
+            if dt:
+                best["first_dt"] = min(best["first_dt"], dt) if best["first_dt"] else dt
+                best["last_dt"] = max(best["last_dt"], dt) if best["last_dt"] else dt
+
+        for i, g in enumerate(groups, start=1):
+            symbol = g["symbol"]
+            first_dt = g["first_dt"]
+            last_dt = g["last_dt"]
+            pid = f"{symbol}-INCOME-{_format_db_time(first_dt) or i}-{i}".replace(" ", "T")
+            meta = conn.execute(
+                """SELECT *
+                   FROM trades
+                   WHERE symbol=?
+                     AND exit_time IS NOT NULL
+                     AND exit_time != 'N/A'
+                     AND ABS(strftime('%s', exit_time) - strftime('%s', ?)) <= 3600
+                   ORDER BY ABS(strftime('%s', exit_time) - strftime('%s', ?))
+                   LIMIT 1""",
+                (symbol, _format_db_time(last_dt), _format_db_time(last_dt)),
+            ).fetchone()
+            side = meta["side"] if meta and "side" in meta.keys() else None
+            strategy_source = meta["strategy_source"] if meta and "strategy_source" in meta.keys() else "unknown"
+            signal_source = meta["signal_source"] if meta and "signal_source" in meta.keys() else None
+            alpha_symbol = meta["alpha_symbol"] if meta and "alpha_symbol" in meta.keys() else None
+            entry_price = meta["entry_price"] if meta and "entry_price" in meta.keys() else None
+            exit_price = meta["exit_price"] if meta and "exit_price" in meta.keys() else None
+            qty = meta["quantity"] if meta and "quantity" in meta.keys() else None
+            entry_reason = meta["entry_reason"] if meta and "entry_reason" in meta.keys() else None
+            exit_reason = meta["exit_reason"] if meta and "exit_reason" in meta.keys() else "REALIZED_PNL"
+            entry_time = meta["entry_time"] if meta and "entry_time" in meta.keys() else _format_db_time(first_dt)
+            notional = float(entry_price or 0) * float(qty or 0)
+            margin = notional / 3 if notional else 0
+            net_pnl = g["pnl"] + g.get("commission", 0.0) + g.get("funding_fee", 0.0) + g.get("adjustment", 0.0)
+            pnl_pct = (net_pnl / margin * 100) if margin else None
+            conn.execute(
+                """INSERT OR REPLACE INTO position_trades
+                   (position_trade_id, symbol, side, strategy_source, signal_source,
+                    alpha_symbol, entry_time, exit_time, entry_price, exit_price,
+                    quantity, realized_pnl, commission, funding_fee, adjustment,
+                    net_pnl, pnl_pct, income_count,
+                    entry_reason, exit_reason, source, reconcile_status, raw_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    pid,
+                    symbol,
+                    side,
+                    strategy_source,
+                    signal_source,
+                    alpha_symbol,
+                    entry_time,
+                    _format_db_time(last_dt),
+                    entry_price,
+                    exit_price,
+                    qty,
+                    g["pnl"],
+                    g.get("commission", 0.0),
+                    g.get("funding_fee", 0.0),
+                    g.get("adjustment", 0.0),
+                    net_pnl,
+                    pnl_pct,
+                    len(g["rows"]),
+                    entry_reason,
+                    exit_reason,
+                    "exchange_income",
+                    "ok",
+                    json.dumps(g["rows"], ensure_ascii=False),
+                ),
+            )
+
+        if abs(unmatched_side_income) >= 0.00000001:
+            now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """INSERT OR REPLACE INTO position_trades
+                   (position_trade_id, symbol, side, entry_time, exit_time,
+                    adjustment, net_pnl, income_count, exit_reason, source,
+                    reconcile_status, raw_json)
+                   VALUES ('ACCOUNT-UNMATCHED-INCOME', 'ACCOUNT', NULL, ?, ?, ?, ?, 1,
+                           'UNMATCHED_EXCHANGE_INCOME', 'exchange_income',
+                           'unmatched', ?)""",
+                (
+                    now_text,
+                    now_text,
+                    unmatched_side_income,
+                    unmatched_side_income,
+                    json.dumps({"unmatched_side_income": unmatched_side_income}, ensure_ascii=False),
+                ),
+            )
+
+        if account_pnl is not None:
+            net = conn.execute("SELECT COALESCE(SUM(net_pnl),0) FROM position_trades").fetchone()[0] or 0
+            diff = float(account_pnl or 0) - float(unrealized_pnl or 0) - float(net or 0)
+            if abs(diff) >= 0.01:
+                now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                conn.execute(
+                    """INSERT OR REPLACE INTO position_trades
+                       (position_trade_id, symbol, side, entry_time, exit_time,
+                        adjustment, net_pnl, income_count, exit_reason, source,
+                        reconcile_status, raw_json)
+                       VALUES ('ACCOUNT-RECONCILE-DIFF', 'ACCOUNT', NULL, ?, ?, ?, ?, 1,
+                               'ACCOUNT_RECONCILE_DIFF', 'reconcile_adjustment',
+                               'unmatched', ?)""",
+                    (
+                        now_text,
+                        now_text,
+                        diff,
+                        diff,
+                        json.dumps(
+                            {
+                                "account_pnl": account_pnl,
+                                "unrealized_pnl": unrealized_pnl,
+                                "position_net_before_adjustment": net,
+                                "diff": diff,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+
+        conn.commit()
+        return conn.execute("SELECT COUNT(*) FROM position_trades").fetchone()[0]
+    finally:
+        conn.close()
+
+
 def fetch_position_trade_groups(limit=100):
     conn = get_conn()
+    has_position_trades = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='position_trades'"
+    ).fetchone()[0]
+    if has_position_trades:
+        rows = conn.execute(
+            """SELECT
+                   position_trade_id AS position_id,
+                   symbol,
+                   side,
+                   entry_time,
+                   exit_time,
+                   quantity,
+                   entry_price,
+                   exit_price,
+                   net_pnl AS pnl,
+                   pnl_pct,
+                   exit_reason,
+                   income_count AS close_count,
+                   entry_reason,
+                   source,
+                   strategy_source,
+                   signal_source,
+                   alpha_symbol,
+                   alpha_symbol AS alpha_profile,
+                   NULL AS alpha_entry_level,
+                   NULL AS alpha_score,
+                   NULL AS alpha_suggested_position_pct,
+                   commission,
+                   funding_fee,
+                   adjustment,
+                   reconcile_status
+               FROM position_trades
+               ORDER BY COALESCE(exit_time, updated_at, created_at) DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["pnl"] = round(float(d.get("pnl") or 0), 2)
+            d["pnl_pct"] = round(float(d.get("pnl_pct") or 0), 2) if d.get("pnl_pct") is not None else 0
+            d["qty"] = round(float(d.get("quantity") or 0), 6)
+            d["entry_price"] = round(float(d.get("entry_price") or 0), 8)
+            d["exit_price"] = round(float(d.get("exit_price") or 0), 8)
+            d["is_grouped"] = True
+            d["is_adjustment"] = d.get("source") == "reconcile_adjustment"
+            result.append(d)
+        conn.close()
+        return result
+
     rows = conn.execute(
         """SELECT
                COALESCE(NULLIF(position_id, ''), symbol || '-' || side || '-' || entry_time) AS position_id,

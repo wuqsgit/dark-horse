@@ -173,6 +173,11 @@ def fetch_and_store_income(ex, days_back=7):
     """
     from datetime import timedelta
     from collections import defaultdict
+    from shared.db import (
+        backfill_income_ledger_from_fills,
+        rebuild_position_trades_from_income,
+        upsert_exchange_income,
+    )
     conn = get_conn()
     now = datetime.now(timezone.utc)
     
@@ -202,6 +207,14 @@ def fetch_and_store_income(ex, days_back=7):
             conn.close()
             return
 
+        ledger_count = 0
+        for item in inc_data:
+            try:
+                upsert_exchange_income(item)
+                ledger_count += 1
+            except Exception as e:
+                logger.warning(f"income ledger upsert error: {e}")
+
         real_pnl = [i for i in inc_data if i.get("incomeType") == "REALIZED_PNL"]
         funding = [i for i in inc_data if i.get("incomeType") == "FUNDING_FEE"]
         commission = [i for i in inc_data if i.get("incomeType") == "COMMISSION"]
@@ -213,7 +226,7 @@ def fetch_and_store_income(ex, days_back=7):
             income = float(i.get("income", 0))
             by_symbol[sym] += income
 
-        logger.info(f"Income sync: {len(real_pnl)} PnL, {len(funding)} funding, {len(commission)} commission")
+        logger.info(f"Income sync: {len(real_pnl)} PnL, {len(funding)} funding, {len(commission)} commission, ledger={ledger_count}")
         
         # 打印按币种汇总
         for sym, pnl in sorted(by_symbol.items(), key=lambda x: -x[1]):
@@ -240,6 +253,26 @@ def fetch_and_store_income(ex, days_back=7):
         logger.info(f"写入 {fill_count} 条 fills")
 
         # 对账
+        try:
+            backfill_income_ledger_from_fills()
+            rebuilt = rebuild_position_trades_from_income()
+            logger.info(f"Position trade rebuild complete: {rebuilt} rows")
+            _apply_recent_alpha_close_cooldowns()
+            try:
+                from shared.policy_loop import review_position_trade_exits, summarize_exit_reviews
+
+                reviewed = review_position_trade_exits(limit=200)
+                summarized = summarize_exit_reviews(window_days=7, recent_limit=30)
+                logger.info(
+                    "Exit review complete: reviewed=%s summaries=%s",
+                    reviewed.get("reviewed", 0),
+                    len(summarized.get("summaries", [])),
+                )
+            except Exception as e:
+                logger.warning(f"exit review sync error: {e}")
+        except Exception as e:
+            logger.warning(f"position trade rebuild error: {e}")
+
         total_income_pnl = sum(float(i["income"]) for i in real_pnl)
         local_pnl = conn.execute("SELECT SUM(pnl) FROM trades WHERE source IN ('system','income_auto')").fetchone()[0] or 0
         diff = abs(total_income_pnl - local_pnl)
@@ -253,6 +286,73 @@ def fetch_and_store_income(ex, days_back=7):
     finally:
         conn.close()
     # 不关闭 ex.client，后续循环还要用
+
+
+def _apply_recent_alpha_close_cooldowns(minutes_back=12):
+    """Backfill alpha cooldowns for exchange-side closes discovered by income sync."""
+    from shared.db import set_alpha_cooldown
+
+    cfg = TRADING_CONFIG.get("alpha_trading") or {}
+    post_minutes = int(cfg.get("post_close_cooldown_minutes", 45))
+    loss_minutes = int(cfg.get("loss_cooldown_minutes", 120))
+    stop_minutes = int(cfg.get("stop_cooldown_minutes", 180))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT pt.symbol,
+                   pt.net_pnl,
+                   pt.exit_reason,
+                   pt.exit_time,
+                   pt.strategy_source,
+                   pt.alpha_symbol,
+                   EXISTS(
+                       SELECT 1
+                       FROM orders o
+                       WHERE o.symbol = pt.symbol
+                         AND COALESCE(o.strategy_source, '') = 'alpha'
+                         AND datetime(o.created_at) >= datetime(pt.exit_time, '-6 hours')
+                         AND datetime(o.created_at) <= datetime(pt.exit_time, '+5 minutes')
+                   ) AS has_alpha_order
+            FROM position_trades pt
+            WHERE pt.symbol <> 'ACCOUNT'
+              AND datetime(pt.exit_time) >= datetime('now', ?)
+              AND (
+                  COALESCE(pt.strategy_source, '') = 'alpha'
+                  OR COALESCE(pt.alpha_symbol, '') <> ''
+                  OR pt.exit_reason LIKE 'alpha_%'
+                  OR has_alpha_order = 1
+              )
+            ORDER BY datetime(pt.exit_time) DESC
+            LIMIT 100
+            """,
+            (f"-{int(minutes_back)} minutes",),
+        ).fetchall()
+
+        for row in rows:
+            pnl = float(row["net_pnl"] or 0)
+            reason = row["exit_reason"] or "exchange income close"
+            reason_l = reason.lower()
+            stop_like = "stop" in reason_l or "止损" in reason
+            if stop_like:
+                cooldown_type, minutes, loss_count = "stop", stop_minutes, 1
+            elif pnl < 0:
+                cooldown_type, minutes, loss_count = "loss", loss_minutes, 1
+            else:
+                cooldown_type, minutes, loss_count = "post_close", post_minutes, 0
+            set_alpha_cooldown(
+                row["symbol"],
+                cooldown_type,
+                f"income close cooldown: pnl={pnl:.2f}; {reason}"[:240],
+                minutes,
+                loss_count=loss_count,
+            )
+        if rows:
+            logger.info("Applied alpha close cooldowns from income sync: %s", len(rows))
+    except Exception as e:
+        logger.warning("apply alpha close cooldowns failed: %s", e)
+    finally:
+        conn.close()
 
 
 def _get_cat_name_by_threshold(th: float) -> str:

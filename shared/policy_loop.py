@@ -31,6 +31,17 @@ BIG_MOVE_RULES = {
     "default": {"pct": 0.08, "atr": 2.0},
 }
 
+EXIT_REVIEW_THRESHOLDS = {
+    "alpha": {"early": 0.06, "noise_mfe": 0.03, "noise_loss": -0.02, "small_profit": 0.02, "small_mfe": 0.05},
+    "core_bluechip": {"early": 0.03, "noise_mfe": 0.02, "noise_loss": -0.015, "small_profit": 0.015, "small_mfe": 0.025},
+    "large_cap": {"early": 0.05, "noise_mfe": 0.03, "noise_loss": -0.02, "small_profit": 0.02, "small_mfe": 0.04},
+    "fundamental": {"early": 0.05, "noise_mfe": 0.03, "noise_loss": -0.02, "small_profit": 0.02, "small_mfe": 0.04},
+    "narrative": {"early": 0.05, "noise_mfe": 0.03, "noise_loss": -0.02, "small_profit": 0.02, "small_mfe": 0.04},
+    "meme": {"early": 0.08, "noise_mfe": 0.05, "noise_loss": -0.03, "small_profit": 0.03, "small_mfe": 0.06},
+    "discovery": {"early": 0.05, "noise_mfe": 0.03, "noise_loss": -0.02, "small_profit": 0.02, "small_mfe": 0.04},
+    "default": {"early": 0.05, "noise_mfe": 0.03, "noise_loss": -0.02, "small_profit": 0.02, "small_mfe": 0.04},
+}
+
 CATEGORY_ALIASES = {
     "bluechip": "core_bluechip",
     "bluechip_trend": "core_bluechip",
@@ -474,8 +485,317 @@ def _median(values: list[float | None]) -> float:
     return statistics.median(usable) if usable else 0.0
 
 
+def _exit_review_thresholds(category: str, strategy_source: str | None = None) -> dict:
+    if strategy_source == "alpha":
+        return EXIT_REVIEW_THRESHOLDS["alpha"]
+    return EXIT_REVIEW_THRESHOLDS.get(category) or EXIT_REVIEW_THRESHOLDS["default"]
+
+
+def _pct_for_review(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if abs(v) > 1.5:
+        return v / 100.0
+    return v
+
+
+def _exit_review_label(pnl_pct: float | None, mfe: float, mae: float, category: str, strategy_source: str | None, bars: int) -> str:
+    if bars < 4:
+        return "pending"
+    th = _exit_review_thresholds(category, strategy_source)
+    pnl = pnl_pct
+    if pnl is not None:
+        if th["noise_loss"] <= pnl <= 0 and mfe >= th["noise_mfe"]:
+            return "noise_loss_exit"
+        if 0 < pnl <= th["small_profit"] and mfe >= th["small_mfe"]:
+            return "small_profit_exit"
+    if mfe >= th["early"]:
+        return "early_exit"
+    if mfe < th["early"] * 0.5 and mae <= -max(th["noise_mfe"], 0.02):
+        return "good_exit"
+    if pnl is not None and pnl > 0 and mae <= -max(float(pnl) * 0.6, 0.02):
+        return "late_exit"
+    return "good_exit" if mfe < th["early"] * 0.7 else "unknown"
+
+
+def _exit_review_summary(symbol: str, exit_reason: str, net_pnl: float, mfe: float, label: str) -> str:
+    label_text = {
+        "good_exit": "平仓后没有明显继续走强，暂定平得合理",
+        "early_exit": "平仓后继续朝原方向走出明显空间，疑似平早",
+        "noise_loss_exit": "小亏出场后又给出有利空间，疑似被噪音洗出",
+        "small_profit_exit": "小盈利出场后仍有明显空间，疑似吃得太少",
+        "late_exit": "平仓前后回吐偏大，疑似保护利润偏慢",
+        "pending": "后续K线不足，暂不下结论",
+    }.get(label, "样本结论不明确，继续观察")
+    return f"{symbol} 因 {exit_reason or 'unknown'} 平仓，实际盈亏 {net_pnl:.2f}U；平仓后最大有利空间 {mfe * 100:.2f}%，{label_text}。"
+
+
+def review_position_trade_exits(limit: int = 300) -> dict:
+    init_db()
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT pt.*
+               FROM position_trades pt
+               LEFT JOIN trade_exit_reviews r ON r.position_trade_id = pt.position_trade_id
+               WHERE pt.position_trade_id IS NOT NULL
+                 AND pt.symbol <> 'ACCOUNT'
+                 AND pt.exit_time IS NOT NULL
+                 AND (r.id IS NULL OR r.review_label = 'pending')
+               ORDER BY datetime(pt.exit_time) ASC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        payload = []
+        for row in rows:
+            exit_dt = parse_dt(row["exit_time"])
+            if not exit_dt:
+                continue
+            entry_dt = parse_dt(row["entry_time"])
+            entry_price = float(row["exit_price"] or row["entry_price"] or 0)
+            if entry_price <= 0:
+                continue
+            side = row["side"] or "LONG"
+            end_dt = exit_dt + timedelta(hours=73)
+            candles = [
+                dict(c)
+                for c in conn.execute(
+                    """SELECT time, close, high, low
+                       FROM candles_1h
+                       WHERE symbol = ?
+                         AND time > ?
+                         AND time <= ?
+                       ORDER BY time ASC""",
+                    (row["symbol"], iso_z(exit_dt), iso_z(end_dt)),
+                ).fetchall()
+            ]
+            for c in candles:
+                c["_time"] = parse_dt(c["time"])
+            candles = [c for c in candles if c.get("_time")]
+            returns = {}
+            for hours in WINDOWS:
+                eligible = [c for c in candles if c["_time"] <= exit_dt + timedelta(hours=hours)]
+                returns[hours] = _signed_return(float(eligible[-1]["close"]), entry_price, side) if eligible else None
+            signed_highs = []
+            signed_lows = []
+            for c in candles:
+                high_ret = _signed_return(float(c["high"]), entry_price, side)
+                low_ret = _signed_return(float(c["low"]), entry_price, side)
+                signed_highs.append((max(high_ret, low_ret), c["time"]))
+                signed_lows.append((min(high_ret, low_ret), c["time"]))
+            if signed_highs:
+                mfe, mfe_time = max(signed_highs, key=lambda x: x[0])
+                mae, mae_time = min(signed_lows, key=lambda x: x[0])
+            else:
+                mfe, mfe_time, mae, mae_time = 0.0, None, 0.0, None
+            strategy_source = row["strategy_source"] or "unknown"
+            category = category_for(row["symbol"], {}, strategy_source)
+            pnl_pct = _pct_for_review(row["pnl_pct"])
+            net_pnl = float(row["net_pnl"] or 0)
+            label = _exit_review_label(pnl_pct, mfe, mae, category, strategy_source, len(candles))
+            holding_minutes = ((exit_dt - entry_dt).total_seconds() / 60.0) if entry_dt else None
+            evidence = {
+                "bars_observed": len(candles),
+                "thresholds": _exit_review_thresholds(category, strategy_source),
+                "returns": {str(k): returns.get(k) for k in WINDOWS},
+            }
+            payload.append(
+                (
+                    row["position_trade_id"], row["symbol"], strategy_source, row["alpha_symbol"],
+                    side, category, row["entry_time"], row["exit_time"], row["exit_reason"],
+                    net_pnl, pnl_pct, holding_minutes, returns.get(1), returns.get(4),
+                    returns.get(12), returns.get(24), returns.get(72), mfe, mae,
+                    mfe_time, mae_time, label,
+                    _exit_review_summary(row["symbol"], row["exit_reason"], net_pnl, mfe, label),
+                    dumps(evidence),
+                )
+            )
+        if payload:
+            conn.executemany(
+                """INSERT INTO trade_exit_reviews
+                   (position_trade_id, symbol, strategy_source, alpha_symbol, side, category,
+                    entry_time, exit_time, exit_reason, net_pnl, pnl_pct, holding_minutes,
+                    return_1h, return_4h, return_12h, return_24h, return_72h,
+                    max_favorable_return, max_adverse_return, max_favorable_time,
+                    max_adverse_time, review_label, review_summary, evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(position_trade_id) DO UPDATE SET
+                    return_1h=excluded.return_1h,
+                    return_4h=excluded.return_4h,
+                    return_12h=excluded.return_12h,
+                    return_24h=excluded.return_24h,
+                    return_72h=excluded.return_72h,
+                    max_favorable_return=excluded.max_favorable_return,
+                    max_adverse_return=excluded.max_adverse_return,
+                    max_favorable_time=excluded.max_favorable_time,
+                    max_adverse_time=excluded.max_adverse_time,
+                    review_label=excluded.review_label,
+                    review_summary=excluded.review_summary,
+                    evidence_json=excluded.evidence_json,
+                    updated_at=datetime('now')""",
+                payload,
+            )
+        conn.commit()
+        return {"reviewed": len(payload), "scanned": len(rows)}
+    finally:
+        conn.close()
+
+
+def summarize_exit_reviews(window_days: int = 7, recent_limit: int = 30) -> dict:
+    init_db()
+    review_position_trade_exits(limit=500)
+    conn = get_conn()
+    run_time = utc_now()
+    cutoff = iso_z(datetime.now(timezone.utc) - timedelta(days=window_days))
+    try:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                """SELECT *
+                   FROM trade_exit_reviews
+                   WHERE datetime(exit_time) >= datetime(?)
+                   ORDER BY datetime(exit_time) DESC
+                   LIMIT ?""",
+                (cutoff, recent_limit),
+            ).fetchall()
+        ]
+        groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+        for row in rows:
+            groups[(row.get("category") or "unknown", row.get("strategy_source") or "unknown", row.get("exit_reason") or "unknown")].append(row)
+        payload = []
+        summaries = []
+        for (category, source, reason), items in groups.items():
+            sample = len(items)
+            pnl_values = [float(x.get("net_pnl") or 0) for x in items]
+            labels = [x.get("review_label") or "unknown" for x in items]
+            good = labels.count("good_exit")
+            early = labels.count("early_exit")
+            noise = labels.count("noise_loss_exit")
+            small = labels.count("small_profit_exit")
+            late = labels.count("late_exit")
+            avg_mfe = _mean([x.get("max_favorable_return") for x in items])
+            avg_mae = _mean([x.get("max_adverse_return") for x in items])
+            if sample >= 3 and good / sample >= 0.60 and early / sample < 0.25:
+                action_type = "keep"
+                conclusion = "继续保持"
+                summary_text = f"{reason}: 最近{sample}次触发，{good}次平仓有效，平均平仓后最大有利空间{avg_mfe*100:.2f}%，规则暂时有效。"
+            elif sample >= 3 and max(early, noise, small) / sample >= 0.40:
+                action_type = "improve"
+                conclusion = "需要优化"
+                if early >= noise and early >= small:
+                    focus = "过早平仓"
+                elif noise >= small:
+                    focus = "小亏噪音洗出"
+                else:
+                    focus = "小盈利吃得太少"
+                summary_text = f"{reason}: 最近{sample}次触发，{focus}占比{max(early, noise, small)/sample:.0%}，平均平仓后最大有利空间{avg_mfe*100:.2f}%，建议进入策略优化观察。"
+            else:
+                action_type = "watch"
+                conclusion = "继续观察"
+                summary_text = f"{reason}: 最近{sample}次触发，样本或方向暂不稳定，继续观察。"
+            summary_id = stable_id("exit_summary", window_days, category, source, reason)
+            payload.append(
+                (
+                    summary_id, run_time, window_days, category, source, reason, sample,
+                    sum(1 for v in pnl_values if v > 0), sum(1 for v in pnl_values if v <= 0),
+                    _mean(pnl_values), sum(pnl_values), avg_mfe, avg_mae,
+                    good, early, noise, small, late, conclusion, action_type, summary_text,
+                )
+            )
+            summaries.append({
+                "summary_id": summary_id,
+                "run_time": run_time,
+                "window_days": window_days,
+                "category": category,
+                "strategy_source": source,
+                "exit_reason": reason,
+                "sample_size": sample,
+                "win_count": sum(1 for v in pnl_values if v > 0),
+                "loss_count": sum(1 for v in pnl_values if v <= 0),
+                "avg_pnl": _mean(pnl_values),
+                "total_pnl": sum(pnl_values),
+                "avg_mfe_after_exit": avg_mfe,
+                "avg_mae_after_exit": avg_mae,
+                "good_exit_count": good,
+                "early_exit_count": early,
+                "noise_loss_exit_count": noise,
+                "small_profit_exit_count": small,
+                "late_exit_count": late,
+                "conclusion": conclusion,
+                "action_type": action_type,
+                "summary_text": summary_text,
+            })
+        if payload:
+            conn.executemany(
+                """INSERT OR REPLACE INTO exit_review_summaries
+                   (summary_id, run_time, window_days, category, strategy_source,
+                    exit_reason, sample_size, win_count, loss_count, avg_pnl,
+                    total_pnl, avg_mfe_after_exit, avg_mae_after_exit,
+                    good_exit_count, early_exit_count, noise_loss_exit_count,
+                    small_profit_exit_count, late_exit_count, conclusion,
+                    action_type, summary_text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                payload,
+            )
+        conn.commit()
+        return {"run_time": run_time, "window_days": window_days, "samples": len(rows), "summaries": summaries}
+    finally:
+        conn.close()
+
+
+def fetch_exit_reviews(limit: int = 100) -> list[dict]:
+    init_db()
+    review_position_trade_exits(limit=500)
+    conn = get_conn()
+    try:
+        return [
+            {**dict(r), "evidence": loads(r["evidence_json"], {})}
+            for r in conn.execute(
+                """SELECT *
+                   FROM trade_exit_reviews
+                   ORDER BY datetime(exit_time) DESC, id DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def fetch_exit_review_summaries(limit: int = 100) -> list[dict]:
+    init_db()
+    conn = get_conn()
+    try:
+        latest = conn.execute("SELECT MAX(run_time) AS run_time FROM exit_review_summaries").fetchone()["run_time"]
+        if not latest:
+            summarize_exit_reviews()
+            latest = conn.execute("SELECT MAX(run_time) AS run_time FROM exit_review_summaries").fetchone()["run_time"]
+        if not latest:
+            return []
+        return [
+            dict(r)
+            for r in conn.execute(
+                """SELECT *
+                   FROM exit_review_summaries
+                   WHERE run_time = ?
+                   ORDER BY
+                     CASE action_type WHEN 'improve' THEN 0 WHEN 'watch' THEN 1 ELSE 2 END,
+                     sample_size DESC
+                   LIMIT ?""",
+                (latest, limit),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
 def run_policy_review(days: int = 14) -> dict:
     label_decision_outcomes()
+    summarize_exit_reviews(window_days=7, recent_limit=30)
     conn = get_conn()
     run_time = utc_now()
     cutoff = iso_z(datetime.now(timezone.utc) - timedelta(days=days))
@@ -814,6 +1134,7 @@ def policy_guard() -> dict:
 
 
 def fetch_policy_loop_summary(limit: int = 200) -> dict:
+    summarize_exit_reviews(window_days=7, recent_limit=30)
     conn = get_conn()
     try:
         latest_review = conn.execute("SELECT MAX(run_time) AS run_time FROM policy_reviews").fetchone()["run_time"]
@@ -896,6 +1217,8 @@ def fetch_policy_loop_summary(limit: int = 200) -> dict:
                 (limit,),
             ).fetchall()
         ]
+        exit_reviews = fetch_exit_reviews(limit=100)
+        exit_summaries = fetch_exit_review_summaries(limit=100)
         return {
             "generated_at": utc_now(),
             "latest_review_time": latest_review,
@@ -905,6 +1228,8 @@ def fetch_policy_loop_summary(limit: int = 200) -> dict:
             "candidates": candidates,
             "versions": versions,
             "actions": actions,
+            "exit_reviews": exit_reviews,
+            "exit_summaries": exit_summaries,
             "entry_policy": _read_json(ENTRY_POLICY_PATH, {}),
             "exit_policy": _read_json(EXIT_POLICY_PATH, {}),
         }

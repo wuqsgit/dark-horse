@@ -22,8 +22,12 @@ from shared.db import (
 )
 from shared.policy_loop import (
     fetch_policy_loop_summary,
+    fetch_exit_reviews,
+    fetch_exit_review_summaries,
     generate_and_activate_policies,
     label_decision_outcomes,
+    review_position_trade_exits,
+    summarize_exit_reviews,
     clear_legacy_backtest_data,
 )
 
@@ -819,6 +823,8 @@ async def get_backtest_summary(user=Depends(get_user)):
             "candidates": data.get("candidates", []),
             "versions": data.get("versions", []),
             "actions": data.get("actions", [])[:80],
+            "exit_reviews": data.get("exit_reviews", [])[:100],
+            "exit_summaries": data.get("exit_summaries", [])[:100],
             "entry_policy": data.get("entry_policy", {}),
             "exit_policy": data.get("exit_policy", {}),
             "grades": [],
@@ -918,6 +924,33 @@ async def run_policy_review_now(user=Depends(get_user)):
         return {"status": "ok", **result}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/api/policy/exit-review/run")
+async def run_exit_review_now(user=Depends(get_user)):
+    try:
+        reviewed = review_position_trade_exits(limit=1000)
+        summary = summarize_exit_reviews(window_days=7, recent_limit=30)
+        _api_cache.pop("policy_loop_summary", None)
+        return {"status": "ok", "reviewed": reviewed, "summary": summary}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/backtest/exit-reviews")
+async def get_exit_reviews(limit: int = 100, user=Depends(get_user)):
+    try:
+        return {"reviews": fetch_exit_reviews(limit=limit)}
+    except Exception as e:
+        return {"error": str(e), "reviews": []}
+
+
+@app.get("/api/backtest/exit-review-summary")
+async def get_exit_review_summary(limit: int = 100, user=Depends(get_user)):
+    try:
+        return {"summaries": fetch_exit_review_summaries(limit=limit)}
+    except Exception as e:
+        return {"error": str(e), "summaries": []}
 
 
 @app.post("/api/policy/outcomes/label")
@@ -1135,7 +1168,7 @@ async def update_trading_controls(body: dict, user=Depends(get_user)):
 
 
 def _build_local_trading_status(error=None):
-    from shared.db import fetch_position_trade_groups, get_conn
+    from shared.db import fetch_position_trade_groups, get_conn, rebuild_position_trades_from_income
     from trader.config import TRADING_CONFIG
 
     controls = _safe_trading_runtime_controls()
@@ -1149,8 +1182,11 @@ def _build_local_trading_status(error=None):
                 "SELECT * FROM positions_history WHERE time = ? ORDER BY symbol",
                 (latest_snapshot,),
             ).fetchall()
-        recent_trades = fetch_position_trade_groups(100)
-        grouped_stats = _grouped_trade_stats(recent_trades)
+        recent_trades = [
+            r for r in fetch_position_trade_groups(150)
+            if r.get("symbol") != "ACCOUNT"
+        ][:100]
+        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
         total_trades = grouped_stats["total_trades"]
         total_pnl = grouped_stats["total_pnl"]
         total_closed = grouped_stats["total_closed"]
@@ -1213,13 +1249,19 @@ def _build_local_trading_status(error=None):
 
 def _grouped_trade_stats(grouped_trades):
     rows = [r for r in (grouped_trades or []) if r.get("exit_time")]
+    position_rows = [
+        r for r in rows
+        if not r.get("is_adjustment") and r.get("symbol") != "ACCOUNT"
+    ]
     total_pnl = sum(float(r.get("pnl") or 0) for r in rows)
-    wins = [r for r in rows if float(r.get("pnl") or 0) > 0]
-    losses = [r for r in rows if float(r.get("pnl") or 0) <= 0]
+    adjustment_pnl = sum(float(r.get("pnl") or 0) for r in rows if r not in position_rows)
+    position_pnl = sum(float(r.get("pnl") or 0) for r in position_rows)
+    wins = [r for r in position_rows if float(r.get("pnl") or 0) > 0]
+    losses = [r for r in position_rows if float(r.get("pnl") or 0) <= 0]
     total_win = sum(float(r.get("pnl") or 0) for r in wins)
     total_loss = abs(sum(float(r.get("pnl") or 0) for r in losses))
     reason_stats = {}
-    for r in rows:
+    for r in position_rows:
         reason = r.get("exit_reason") or "unknown"
         reason_stats.setdefault(reason, {"count": 0, "total_pnl": 0.0, "wins": 0})
         reason_stats[reason]["count"] += 1
@@ -1227,12 +1269,14 @@ def _grouped_trade_stats(grouped_trades):
         if float(r.get("pnl") or 0) > 0:
             reason_stats[reason]["wins"] += 1
     return {
-        "total_trades": len(rows),
-        "total_closed": len(rows),
+        "total_trades": len(position_rows),
+        "total_closed": len(position_rows),
         "total_pnl": total_pnl,
+        "position_pnl": position_pnl,
+        "adjustment_pnl": adjustment_pnl,
         "win_count": len(wins),
         "loss_count": len(losses),
-        "win_rate": round(len(wins) / len(rows) * 100, 2) if rows else 0,
+        "win_rate": round(len(wins) / len(position_rows) * 100, 2) if position_rows else 0,
         "profit_ratio": round(total_win / total_loss, 2) if total_loss else 0,
         "reason_stats": {
             k: {
@@ -1252,7 +1296,7 @@ async def get_trading_status(user=Depends(get_user)):
     import time
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from shared.db import fetch_position_trade_groups, get_conn
+    from shared.db import fetch_position_trade_groups, get_conn, rebuild_position_trades_from_income
 
     # Check cache.
     if _trading_status_cache["data"] and time.time() - _trading_status_cache["time"] < _CACHE_TTL:
@@ -1289,12 +1333,22 @@ async def get_trading_status(user=Depends(get_user)):
         balance = margin_data["totalWalletBalance"]
         margin_balance = margin_data.get("totalMarginBalance") or balance
         positions = ex.get_positions()
+        unrealized_total = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
+        rebuild_position_trades_from_income(
+            account_pnl=(float(balance) - float(INITIAL_CAPITAL)) if isinstance(balance, (int, float)) else None,
+            unrealized_pnl=unrealized_total,
+        )
         conn = get_conn()
-        recent_trades = fetch_position_trade_groups(100)
-        grouped_stats = _grouped_trade_stats(recent_trades)
+        recent_trades = [
+            r for r in fetch_position_trade_groups(150)
+            if r.get("symbol") != "ACCOUNT"
+        ][:100]
+        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
         total_trades = grouped_stats["total_trades"]
         total_closed = grouped_stats["total_closed"]
         total_pnl = grouped_stats["total_pnl"]
+        position_pnl = grouped_stats.get("position_pnl", total_pnl)
+        adjustment_pnl = grouped_stats.get("adjustment_pnl", 0)
         win_count = grouped_stats["win_count"]
         loss_count = grouped_stats["loss_count"]
         win_rate = grouped_stats["win_rate"]
@@ -1384,6 +1438,15 @@ async def get_trading_status(user=Depends(get_user)):
                     "tp1_hit": False,
                     "tp2_hit": False,
                     "highest_price": None,
+                    "lowest_price": None,
+                    "stop_model": None,
+                    "initial_stop_loss": None,
+                    "stop_pct": None,
+                    "current_stop_loss": None,
+                    "trailing_stop_price": None,
+                    "trailing_enabled": False,
+                    "trailing_atr_multiplier": None,
+                    "r_multiple": 0,
                     "last_exit_reason": None,
                     "last_exit_plain": None,
                     "strategy_source": "normal",
@@ -1428,6 +1491,15 @@ async def get_trading_status(user=Depends(get_user)):
                 "tp1_hit": bool(r["tp1_hit"]) if "tp1_hit" in r.keys() else False,
                 "tp2_hit": bool(r["tp2_hit"]) if "tp2_hit" in r.keys() else False,
                 "highest_price": float(r["highest_price"] or 0) if "highest_price" in r.keys() else None,
+                "lowest_price": float(r["lowest_price"] or 0) if "lowest_price" in r.keys() else None,
+                "stop_model": r["stop_model"] if "stop_model" in r.keys() else None,
+                "initial_stop_loss": float(r["initial_stop_loss"] or 0) if "initial_stop_loss" in r.keys() else None,
+                "stop_pct": float(r["stop_pct"] or 0) if "stop_pct" in r.keys() else None,
+                "current_stop_loss": float(r["current_stop_loss"] or 0) if "current_stop_loss" in r.keys() else None,
+                "trailing_stop_price": float(r["trailing_stop_price"] or 0) if "trailing_stop_price" in r.keys() else None,
+                "trailing_enabled": bool(r["trailing_enabled"]) if "trailing_enabled" in r.keys() else False,
+                "trailing_atr_multiplier": float(r["trailing_atr_multiplier"] or 0) if "trailing_atr_multiplier" in r.keys() else None,
+                "r_multiple": float(r["r_multiple"] or 0) if "r_multiple" in r.keys() else 0,
                 "last_exit_reason": r["last_exit_reason"] if "last_exit_reason" in r.keys() else None,
                 "last_exit_plain": plain_reason(r["last_exit_reason"]) if "last_exit_reason" in r.keys() else None,
                 "strategy_source": r["strategy_source"] if "strategy_source" in r.keys() else "normal",
@@ -1549,7 +1621,11 @@ async def get_trading_status(user=Depends(get_user)):
             # stats 瀛楁
             "total_pnl": round(balance - INITIAL_CAPITAL, 2) if isinstance(balance, (int, float)) else 0,
             "trades_pnl": round(total_pnl, 2),
-            "income_pnl": round(conn.execute("SELECT SUM(pnl) FROM trades WHERE source='income_auto'").fetchone()[0] or 0, 2),
+            "realized_pnl": round(total_pnl, 2),
+            "position_pnl": round(position_pnl, 2),
+            "adjustment_pnl": round(adjustment_pnl, 2),
+            "income_pnl": round(conn.execute("SELECT COALESCE(SUM(income),0) FROM exchange_income_ledger").fetchone()[0] or 0, 2),
+            "reconcile_diff": round((balance - INITIAL_CAPITAL) - total_pnl - unrealized_total, 2) if isinstance(balance, (int, float)) else 0,
             "current_positions": len(positions),
             "total_opens": total_trades,
             "total_closed": total_closed,
@@ -1589,12 +1665,14 @@ async def get_trading_status(user=Depends(get_user)):
 
 @app.get("/api/trading/stats")
 async def get_trading_stats(user=Depends(get_user)):
-    from shared.db import fetch_position_trade_groups, get_conn
+    from shared.db import fetch_position_trade_groups, get_conn, rebuild_position_trades_from_income
     conn = get_conn()
     try:
-        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(500))
+        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
         total_closed = grouped_stats["total_closed"]
         total_pnl = grouped_stats["total_pnl"]
+        position_pnl = grouped_stats.get("position_pnl", total_pnl)
+        adjustment_pnl = grouped_stats.get("adjustment_pnl", 0)
         win_count = grouped_stats["win_count"]
         loss_count = grouped_stats["loss_count"]
         win_rate = grouped_stats["win_rate"]
@@ -1614,6 +1692,8 @@ async def get_trading_stats(user=Depends(get_user)):
         return {
             "total_pnl": round(total_pnl, 2),
             "realized_pnl": round(total_pnl, 2),
+            "position_pnl": round(position_pnl, 2),
+            "adjustment_pnl": round(adjustment_pnl, 2),
             "current_positions": current_pos,
             "total_opens": total_opens,
             "total_closed": total_closed,
