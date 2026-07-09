@@ -1756,6 +1756,63 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
                     return True
             return False
 
+        def order_side_to_position_side(order_side):
+            side_text = (order_side or "").upper()
+            if side_text == "BUY":
+                return "LONG"
+            if side_text == "SELL":
+                return "SHORT"
+            return None
+
+        def latest_open_order_before(symbol, dt):
+            if not dt:
+                return None
+            return conn.execute(
+                """SELECT *
+                   FROM orders
+                   WHERE symbol=?
+                     AND order_type='MARKET'
+                     AND datetime(created_at) <= datetime(?)
+                   ORDER BY datetime(created_at) DESC, id DESC
+                   LIMIT 1""",
+                (symbol, _format_db_time(dt)),
+            ).fetchone()
+
+        def latest_position_snapshot_before(symbol, dt):
+            if not dt:
+                return None
+            return conn.execute(
+                """SELECT *
+                   FROM positions_history
+                   WHERE symbol=?
+                     AND datetime(time) <= datetime(?)
+                   ORDER BY datetime(time) DESC, id DESC
+                   LIMIT 1""",
+                (symbol, _format_db_time(dt)),
+            ).fetchone()
+
+        def row_time(row, column):
+            if row is None:
+                return None
+            try:
+                return _parse_db_time(row[column])
+            except Exception:
+                return None
+
+        def infer_exit_price(side, entry_price, qty, realized_pnl):
+            try:
+                entry = float(entry_price or 0)
+                amount = float(qty or 0)
+                pnl_value = float(realized_pnl or 0)
+            except Exception:
+                return None
+            if entry <= 0 or amount <= 0:
+                return None
+            delta = pnl_value / amount
+            if (side or "").upper() == "SHORT":
+                return entry - delta
+            return entry + delta
+
         conn.execute("DELETE FROM position_trades")
         groups = []
         real_by_symbol = {}
@@ -1864,10 +1921,11 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
                    WHERE symbol=?
                      AND exit_time IS NOT NULL
                      AND exit_time != 'N/A'
+                     AND datetime(exit_time) <= datetime(?, '+5 minutes')
                      AND ABS(strftime('%s', exit_time) - strftime('%s', ?)) <= 3600
                    ORDER BY ABS(strftime('%s', exit_time) - strftime('%s', ?))
                    LIMIT 1""",
-                (symbol, _format_db_time(last_dt), _format_db_time(last_dt)),
+                (symbol, _format_db_time(last_dt), _format_db_time(last_dt), _format_db_time(last_dt)),
             ).fetchone()
             side = meta["side"] if meta and "side" in meta.keys() else None
             strategy_source = meta["strategy_source"] if meta and "strategy_source" in meta.keys() else "unknown"
@@ -1878,9 +1936,37 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
             qty = meta["quantity"] if meta and "quantity" in meta.keys() else None
             entry_reason = meta["entry_reason"] if meta and "entry_reason" in meta.keys() else None
             exit_reason = meta["exit_reason"] if meta and "exit_reason" in meta.keys() else "REALIZED_PNL"
-            entry_time = meta["entry_time"] if meta and "entry_time" in meta.keys() else _format_db_time(first_dt)
+            entry_time = meta["entry_time"] if meta and "entry_time" in meta.keys() else None
+            open_order = latest_open_order_before(symbol, first_dt or last_dt)
+            snapshot = latest_position_snapshot_before(symbol, last_dt or first_dt)
+            open_dt = row_time(open_order, "created_at")
+            snapshot_dt = row_time(snapshot, "time")
+            prefer_snapshot = snapshot_dt and (not open_dt or snapshot_dt >= open_dt)
+            if prefer_snapshot and snapshot:
+                side = side or snapshot["side"]
+                entry_price = entry_price or snapshot["entry_price"]
+                qty = qty or snapshot["quantity"]
+                entry_time = entry_time or snapshot["time"]
+            if open_order and not prefer_snapshot:
+                side = side or order_side_to_position_side(open_order["side"])
+                strategy_source = strategy_source if strategy_source != "unknown" else (open_order["strategy_source"] or "unknown")
+                signal_source = signal_source or open_order["signal_source"]
+                alpha_symbol = alpha_symbol or open_order["alpha_symbol"]
+                entry_price = entry_price or open_order["price"]
+                qty = qty or open_order["quantity"]
+                entry_reason = entry_reason or open_order["reason"]
+                entry_time = entry_time or open_order["created_at"]
+            if snapshot:
+                side = side or snapshot["side"]
+                entry_price = entry_price or snapshot["entry_price"]
+                qty = qty or snapshot["quantity"]
+                entry_time = entry_time or snapshot["time"]
+            entry_time = entry_time or _format_db_time(first_dt)
+            if not exit_price:
+                exit_price = infer_exit_price(side, entry_price, qty, g["pnl"])
             notional = float(entry_price or 0) * float(qty or 0)
-            margin = notional / 3 if notional else 0
+            leverage = snapshot["leverage"] if snapshot and "leverage" in snapshot.keys() else 3
+            margin = notional / max(float(leverage or 3), 1) if notional else 0
             net_pnl = g["pnl"] + g.get("commission", 0.0) + g.get("funding_fee", 0.0) + g.get("adjustment", 0.0)
             pnl_pct = (net_pnl / margin * 100) if margin else None
             conn.execute(
@@ -2015,10 +2101,10 @@ def fetch_position_trade_groups(limit=100):
         for r in rows:
             d = dict(r)
             d["pnl"] = round(float(d.get("pnl") or 0), 2)
-            d["pnl_pct"] = round(float(d.get("pnl_pct") or 0), 2) if d.get("pnl_pct") is not None else 0
-            d["qty"] = round(float(d.get("quantity") or 0), 6)
-            d["entry_price"] = round(float(d.get("entry_price") or 0), 8)
-            d["exit_price"] = round(float(d.get("exit_price") or 0), 8)
+            d["pnl_pct"] = round(float(d.get("pnl_pct")), 2) if d.get("pnl_pct") is not None else None
+            d["qty"] = round(float(d.get("quantity")), 6) if d.get("quantity") is not None else None
+            d["entry_price"] = round(float(d.get("entry_price")), 8) if d.get("entry_price") is not None else None
+            d["exit_price"] = round(float(d.get("exit_price")), 8) if d.get("exit_price") is not None else None
             d["is_grouped"] = True
             d["is_adjustment"] = d.get("source") == "reconcile_adjustment"
             result.append(d)

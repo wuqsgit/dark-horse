@@ -12,6 +12,24 @@ function fmt(v, digits = 2) {
   return Number.isFinite(n) ? n.toFixed(digits) : '-';
 }
 
+function fmtValue(v, digits = 2) {
+  if (v === null || v === undefined || v === '') return '-';
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(digits) : '-';
+}
+
+function sideText(side) {
+  if (side === 'LONG') return '多';
+  if (side === 'SHORT') return '空';
+  return '-';
+}
+
+function sideColor(side) {
+  if (side === 'LONG') return '#22c55e';
+  if (side === 'SHORT') return '#ef4444';
+  return '#9ca3af';
+}
+
 function timeText(value) {
   if (!value) return '-';
   const text = String(value).trim();
@@ -364,12 +382,12 @@ export default function LiveTrading() {
                       {t.alpha_symbol ? <span className="mini-pill" style={{ marginLeft: 6 }}>{t.alpha_symbol}</span> : null}
                     </td>
                     <td>{sourceText(t.strategy_source)}{t.alpha_profile ? ` · ${alphaProfileText(t.alpha_profile)}` : ''}</td>
-                    <td style={{ color: t.side === 'LONG' ? '#22c55e' : '#ef4444' }}>{t.side === 'LONG' ? '多' : '空'}</td>
-                    <td>{t.qty || t.quantity}</td>
-                    <td>${fmt(t.entry_price, 4)}</td>
-                    <td>{t.exit_price ? '$' + fmt(t.exit_price, 4) : '-'}</td>
+                    <td style={{ color: sideColor(t.side) }}>{sideText(t.side)}</td>
+                    <td>{fmtValue(t.qty ?? t.quantity, 6)}</td>
+                    <td>{t.entry_price ? `$${fmtValue(t.entry_price, 4)}` : '-'}</td>
+                    <td>{t.exit_price ? `$${fmtValue(t.exit_price, 4)}` : '-'}</td>
                     <td style={pnlColor(t.pnl)}>{Number(t.pnl || 0) >= 0 ? '+' : ''}${fmt(t.pnl)}</td>
-                    <td style={pnlColor(t.pnl_pct)}>{t.pnl_pct != null ? `${fmt(t.pnl_pct)}%` : '-'}</td>
+                    <td style={pnlColor(t.pnl_pct)}>{t.pnl_pct != null ? `${fmtValue(t.pnl_pct)}%` : '-'}</td>
                     <td>{t.grade_at_entry || '-'} {t.score_at_entry != null ? fmt(t.score_at_entry, 1) : ''}</td>
                     <td>{timeText(t.exit_time || t.entry_time)}</td>
                   </tr>
