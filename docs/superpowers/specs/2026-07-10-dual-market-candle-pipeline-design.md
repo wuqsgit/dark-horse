@@ -153,6 +153,9 @@ CREATE TABLE market_universe (
     universe_rank INTEGER,
     selected INTEGER DEFAULT 0,
     forced_position INTEGER DEFAULT 0,
+    data_ready INTEGER DEFAULT 0,
+    data_error TEXT,
+    data_checked_at TEXT,
     selection_reason TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (pool_type, source_symbol)
@@ -194,16 +197,17 @@ Normal Top 150 and Alpha Top 80 may map to the same futures symbol. Build one un
 
 Collection cadence remains every 10 minutes.
 
-- 15m: request enough pages to maintain at least 14 days for active symbols.
-- 1h: maintain up to 90 days.
-- 6h: maintain up to 90 days.
-- 24h: maintain up to 90 days.
+- Every cycle re-fetches the latest 48 candles for each interval and uses `INSERT OR REPLACE`.
+- Re-fetching the rolling 48-candle window automatically repairs recent gaps without a separate repair queue.
+- A failed symbol is retried immediately up to two additional times in the same cycle.
+- Initial backfill may request older pages, but normal cycles never re-download the full history.
+- All intervals are pruned at 90 days.
 
-Incremental collection requests only the missing range after initial backfill. Never re-download the full history every 10 minutes.
+The implementation intentionally avoids a separate gap-repair scheduler, snapshot state machine, or multi-stage alert workflow.
 
 ## 8. Data Quality Gates
 
-Before a symbol can enter an opening candidate list:
+After each collection cycle, perform one readiness check for every selected or forced symbol:
 
 - Spot 15m newest candle age must be at most 20 minutes.
 - Futures 15m newest candle age must be at most 20 minutes.
@@ -211,7 +215,8 @@ Before a symbol can enter an opening candidate list:
 - Futures 1h newest candle age must be at most 75 minutes.
 - At least 32 closed 15m candles must exist on both required markets.
 - At least 48 closed 1h candles must exist on both required markets.
-- The latest spot and futures candle timestamps must differ by no more than one interval.
+
+For Alpha, replace Binance spot checks with Alpha spot checks. If all checks pass, set `market_universe.data_ready=1` and clear `data_error`. Otherwise set `data_ready=0`, store one concise reason, and keep the symbol out of scoring and new entries until a later cycle succeeds.
 
 Reject reasons are explicit:
 
@@ -219,10 +224,11 @@ Reject reasons are explicit:
 - `futures_candles_stale`
 - `spot_candles_insufficient`
 - `futures_candles_insufficient`
-- `dual_market_timestamp_mismatch`
 - `not_in_selected_universe`
 
-Held-position risk management never stops because spot data is stale. Hard stops and protective futures-side logic continue from futures price data; only optional volume-based exits degrade to hold/observe.
+Engine only scores rows with `selected=1 AND data_ready=1`. Trader checks `data_ready` again immediately before submitting a new opening order, so an old scan result cannot bypass the gate.
+
+Held-position risk management never stops because `data_ready=0`. Hard stops and protective futures-side logic continue from exchange Mark Price and futures data; only new entries, additions, and optional volume-based exits are blocked or degraded to hold.
 
 ## 9. Feature Ownership
 
@@ -363,26 +369,17 @@ Rollback keeps the database backup and code branch. Because the schema change is
 
 ## 13. Monitoring
 
-Every cycle logs and exposes:
+Keep monitoring intentionally small. Every cycle logs and exposes:
 
-- Normal selected count, expected `150` unless fewer eligible symbols exist.
-- Alpha selected count, expected `80` unless fewer eligible symbols exist.
+- Normal readiness, for example `150/150`.
+- Alpha readiness, for example `80/80`.
 - Forced-position count.
-- Spot/futures/Alpha request success and failure counts.
-- Fresh 15m and 1h coverage per pool.
-- Maximum candle age per source.
-- Timestamp mismatch count.
-- Symbols rejected by each quality gate.
-- Collection duration and inserted row count by table.
+- Symbols with `data_ready=0` and their single `data_error` reason.
+- Collection duration.
 
-Alert conditions:
+The frontend shows green only when the selected pool is fully ready. Otherwise it shows the ready count and missing symbols. New entries are automatically disabled only for the affected symbols; no separate alert state machine is introduced.
 
-- Selected pool coverage below 100% after a completed cycle.
-- Any selected symbol missing one required market.
-- 15m candle age above 20 minutes.
-- 1h candle age above 75 minutes.
-- Repeated HTTP 400 for a selected symbol.
-- Collection duration exceeds the 10-minute schedule interval.
+The service log uses warning level when readiness is below the selected count or collection duration exceeds 10 minutes.
 
 ## 14. Testing
 
@@ -394,6 +391,9 @@ Unit tests:
 - Spot writes cannot enter futures tables and vice versa.
 - Duplicate futures symbols across normal and Alpha pools are requested once.
 - Freshness and bar-count gates produce exact rejection reasons.
+- Rolling 48-candle upserts restore a simulated recent gap.
+- A failed symbol is retried at most two additional times.
+- `data_ready=0` prevents scoring and opening.
 - Dual-market volume states cover synchronized and divergent scenarios.
 - ATR, R:R, and post-exit review read futures candles.
 
@@ -401,6 +401,7 @@ Integration tests:
 
 - Run one collection cycle against mocked spot/futures/Alpha APIs.
 - Verify selected counts, source-isolated rows, and universe state.
+- Verify readiness counts become `150/150` and `80/80` after a successful cycle.
 - Simulate a symbol leaving Top 150 while held.
 - Simulate one market becoming stale while futures hard-stop management continues.
 - Verify 90-day cleanup leaves current data intact.
@@ -419,3 +420,4 @@ The change is complete only when:
 8. Existing positions continue risk management after leaving a top pool.
 9. B2-style mapped Alpha positions retain correct Alpha and futures provenance.
 10. All candle tables contain no rows older than 90 days.
+11. A failed or incomplete symbol is marked `data_ready=0`, excluded from scoring, and rejected again by Trader before opening.
