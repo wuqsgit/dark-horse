@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "alphadog.db")
-RETENTION_DAYS = 5
+RETENTION_DAYS = 4
 
 OPERATIONAL_RETENTION_TABLES = {
     "candles_15m": "time",
