@@ -9,8 +9,12 @@ import httpx
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.db import (
-    insert_candles_1h, insert_candles_15m, insert_candles_6h, insert_candles_24h, insert_futures, upsert_symbol, insert_orderbook_snapshot
+    insert_candles_1h, insert_candles_15m, insert_candles_6h, insert_candles_24h,
+    insert_futures_candles, insert_futures, upsert_symbol, insert_orderbook_snapshot,
+    replace_market_universe, fetch_tracked_position_symbols, purge_old_kline_data, RETENTION_DAYS,
 )
+from shared.market_universe import build_normal_universe
+from pipeline.candle_health import refresh_universe_readiness, retry_async
 
 logger = logging.getLogger("binance")
 
@@ -19,68 +23,68 @@ class BinanceHTTPCollector:
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"})
 
-    async def get_top_pairs(self, limit=150):
-        """Get top USDT pairs by 24h quote volume from Binance futures"""
+    @staticmethod
+    def kline_request(market, symbol, interval):
+        if market == "spot":
+            url = "https://api.binance.com/api/v3/klines"
+        elif market == "futures":
+            url = "https://fapi.binance.com/fapi/v1/klines"
+        else:
+            raise ValueError(f"unsupported market: {market}")
+        return url, {"symbol": symbol, "interval": interval, "limit": 48}
+
+    async def get_normal_universe(self, limit=150):
+        """Get the liquid intersection of Binance spot and USDT perpetuals."""
         try:
-            resp = await self.client.get("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            if resp.status_code != 200:
-                logger.error(f"ticker/24hr: {resp.status_code}")
-                return []
-
-            data = resp.json()
-            pairs = []
-            for t in data:
-                sym = t.get("symbol", "")
-                if sym.endswith("USDT"):
-                    vol = float(t.get("quoteVolume", 0) or 0)
-                    trades = float(t.get("count", 0) or 0)
-                    change_abs = abs(float(t.get("priceChangePercent", 0) or 0))
-                    if vol > 100_000:
-                        pairs.append({
-                            "symbol": sym,
-                            "quote_volume": vol,
-                            "trades": trades,
-                            "abs_change": change_abs,
-                        })
-
-            by_volume = sorted(pairs, key=lambda x: -x["quote_volume"])[:limit]
-            by_change = sorted(
-                [p for p in pairs if p["quote_volume"] >= 500_000],
-                key=lambda x: -x["abs_change"],
-            )[: max(20, limit // 4)]
-            by_activity = sorted(
-                [p for p in pairs if p["quote_volume"] >= 300_000],
-                key=lambda x: -x["trades"],
-            )[: max(20, limit // 4)]
-
-            merged = {}
-            for bucket in (by_volume, by_change, by_activity):
-                for p in bucket:
-                    merged[p["symbol"]] = p
-
-            ranked = sorted(
-                merged.values(),
-                key=lambda x: (
-                    -x["quote_volume"],
-                    -x["abs_change"],
-                    -x["trades"],
-                ),
+            urls = (
+                "https://api.binance.com/api/v3/exchangeInfo",
+                "https://fapi.binance.com/fapi/v1/exchangeInfo",
+                "https://api.binance.com/api/v3/ticker/24hr",
+                "https://fapi.binance.com/fapi/v1/ticker/24hr",
             )
-            top = [p["symbol"] for p in ranked[: max(limit, len(ranked))]]
-            logger.info(
-                "Top %s pairs from volume/change/activity pools (top volume: $%s)",
-                len(top),
-                f"{by_volume[0]['quote_volume']:,.0f}" if by_volume else "0",
-            )
-            return top
+            responses = await asyncio.gather(*(self.client.get(url) for url in urls))
+            for response in responses:
+                response.raise_for_status()
+            spot_info, futures_info, spot_tickers, futures_tickers = (response.json() for response in responses)
+            spot_volumes = {row.get("symbol"): row.get("quoteVolume") for row in spot_tickers}
+            futures_volumes = {row.get("symbol"): row.get("quoteVolume") for row in futures_tickers}
+            spot = {
+                row["symbol"]: {"status": row.get("status"), "quote_volume": spot_volumes.get(row["symbol"], 0)}
+                for row in spot_info.get("symbols", []) if str(row.get("symbol", "")).endswith("USDT")
+            }
+            futures = {
+                row["symbol"]: {
+                    "status": row.get("status"), "contract_type": row.get("contractType"),
+                    "quote_volume": futures_volumes.get(row["symbol"], 0),
+                }
+                for row in futures_info.get("symbols", []) if str(row.get("symbol", "")).endswith("USDT")
+            }
+            selected = build_normal_universe(spot, futures, limit=limit)
+            selected_symbols = {row["source_symbol"] for row in selected}
+            for symbol in sorted(fetch_tracked_position_symbols() - selected_symbols):
+                if symbol not in spot or symbol not in futures:
+                    continue
+                forced = build_normal_universe({symbol: spot[symbol]}, {symbol: futures[symbol]}, limit=1)
+                if forced:
+                    forced[0].update(selected=False, forced_position=True, universe_rank=None, selection_reason="open_position")
+                    selected.extend(forced)
+            replace_market_universe("normal", selected)
+            logger.info("Normal dual-market universe: %s selected, %s forced", sum(r["selected"] for r in selected), sum(r["forced_position"] for r in selected))
+            return selected
 
         except Exception as e:
-            logger.error(f"get_top_pairs: {e}")
+            logger.error(f"get_normal_universe: {e}")
             return []
+
+    async def get_top_pairs(self, limit=150):
+        return [row["source_symbol"] for row in await self.get_normal_universe(limit)]
 
     async def collect_all(self, symbols: list):
         if not symbols:
             return
+
+        if isinstance(symbols[0], dict):
+            symbols = [row["futures_symbol"] for row in symbols if row.get("selected") or row.get("forced_position")]
 
         now_utc = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         now_ms = int(time.time() * 1000)
@@ -88,6 +92,7 @@ class BinanceHTTPCollector:
         rows_15m = []
         rows_6h = []
         rows_24h = []
+        futures_rows = {"futures_candles_1h": [], "futures_candles_15m": [], "futures_candles_6h": [], "futures_candles_24h": []}
         rows_fut = []
 
         # Pre-fetch futures data
@@ -107,58 +112,22 @@ class BinanceHTTPCollector:
             async with semaphore:
                 try:
                     pair = sym.replace("/", "")
+                    interval_tables = (("15m", rows_15m, "futures_candles_15m"), ("1h", rows_1h, "futures_candles_1h"), ("6h", rows_6h, "futures_candles_6h"), ("1d", rows_24h, "futures_candles_24h"))
+                    for interval, spot_rows, futures_table in interval_tables:
+                        for market, target in (("spot", spot_rows), ("futures", futures_rows[futures_table])):
+                            url, params = self.kline_request(market, pair, interval)
 
-                    # 1h klines (last 48)
-                    url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1h&limit=48"
-                    resp = await self.client.get(url)
-                    if resp.status_code == 200:
-                        for o in resp.json():
-                            rows_1h.append((
-                                datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                pair,
-                                float(o[1]), float(o[2]), float(o[3]), float(o[4]),
-                                float(o[5]), float(o[7]),
-                                int(o[8]),
-                            ))
+                            async def request(url=url, params=params):
+                                response = await self.client.get(url, params=params)
+                                response.raise_for_status()
+                                return response.json()
 
-                    # 15m klines (last 12h)
-                    url15 = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=15m&limit=48"
-                    resp15 = await self.client.get(url15)
-                    if resp15.status_code == 200:
-                        for o in resp15.json():
-                            rows_15m.append((
-                                datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                pair,
-                                float(o[1]), float(o[2]), float(o[3]), float(o[4]),
-                                float(o[5]), float(o[7]),
-                                int(o[8]),
-                            ))
-
-                    # 6h klines (last 12 days)
-                    url6h = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=6h&limit=48"
-                    resp6h = await self.client.get(url6h)
-                    if resp6h.status_code == 200:
-                        for o in resp6h.json():
-                            rows_6h.append((
-                                datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                pair,
-                                float(o[1]), float(o[2]), float(o[3]), float(o[4]),
-                                float(o[5]), float(o[7]),
-                                int(o[8]),
-                            ))
-
-                    # 24h klines (last 30 days)
-                    url24h = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1d&limit=30"
-                    resp24h = await self.client.get(url24h)
-                    if resp24h.status_code == 200:
-                        for o in resp24h.json():
-                            rows_24h.append((
-                                datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                pair,
-                                float(o[1]), float(o[2]), float(o[3]), float(o[4]),
-                                float(o[5]), float(o[7]),
-                                int(o[8]),
-                            ))
+                            for o in await retry_async(request, retries=2):
+                                target.append((
+                                    datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                    pair, float(o[1]), float(o[2]), float(o[3]), float(o[4]),
+                                    float(o[5]), float(o[7]), int(o[8]),
+                                ))
 
                     # Futures data
                     prem = premium_map.get(pair, {})
@@ -192,8 +161,13 @@ class BinanceHTTPCollector:
             insert_candles_6h(rows_6h)
         if rows_24h:
             insert_candles_24h(rows_24h)
+        for table, rows in futures_rows.items():
+            insert_futures_candles(table, rows)
         if rows_fut:
             insert_futures(rows_fut)
+
+        purge_old_kline_data(days=RETENTION_DAYS)
+        refresh_universe_readiness("normal")
 
         logger.info(f"Done: {len(rows_1h)} 1h + {len(rows_15m)} 15m + {len(rows_6h)} 6h + {len(rows_24h)} 24h + {len(rows_fut)} futures")
 

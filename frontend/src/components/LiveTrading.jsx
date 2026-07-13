@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import TradingAccountManager from './TradingAccountManager';
+import { findSelectedAccount, normalizeSelectedAccount } from './liveTradingAccountSelection';
 
 const TRADES_PER_PAGE = 20;
 
@@ -16,6 +18,18 @@ function fmtValue(v, digits = 2) {
   if (v === null || v === undefined || v === '') return '-';
   const n = Number(v);
   return Number.isFinite(n) ? n.toFixed(digits) : '-';
+}
+
+function marketPhaseText(v) {
+  const map = {
+    trend_up: '上涨趋势',
+    trend_down: '下跌趋势',
+    range: '震荡',
+    breakout_pending: '突破待确认',
+    breakdown_risk: '破位风险',
+    uncertain: '不确定',
+  };
+  return map[v] || v || '-';
 }
 
 function sideText(side) {
@@ -142,21 +156,31 @@ export default function LiveTrading() {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [warning, setWarning] = useState(null);
   const [tradePage, setTradePage] = useState(1);
   const [tradeFilter, setTradeFilter] = useState('all');
   const [switching, setSwitching] = useState(null);
   const [toast, setToast] = useState(null);
+  const [accountsData, setAccountsData] = useState({ accounts: [], summary: {} });
+  const [accountConfigs, setAccountConfigs] = useState([]);
+  const [selectedAccount, setSelectedAccount] = useState(null);
 
   const fetchAll = useCallback(async () => {
     try {
-      const res = await fetch('/api/trading/status');
-      const data = await res.json();
+      const [res, accountsRes, configsRes] = await Promise.all([
+        fetch('/api/trading/status'), fetch('/api/trading/accounts/status'), fetch('/api/trading/accounts'),
+      ]);
+      const [data, multi, configs] = await Promise.all([res.json(), accountsRes.json(), configsRes.json()]);
+      setAccountsData(multi);
+      setAccountConfigs(configs.accounts || []);
       if (data.error) {
-        setError('Binance API 数据不可用: ' + data.error);
+        setWarning('默认账户诊断暂时不可用：' + data.error);
         setStatus(null);
+        setError(null);
       } else {
         setStatus(data);
         setError(null);
+        setWarning(data.binance_warning || null);
       }
     } catch (e) {
       setError('加载实盘数据失败: ' + e.message);
@@ -171,9 +195,16 @@ export default function LiveTrading() {
     return () => clearInterval(id);
   }, [fetchAll]);
 
-  const positions = status?.positions || [];
-  const recentTrades = status?.recent_trades || [];
-  const stats = status?.stats || status || {};
+  useEffect(() => {
+    const normalized = normalizeSelectedAccount(selectedAccount, accountsData.accounts || []);
+    if (String(normalized) !== String(selectedAccount)) setSelectedAccount(normalized);
+  }, [accountsData.accounts, selectedAccount]);
+
+  const selectedRow = findSelectedAccount(selectedAccount, accountsData.accounts || []);
+  const positions = selectedRow?.positions || [];
+  const recentTrades = selectedRow?.recent_trades || [];
+  const stats = selectedRow?.stats || {};
+  const accountSummary = selectedRow || {};
   const filteredTrades = useMemo(() => {
     if (tradeFilter === 'all') return recentTrades;
     return recentTrades.filter((t) => (t.strategy_source || 'normal') === tradeFilter);
@@ -199,21 +230,23 @@ export default function LiveTrading() {
     setError(null);
     const modeText = mode === 'alpha' ? 'Alpha 交易' : '普通交易';
     try {
-      const res = await fetch('/api/trading/controls', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, enabled }),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const targets = accountConfigs.filter((item) => String(item.id) === String(selectedAccount));
+      if (!targets.length) throw new Error('请先选择具体账户');
+      const key = mode === 'alpha' ? 'alpha_trading_enabled' : 'normal_trading_enabled';
+      const results = await Promise.all(targets.map(async (account) => {
+        const res = await fetch(`/api/trading/accounts/${account.id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...account, [key]: enabled }),
+        });
+        return res.json();
+      }));
+      const failed = results.find((item) => item.error);
+      if (failed) throw new Error(failed.error);
       await fetchAll();
-      const closed = Number(data?.close_result?.closed || 0);
       if (enabled) {
-        showToast('success', `${modeText}已开启，下一轮实盘扫描会按新开关执行。`);
-      } else if (closed > 0) {
-        showToast('warning', `${modeText}已关闭，并已触发平仓 ${closed} 个持仓。`);
+        showToast('success', `${modeText}已开启，交易进程会自动加载账户配置。`);
       } else {
-        showToast('warning', `${modeText}已关闭，当前没有需要平掉的对应持仓。`);
+        showToast('warning', `${modeText}已关闭，仅停止新开仓，不会强制平掉已有仓位。`);
       }
     } catch (e) {
       showToast('error', `${modeText}切换失败：${e.message}`);
@@ -226,6 +259,21 @@ export default function LiveTrading() {
 
   return (
     <div className="trading-panel">
+      <div className="trading-section">
+        <TradingAccountManager accounts={accountConfigs} onChanged={fetchAll} />
+        <div className="account-tabs" role="tablist" aria-label="交易账户">
+          {(accountsData.accounts || []).map((account) => (
+            <button key={account.account_id} className={String(selectedAccount) === String(account.account_id) ? 'active' : ''} onClick={() => setSelectedAccount(account.account_id)}>
+              {account.account_name}<span className={`account-health ${account.status}`} />
+            </button>
+          ))}
+        </div>
+      </div>
+      {warning && (
+        <div className="trading-section" style={{ color: '#fbbf24', borderColor: '#92400e' }} role="status">
+          {warning}{status?.stale_age_seconds != null ? `（快照延迟 ${status.stale_age_seconds} 秒）` : ''}
+        </div>
+      )}
       {toast && (
         <div className={`trade-toast trade-toast-${toast.type}`} role="status">
           <span>{toast.message}</span>
@@ -253,7 +301,9 @@ export default function LiveTrading() {
               inactiveText: 'Alpha 开仓已关闭',
             },
           ].map((item) => {
-            const enabled = Boolean(status?.trading_controls?.[item.key]);
+            const enabled = selectedRow
+              ? Boolean(selectedRow[item.key])
+              : Boolean((accountsData.accounts || []).length && (accountsData.accounts || []).every((account) => account[item.key]));
             const relatedCount = positions.filter((p) => (p.strategy_source || 'normal') === item.mode).length;
             return (
               <div className="plain-card" key={item.mode}>
@@ -289,12 +339,12 @@ export default function LiveTrading() {
       <div className="trading-section">
         <h3>账户统计</h3>
         <div className="stats-grid">
-          <div className="stat-card"><div className="stat-label">账户余额</div><div className="stat-value">${fmt(status?.balance)}</div></div>
+          <div className="stat-card"><div className="stat-label">账户权益</div><div className="stat-value">${fmt(accountSummary.equity)}</div></div>
           <div className="stat-card"><div className="stat-label">当前持仓</div><div className="stat-value">{positions.length}</div></div>
-          <div className="stat-card"><div className="stat-label">开仓次数</div><div className="stat-value">{stats.total_opens || status?.total_trades || 0}</div></div>
+          <div className="stat-card"><div className="stat-label">开仓次数</div><div className="stat-value">{stats.total_opens || 0}</div></div>
           <div className="stat-card"><div className="stat-label">已平仓</div><div className="stat-value">{stats.total_closed || 0}</div></div>
           <div className="stat-card"><div className="stat-label">胜利/失败</div><div className="stat-value">{stats.win_count || 0} / {stats.loss_count || 0}</div></div>
-          <div className="stat-card"><div className="stat-label">总盈亏</div><div className="stat-value" style={pnlColor(status?.total_pnl)}>${fmt(status?.total_pnl)}</div></div>
+          <div className="stat-card"><div className="stat-label">总盈亏</div><div className="stat-value" style={pnlColor(accountSummary.total_pnl)}>${fmt(accountSummary.total_pnl)}</div></div>
         </div>
       </div>
 
@@ -305,7 +355,7 @@ export default function LiveTrading() {
         ) : (
           <div style={{ display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))' }}>
             {positions.map((p) => (
-              <div key={p.symbol} className="pos-card">
+              <div key={`${p.account_id || 'all'}-${p.symbol}`} className="pos-card">
                 <div className="pos-header">
                   <span className="pos-symbol">{p.symbol}</span>
                   <span className="pos-side" style={{ color: p.side === 'LONG' ? '#22c55e' : '#ef4444' }}>{p.side === 'LONG' ? '做多' : '做空'}</span>
@@ -337,13 +387,14 @@ export default function LiveTrading() {
                   <div className="pos-row"><span className="label">浮动盈亏/保证金</span><span className="value" style={pnlColor(p.unrealized_pnl)}>${fmt(p.unrealized_pnl)} ({fmt(p.pnl_pct)}%)</span></div>
                   <div className="position-rules">
                     <div><b>系统管理</b> 入场评分 {p.entry_score ? fmt(p.entry_score, 1) : '-'}</div>
+                    <div>市场状态：{marketPhaseText(p.market_phase?.phase)} · {p.market_phase?.confidence != null ? `${fmt(p.market_phase.confidence, 0)}分` : '-'} · {p.market_phase?.allow_roll ? '允许滚仓' : '不滚仓'}</div>
                     <div>TP1：{p.tp1_hit ? '已减过仓' : '未触发'} · TP2：{p.tp2_hit ? '已减过仓' : '未触发'}</div>
                     <div>最高跟踪价：{p.highest_price ? `$${fmt(p.highest_price, 4)}` : '-'}</div>
                     <div>止损模型：{p.stop_model || '-'} · 初始止损 {p.stop_pct ? `${fmt(Number(p.stop_pct) * 100, 2)}%` : '-'}</div>
-                    <div>当前R：{p.r_multiple != null ? `${fmt(p.r_multiple, 2)}R` : '-'} · 保护止损：{p.current_stop_loss ? `$${fmt(p.current_stop_loss, 4)}` : '-'}</div>
+                    <div>当前R：{p.r_multiple != null ? `${fmt(p.r_multiple, 2)}R` : '-'} · 保护止损：{p.protected_stop || p.current_stop_loss ? `$${fmt(p.protected_stop || p.current_stop_loss, 4)}` : '-'}</div>
                     <div>移动止损：{p.trailing_enabled ? '已启用' : '未启用'} · {p.trailing_stop_price ? `$${fmt(p.trailing_stop_price, 4)}` : '-'}</div>
-                    <div>上次系统动作：{p.last_exit_plain || p.last_exit_reason || '暂无'}</div>
-                    <div>滚仓层数：{p.roll_layer || 0}/2 · 保护利润：${fmt(p.protected_profit || 0)}</div>
+                    <div>上次系统动作：{p.last_system_action || p.last_exit_plain || p.last_exit_reason || '暂无'}</div>
+                    <div>滚仓：{p.roll_layer || 0}/1 · 状态 {p.roll_status || 'state_incomplete'} · 成交价 {p.roll_price ? `$${fmt(p.roll_price, 4)}` : '-'}</div>
                     <div>最高浮盈：${fmt(p.max_floating_pnl || 0)} · {p.roll_enabled ? '允许滚仓观察' : '暂不滚仓'}</div>
                     {p.roll_block_reason && <div>滚仓阻断：{p.roll_block_reason}</div>}
                   </div>
@@ -354,7 +405,7 @@ export default function LiveTrading() {
         )}
       </div>
 
-      <DecisionPanel panel={status?.decision_panel} />
+      <DecisionPanel panel={selectedRow?.decision_panel} />
 
       <div className="trading-section">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
@@ -388,7 +439,7 @@ export default function LiveTrading() {
                     <td>{t.exit_price ? `$${fmtValue(t.exit_price, 4)}` : '-'}</td>
                     <td style={pnlColor(t.pnl)}>{Number(t.pnl || 0) >= 0 ? '+' : ''}${fmt(t.pnl)}</td>
                     <td style={pnlColor(t.pnl_pct)}>{t.pnl_pct != null ? `${fmtValue(t.pnl_pct)}%` : '-'}</td>
-                    <td>{t.grade_at_entry || '-'} {t.score_at_entry != null ? fmt(t.score_at_entry, 1) : ''}</td>
+                    <td>{t.score_at_entry != null ? `${t.grade_at_entry ? `${t.grade_at_entry} ` : ''}${fmt(t.score_at_entry, 1)}` : '-'}</td>
                     <td>{timeText(t.exit_time || t.entry_time)}</td>
                   </tr>
                 ))}

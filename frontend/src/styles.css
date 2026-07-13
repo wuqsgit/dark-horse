@@ -141,6 +141,36 @@ button:disabled {
   font-weight: 700;
 }
 
+.terminal-status.degraded { color: #fbbf24; border-color: #92400e; }
+.account-manager-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.account-manager-head h3 { margin-bottom: 4px; }
+.account-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.account-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.account-tabs button { display: inline-flex; align-items: center; gap: 8px; min-height: 38px; }
+.account-tabs button.active { color: #07111f; background: #fbbf24; border-color: #fbbf24; }
+.account-health { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
+.account-health.ok { background: #22c55e; }
+.account-list { display: grid; gap: 8px; margin-top: 16px; }
+.account-list-row { display: grid; grid-template-columns: minmax(110px, 1fr) auto minmax(120px, 1fr) auto auto auto auto; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid #263548; background: #0a1320; }
+.account-list-row button.danger { color: #fecaca; border-color: #7f1d1d; background: rgba(127, 29, 29, 0.25); }
+.env-chip { padding: 3px 7px; border: 1px solid #334155; color: #cbd5e1; font-size: 12px; }
+.env-prod { color: #fca5a5; border-color: #7f1d1d; }
+.env-testnet { color: #6ee7b7; border-color: #065f46; }
+.account-form { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; padding: 14px; border: 1px solid #263548; background: #0a1320; }
+.account-form-title { grid-column: 1 / -1; color: #e5e7eb; font-weight: 800; }
+.account-form label { display: grid; gap: 6px; color: #94a3b8; font-size: 13px; }
+.account-form input, .account-form select { min-height: 38px; padding: 7px 9px; color: #e5e7eb; background: #07101c; border: 1px solid #334155; }
+.account-form .check-label { display: flex; flex-direction: row; align-items: center; gap: 8px; }
+.account-form .check-label input { min-height: 0; }
+.account-form-actions { display: flex; justify-content: flex-end; gap: 8px; grid-column: 1 / -1; }
+.account-form-actions .primary-action { background: #fbbf24; color: #07111f; border-color: #fbbf24; font-weight: 700; }
+.account-message { margin-top: 10px; color: #cbd5e1; }
+
+@media (max-width: 760px) {
+  .account-list-row { grid-template-columns: 1fr auto; }
+  .account-form { grid-template-columns: 1fr; }
+}
+
 .live-dot {
   width: 8px;
   height: 8px;
@@ -589,6 +619,39 @@ button:disabled {
   border-spacing: 0;
   overflow: hidden;
   font-size: 12px;
+  table-layout: auto;
+}
+
+.review-table-wrap,
+.wide-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow: visible;
+  padding-bottom: 8px;
+}
+
+.review-table {
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+  font-size: 11.5px;
+}
+
+.review-table th,
+.review-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
+}
+
+.review-table td {
+  line-height: 1.55;
+}
+
+.review-table button {
+  min-width: 0;
+  padding: 6px 8px;
 }
 
 .trade-table th {
@@ -905,3 +968,21 @@ input[type="number"] {
     max-width: none;
   }
 }
+.market-health {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.market-health span {
+  padding: 5px 8px;
+  border: 1px solid #263244;
+  border-radius: 6px;
+  background: #0d141d;
+}
+
+.market-health-ok { color: #36d98a; }
+.market-health-warn, .market-health-error { color: #f4b942; }

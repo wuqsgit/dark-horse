@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 
 async function apiGet(path) {
   const res = await fetch(`/api${path}`);
@@ -43,6 +43,12 @@ function tone(value) {
   return { color: '#9ca3af' };
 }
 
+function issueText(value) {
+  if (value === 'entry_confirmation') return '开仓确认不足';
+  if (value === 'early_exit') return '平仓过早';
+  return value || '-';
+}
+
 function Metric({ label, value, detail, color }) {
   return (
     <div className="bt-card">
@@ -59,6 +65,7 @@ export default function BacktestPanel() {
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
+  const [actionDetails, setActionDetails] = useState({});
 
   const load = async () => {
     try {
@@ -99,18 +106,22 @@ export default function BacktestPanel() {
   };
 
   const overview = data?.overview || {};
-  const categories = data?.categories || [];
-  const reviews = data?.reviews || [];
-  const candidates = data?.candidates || [];
-  const versions = data?.versions || [];
-  const actions = data?.actions || [];
   const exitReviews = data?.exit_reviews || [];
   const exitSummaries = data?.exit_summaries || [];
+  const entryReviews = data?.entry_reviews || [];
+  const entrySummaries = data?.entry_summaries || [];
+  const entryStatus = data?.entry_review_status || {};
+  const tradeReviews = data?.trade_reviews || [];
+  const tradeReviewSummaries = data?.trade_review_summaries || [];
 
-  const issueRows = useMemo(() => reviews
-    .filter((r) => (r.bad_block_count || 0) > 0 || (r.early_exit_count || 0) > 0 || (r.small_profit_exit_count || 0) > 0)
-    .slice(0, 80), [reviews]);
-  const diagnosticRows = issueRows.length > 0 ? issueRows : reviews.slice(0, 80);
+  const toggleActions = async (positionTradeId) => {
+    if (actionDetails[positionTradeId]) {
+      setActionDetails((current) => ({ ...current, [positionTradeId]: null }));
+      return;
+    }
+    const result = await apiGet(`/policy-loop/positions/${encodeURIComponent(positionTradeId)}/actions`);
+    setActionDetails((current) => ({ ...current, [positionTradeId]: result.actions || [] }));
+  };
 
   if (loading) return <div className="trading-section">加载策略闭环数据...</div>;
   if (error) return <div className="trading-section" style={{ color: '#ef4444' }}>加载失败: {error}</div>;
@@ -143,12 +154,8 @@ export default function BacktestPanel() {
       <div className="nav" style={{ marginBottom: 16 }}>
         {[
           ['overview', '闭环总览'],
-          ['categories', '分类表现'],
-          ['issues', '问题诊断'],
-          ['policies', '自动策略'],
-          ['actions', '动作流水'],
-          ['exitFacts', '平仓事实'],
-          ['exitSummary', '平仓总结'],
+          ['tradeReview', '完整交易复盘'],
+          ['categoryReview', '分类优化建议'],
         ].map(([key, label]) => (
           <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>{label}</button>
         ))}
@@ -168,163 +175,172 @@ export default function BacktestPanel() {
             <Metric label="小盈利过早平仓" value={overview.small_profit_exit_count || 0} />
             <Metric label="误拦截" value={overview.bad_block_count || 0} />
             <Metric label="有效拦截" value={overview.good_block_count || 0} />
-            <Metric label="自动生效版本" value={versions.filter((v) => v.status === 'active').length} />
           </div>
           <div className="trading-section">
             <h3>闭环状态</h3>
             <div style={{ color: '#cbd5e1', fontSize: 13, lineHeight: 1.8 }}>
-              旧回测已下线。当前页面直接展示真实动作的后续结果：收益、最大浮盈、最大回撤、错过大波段、过早平仓、自动生效策略和回滚状态。
+              旧回测已下线。当前页面基于真实仓位展示开仓事实、开仓质量、后续走势、平仓事实和分类建议。
             </div>
           </div>
         </div>
       )}
 
-      {tab === 'categories' && (
+      {tab === 'tradeReview' && (
         <div className="trading-section">
-          <h3>分类表现</h3>
-          <table className="trade-table">
+          <h3>完整交易复盘</h3>
+          <div className="review-table-wrap">
+          <table className="trade-table review-table trade-review-table">
+            <colgroup>
+              <col style={{ width: '9%' }} />
+              <col style={{ width: '7%' }} />
+              <col style={{ width: '6%' }} />
+              <col style={{ width: '23%' }} />
+              <col style={{ width: '18%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '10%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '3%' }} />
+            </colgroup>
             <thead>
               <tr>
-                <th>类别</th><th>样本</th><th>24h收益</th><th>72h收益</th><th>最大浮盈</th><th>最大回撤</th><th>波段捕获</th><th>错过</th><th>过早平仓</th>
+                <th>平仓时间</th><th>币种</th><th>盈亏</th><th>开仓条件</th><th>平仓条件</th>
+                <th>平仓后走势</th><th>联合结论</th><th>优化建议</th><th>证据</th>
               </tr>
             </thead>
             <tbody>
-              {categories.map((r) => (
-                <tr key={r.category || 'none'}>
-                  <td style={{ fontWeight: 700 }}>{r.category || '-'}</td>
-                  <td>{r.samples || 0}</td>
-                  <td style={tone(r.avg_return_24h)}>{pct(r.avg_return_24h)}</td>
-                  <td style={tone(r.avg_return_72h)}>{pct(r.avg_return_72h)}</td>
-                  <td style={tone(r.avg_mfe)}>{pct(r.avg_mfe)}</td>
-                  <td style={tone(r.avg_mae)}>{pct(r.avg_mae)}</td>
-                  <td>{pct(r.trend_capture_ratio)}</td>
-                  <td>{r.missed_big_move_count || 0}</td>
-                  <td>{r.early_exit_count || 0}</td>
-                </tr>
+              {tradeReviews.map((r) => (
+                <React.Fragment key={r.position_trade_id}>
+                  <tr>
+                    <td style={{ whiteSpace: 'nowrap' }}>{timeText(r.exit_time)}</td>
+                    <td style={{ fontWeight: 700 }}>{r.symbol}<div style={{ color: '#64748b', fontSize: 11 }}>{r.category || '-'}</div></td>
+                    <td style={tone(r.net_pnl)}>{num(r.net_pnl)}U<div>{pct(r.pnl_pct)}</div></td>
+                    <td style={{ color: '#cbd5e1', lineHeight: 1.6 }}>{r.entry_condition}</td>
+                    <td style={{ color: '#cbd5e1', lineHeight: 1.6 }}>{r.exit_condition}</td>
+                    <td style={{ lineHeight: 1.6 }}>
+                      <div>1h {pct(r.return_1h)} · 4h {pct(r.return_4h)}</div>
+                      <div>12h {pct(r.return_12h)} · 24h {pct(r.return_24h)}</div>
+                      <div style={tone(r.post_mfe)}>最大有利 {pct(r.post_mfe)}</div>
+                      <div style={tone(r.post_mae)}>最大不利 {pct(r.post_mae)}</div>
+                    </td>
+                    <td style={{ fontWeight: 700 }}>{r.conclusion}</td>
+                    <td style={{ color: '#94a3b8', lineHeight: 1.6 }}>{r.recommendation}</td>
+                    <td><button onClick={() => toggleActions(r.position_trade_id)}>{actionDetails[r.position_trade_id] ? '收起' : '查看'}</button></td>
+                  </tr>
+                  {actionDetails[r.position_trade_id] && (
+                    <tr><td colSpan={9} style={{ background: '#0b1220', color: '#94a3b8' }}>
+                      {actionDetails[r.position_trade_id].length === 0 ? '暂无可用动作证据' : actionDetails[r.position_trade_id].map((a) => (
+                        <div key={a.action_id || a.id}>{timeText(a.time)} · {a.action_type} · {a.action_result} · {a.reason_text || a.reason_code || '-'}</div>
+                      ))}
+                    </td></tr>
+                  )}
+                </React.Fragment>
               ))}
-              {categories.length === 0 && <tr><td colSpan={9} style={{ textAlign: 'center', color: '#6b7280' }}>暂无分类样本</td></tr>}
+              {tradeReviews.length === 0 && <tr><td colSpan={9} style={{ textAlign: 'center', color: '#6b7280' }}>暂无完整交易复盘</td></tr>}
             </tbody>
           </table>
-        </div>
-      )}
-
-      {tab === 'issues' && (
-        <div className="trading-section">
-          <h3>问题诊断</h3>
-          <table className="trade-table">
-            <thead>
-              <tr>
-                <th>类别</th><th>目标</th><th>规则/原因</th><th>样本</th><th>24h收益</th><th>最大浮盈</th><th>误拦截</th><th>过早平仓</th><th>诊断</th>
-              </tr>
-            </thead>
-            <tbody>
-              {diagnosticRows.map((r) => (
-                <tr key={r.review_id}>
-                  <td>{r.category || '-'}</td>
-                  <td>{r.target_type}</td>
-                  <td style={{ maxWidth: 320, color: '#cbd5e1' }}>{r.target_name}</td>
-                  <td>{r.sample_size || 0}</td>
-                  <td style={tone(r.avg_return)}>{pct(r.avg_return)}</td>
-                  <td style={tone(r.avg_mfe)}>{pct(r.avg_mfe)}</td>
-                  <td>{r.bad_block_count || 0}</td>
-                  <td>{r.early_exit_count || 0}</td>
-                  <td style={{ color: '#fbbf24' }}>{r.diagnosis}</td>
-                </tr>
-              ))}
-              {diagnosticRows.length === 0 && <tr><td colSpan={9} style={{ textAlign: 'center', color: '#6b7280' }}>暂无诊断样本</td></tr>}
-            </tbody>
-          </table>
-          {issueRows.length === 0 && diagnosticRows.length > 0 && (
-            <div style={{ marginTop: 10, color: '#94a3b8', fontSize: 12 }}>
-              当前样本没有触发误拦截、过早平仓或小盈利早平阈值，所以上面展示的是常规诊断行。
-            </div>
-          )}
-        </div>
-      )}
-
-      {tab === 'policies' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div className="trading-section">
-            <h3>自动策略</h3>
-            {candidates.length === 0 && (
-              <div style={{ border: '1px solid #243246', background: '#0b1220', borderRadius: 8, padding: 12, color: '#cbd5e1', fontSize: 13, lineHeight: 1.7, marginBottom: 12 }}>
-                暂无自动生效策略。当前复盘样本没有达到自动改规则阈值：误拦截为 0、过早平仓为 0、小盈利过早平仓为 0。系统会继续记录后续动作，一旦某个原因连续误杀大波段或导致早平，会自动生成并生效策略。
-              </div>
-            )}
-            <table className="trade-table">
-              <thead>
-                <tr><th>状态</th><th>目标</th><th>建议</th><th>样本</th><th>预期改善</th><th>原因</th></tr>
-              </thead>
-              <tbody>
-                {candidates.map((c) => (
-                  <tr key={c.id}>
-                    <td><span className={`policy-status ${c.status}`}>{c.status}</span></td>
-                    <td>{c.target}</td>
-                    <td style={{ fontWeight: 700, color: '#cbd5e1' }}>{c.title}</td>
-                    <td>{c.sample_size || 0}</td>
-                    <td style={tone(c.expected_delta)}>{pct(c.expected_delta)}</td>
-                    <td style={{ minWidth: 280, color: '#9ca3af' }}>{c.summary}</td>
-                  </tr>
-                ))}
-                {candidates.length === 0 && <tr><td colSpan={6} style={{ textAlign: 'center', color: '#6b7280' }}>暂无自动策略</td></tr>}
-              </tbody>
-            </table>
-          </div>
-          <div className="trading-section">
-            <h3>策略版本</h3>
-            <table className="trade-table">
-              <thead>
-                <tr><th>状态</th><th>类别</th><th>目标</th><th>版本</th><th>激活时间</th></tr>
-              </thead>
-              <tbody>
-                {versions.map((v) => (
-                  <tr key={v.version_id}>
-                    <td>{v.status}</td>
-                    <td>{v.category || '-'}</td>
-                    <td>{v.target_type}</td>
-                    <td style={{ fontSize: 11 }}>{v.version_id}</td>
-                    <td>{timeText(v.activated_at || v.created_at)}</td>
-                  </tr>
-                ))}
-                {versions.length === 0 && <tr><td colSpan={5} style={{ textAlign: 'center', color: '#6b7280' }}>暂无策略版本</td></tr>}
-              </tbody>
-            </table>
           </div>
         </div>
       )}
 
-      {tab === 'actions' && (
+      {tab === 'categoryReview' && (
         <div className="trading-section">
-          <h3>动作流水</h3>
-          <table className="trade-table">
-            <thead>
-              <tr>
-                <th>时间</th><th>币种</th><th>类别</th><th>动作</th><th>结果</th><th>原因</th><th>24h</th><th>最大浮盈</th><th>最大回撤</th><th>标签</th>
-              </tr>
-            </thead>
+          <h3>分类优化建议</h3>
+          <div className="review-table-wrap">
+          <table className="trade-table review-table category-review-table">
+            <colgroup>
+              <col style={{ width: '9%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '22%' }} />
+              <col style={{ width: '13%' }} />
+              <col style={{ width: '20%' }} />
+              <col style={{ width: '24%' }} />
+            </colgroup>
+            <thead><tr><th>优先级</th><th>策略 / 分类</th><th>统计证据</th><th>代表币种</th><th>结论</th><th>建议</th></tr></thead>
             <tbody>
-              {actions.map((a) => (
-                <tr key={a.action_id}>
-                  <td style={{ whiteSpace: 'nowrap' }}>{timeText(a.time)}</td>
-                  <td style={{ fontWeight: 700 }}>{a.symbol}</td>
-                  <td>{a.category || '-'}</td>
-                  <td>{a.action_type}</td>
-                  <td>{a.action_result}</td>
-                  <td style={{ maxWidth: 320, color: '#9ca3af' }}>{a.reason_text || '-'}</td>
-                  <td style={tone(a.return_24h)}>{pct(a.return_24h)}</td>
-                  <td style={tone(a.max_favorable_return)}>{pct(a.max_favorable_return)}</td>
-                  <td style={tone(a.max_adverse_return)}>{pct(a.max_adverse_return)}</td>
+              {tradeReviewSummaries.map((r) => (
+                <tr key={`${r.strategy_source}-${r.category}-${r.issue_type}`}>
+                  <td style={{ color: r.priority === '急需修复' ? '#ef4444' : '#fbbf24', fontWeight: 800 }}>{r.priority || '-'}</td>
                   <td>
-                    {a.missed_big_move ? '错过 ' : ''}
-                    {a.early_exit ? '过早 ' : ''}
-                    {a.bad_block ? '误拦截 ' : ''}
-                    {a.good_block ? '有效拦截' : ''}
+                    <div style={{ fontWeight: 800 }}>{r.strategy_source || '-'}</div>
+                    <div style={{ color: '#94a3b8' }}>{r.category || '-'}</div>
+                    <div style={{ color: '#cbd5e1', marginTop: 4 }}>{issueText(r.issue_type)}</div>
                   </td>
+                  <td style={{ lineHeight: 1.65 }}>
+                    <div>{r.issue_count || 0}/{r.sample_size || 0} 笔 · {pct(r.issue_rate)}</div>
+                    <div style={tone(r.total_pnl)}>问题样本盈亏 {num(r.total_pnl)}U</div>
+                    <div>持仓 MFE {pct(r.avg_mfe)} · MAE {pct(r.avg_mae)}</div>
+                    <div>平仓后 MFE {pct(r.avg_post_mfe)}</div>
+                  </td>
+                  <td style={{ color: '#cbd5e1' }}>{(r.representative_symbols || []).join('、') || '-'}</td>
+                  <td style={{ color: '#cbd5e1', lineHeight: 1.65 }}>{r.conclusion}</td>
+                  <td style={{ color: '#94a3b8', lineHeight: 1.65 }}>{r.recommendation}</td>
                 </tr>
               ))}
-              {actions.length === 0 && <tr><td colSpan={10} style={{ textAlign: 'center', color: '#6b7280' }}>暂无动作流水</td></tr>}
+              {tradeReviewSummaries.length === 0 && <tr><td colSpan={6} style={{ textAlign: 'center', color: '#6b7280' }}>当前没有达到样本与集中度门槛的问题</td></tr>}
             </tbody>
           </table>
+          </div>
+        </div>
+      )}
+
+      {tab === 'entrySummary' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div className="backtest-grid">
+            <Metric label="开仓样本" value={entryStatus.total || 0} />
+            <Metric label="已有结论" value={entryStatus.reviewed || 0} />
+            <Metric label="待观察" value={entryStatus.pending || 0} />
+            <Metric label="历史指标缺失" value={entryStatus.missing_snapshot || 0} />
+          </div>
+          <div className="trading-section">
+            <h3>开仓事实</h3>
+            <table className="trade-table">
+              <thead><tr><th>时间</th><th>币种</th><th>方向</th><th>分类 / 模板</th><th>开仓原因</th><th>状态</th><th>结果</th><th>最大浮盈</th><th>最大回撤</th><th>结论</th><th>证据</th></tr></thead>
+              <tbody>
+                {entryReviews.map((r) => (
+                  <React.Fragment key={r.position_trade_id}>
+                    <tr>
+                      <td style={{ whiteSpace: 'nowrap' }}>{timeText(r.entry_time)}</td>
+                      <td style={{ fontWeight: 700 }}>{r.symbol}</td>
+                      <td>{r.side || '-'}</td>
+                      <td>{r.category || '-'} / {r.entry_template || '-'}</td>
+                      <td style={{ minWidth: 360, color: '#cbd5e1' }}>{r.entry_reason_text || '历史开仓指标未记录'}</td>
+                      <td>{r.position_status === 'open' ? '持有中' : '已平仓'}</td>
+                      <td style={tone(r.position_status === 'open' ? r.return_now : r.pnl_pct)}>{pct(r.position_status === 'open' ? r.return_now : r.pnl_pct)}</td>
+                      <td style={tone(r.max_favorable_return)}>{pct(r.max_favorable_return)}</td>
+                      <td style={tone(r.max_adverse_return)}>{pct(r.max_adverse_return)}</td>
+                      <td title={r.review_reason || ''}>{r.review_label || 'pending'}</td>
+                      <td><button onClick={() => toggleActions(r.position_trade_id)} title="查看该仓位动作证据">{actionDetails[r.position_trade_id] ? '收起' : '查看'}</button></td>
+                    </tr>
+                    {actionDetails[r.position_trade_id] && (
+                      <tr><td colSpan={11} style={{ background: '#0b1220', color: '#94a3b8' }}>
+                        {actionDetails[r.position_trade_id].length === 0 ? '最近5天没有可用动作证据' : actionDetails[r.position_trade_id].map((a) => (
+                          <div key={a.action_id || a.id}>{timeText(a.time)} · {a.action_type} · {a.action_result} · {a.reason_text || a.reason_code || '-'}</div>
+                        ))}
+                      </td></tr>
+                    )}
+                  </React.Fragment>
+                ))}
+                {entryReviews.length === 0 && <tr><td colSpan={11} style={{ textAlign: 'center', color: '#6b7280' }}>暂无开仓总结</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div className="trading-section">
+            <h3>分类建议</h3>
+            <table className="trade-table">
+              <thead><tr><th>策略</th><th>分类</th><th>模板</th><th>样本</th><th>合理</th><th>偏早</th><th>追高</th><th>条件错误</th><th>平均浮盈</th><th>平均回撤</th><th>建议</th></tr></thead>
+              <tbody>
+                {entrySummaries.map((r) => (
+                  <tr key={r.summary_id}>
+                    <td>{r.strategy_source || '-'}</td><td>{r.category || '-'}</td><td>{r.entry_template || '-'}</td><td>{r.sample_size || 0}</td>
+                    <td>{r.reasonable_count || 0}</td><td>{r.early_count || 0}</td><td>{r.chased_count || 0}</td><td>{r.bad_condition_count || 0}</td>
+                    <td style={tone(r.avg_mfe)}>{pct(r.avg_mfe)}</td><td style={tone(r.avg_mae)}>{pct(r.avg_mae)}</td>
+                    <td style={{ minWidth: 360, color: r.action_type === 'improve' ? '#fbbf24' : '#9ca3af' }}>{r.recommendation}</td>
+                  </tr>
+                ))}
+                {entrySummaries.length === 0 && <tr><td colSpan={11} style={{ textAlign: 'center', color: '#6b7280' }}>样本不足，暂不生成分类建议</td></tr>}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 

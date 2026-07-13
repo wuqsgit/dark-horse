@@ -6,16 +6,19 @@ from datetime import datetime, timezone
 import httpx
 
 from shared.db import (
-    insert_candles_1h,
-    insert_candles_15m,
-    insert_candles_6h,
-    insert_candles_24h,
+    insert_futures_candles,
     insert_futures,
     insert_alpha_candles,
     insert_alpha_orderbook_snapshot,
     purge_old_kline_data,
     upsert_alpha_symbols,
+    replace_market_universe,
+    fetch_tracked_alpha_positions,
+    futures_candles_current,
+    RETENTION_DAYS,
 )
+from shared.market_universe import build_alpha_universe
+from pipeline.candle_health import refresh_universe_readiness, retry_async
 
 logger = logging.getLogger("alpha_pipeline")
 
@@ -71,9 +74,22 @@ class AlphaCollector:
 
     async def get_futures_symbols(self):
         try:
-            resp = await self.client.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
-            resp.raise_for_status()
-            return {s["symbol"] for s in resp.json().get("symbols", []) if s.get("status") == "TRADING"}
+            info_resp, ticker_resp = await asyncio.gather(
+                self.client.get("https://fapi.binance.com/fapi/v1/exchangeInfo"),
+                self.client.get("https://fapi.binance.com/fapi/v1/ticker/24hr"),
+            )
+            info_resp.raise_for_status()
+            ticker_resp.raise_for_status()
+            volumes = {row.get("symbol"): _f(row.get("quoteVolume")) for row in ticker_resp.json()}
+            return {
+                row["symbol"]: {
+                    "status": row.get("status"),
+                    "contract_type": row.get("contractType"),
+                    "quote_volume": volumes.get(row["symbol"], 0),
+                }
+                for row in info_resp.json().get("symbols", [])
+                if row.get("status") == "TRADING"
+            }
         except Exception as exc:
             logger.warning("futures exchangeInfo failed: %s", exc)
             return set()
@@ -133,6 +149,7 @@ class AlphaCollector:
                     "futures_symbol": futures_symbol,
                     "tradeability": tradeability,
                     "volume_24h": volume_24h,
+                    "futures_quote_volume_24h": _f((futures_symbols.get(futures_symbol) or {}).get("quote_volume")),
                 })
 
         rows.sort(key=lambda r: float(r[10] or 0), reverse=True)
@@ -146,10 +163,26 @@ class AlphaCollector:
         return universe
 
     async def collect_market_data(self, universe, top_n=80):
-        selected = sorted(
-            (item for item in universe if item.get("alpha_symbol") and item.get("futures_symbol")),
-            key=lambda x: -float(x.get("volume_24h") or 0),
-        )[:top_n]
+        futures_markets = {
+            item["futures_symbol"]: {
+                "status": "TRADING", "contract_type": "PERPETUAL",
+                "quote_volume": item.get("futures_quote_volume_24h", 0),
+            }
+            for item in universe if item.get("futures_symbol")
+        }
+        selected = build_alpha_universe(universe, futures_markets, limit=top_n, futures_volume_floor=100_000)
+        selected_sources = {row["source_symbol"] for row in selected}
+        by_source = {item["alpha_symbol"]: item for item in universe}
+        for position in fetch_tracked_alpha_positions():
+            source = position.get("alpha_symbol")
+            if not source or source in selected_sources or source not in by_source:
+                continue
+            item = by_source[source]
+            forced = build_alpha_universe([item], futures_markets, limit=1, futures_volume_floor=0)
+            if forced:
+                forced[0].update(selected=False, forced_position=True, universe_rank=None, selection_reason="open_position")
+                selected.extend(forced)
+        replace_market_universe("alpha", selected)
         if not selected:
             logger.info("alpha market data skipped: no futures-mapped alpha symbols")
             return
@@ -165,17 +198,19 @@ class AlphaCollector:
 
         interval_map = {
             "alpha_candles_15m": ("15m", 48),
-            "alpha_candles_1h": ("1h", 72),
-            "alpha_candles_6h": ("6h", 56),
-            "alpha_candles_24h": ("1d", 35),
+            "alpha_candles_1h": ("1h", 48),
+            "alpha_candles_6h": ("6h", 48),
+            "alpha_candles_24h": ("1d", 48),
         }
 
         async def fetch_one(item):
-            symbol = item["alpha_symbol"]
+            symbol = item["source_symbol"]
             async with semaphore:
                 try:
                     for table, (interval, limit) in interval_map.items():
-                        data = await self._get_data(KLINES, {"symbol": symbol, "interval": interval, "limit": limit})
+                        async def request():
+                            return await self._get_data(KLINES, {"symbol": symbol, "interval": interval, "limit": limit})
+                        data = await retry_async(request, retries=2)
                         for o in data or []:
                             rows_by_table[table].append((
                                 _utc(o[0]),
@@ -218,7 +253,7 @@ class AlphaCollector:
                 insert_alpha_candles(table, rows)
         if depth_rows:
             insert_alpha_orderbook_snapshot(depth_rows)
-        purge_old_kline_data(days=90)
+        purge_old_kline_data(days=RETENTION_DAYS)
         logger.info(
             "alpha market data: %s 1h, %s 15m, %s depth",
             len(rows_by_table["alpha_candles_1h"]),
@@ -226,6 +261,15 @@ class AlphaCollector:
             len(depth_rows),
         )
         await self.collect_mapped_futures_data(selected)
+        refresh_universe_readiness("alpha")
+
+    @staticmethod
+    def futures_table_for_interval(interval):
+        suffix = "24h" if interval == "1d" else interval
+        table = f"futures_candles_{suffix}"
+        if table not in {"futures_candles_15m", "futures_candles_1h", "futures_candles_6h", "futures_candles_24h"}:
+            raise ValueError(f"unsupported futures interval: {interval}")
+        return table
 
     async def collect_mapped_futures_data(self, selected):
         futures_symbols = sorted({
@@ -237,20 +281,20 @@ class AlphaCollector:
             return
 
         rows_by_table = {
-            "candles_1h": [],
-            "candles_15m": [],
-            "candles_6h": [],
-            "candles_24h": [],
+            "futures_candles_1h": [],
+            "futures_candles_15m": [],
+            "futures_candles_6h": [],
+            "futures_candles_24h": [],
         }
         rows_fut = []
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         semaphore = asyncio.Semaphore(4)
 
         interval_map = {
-            "candles_15m": ("15m", 48),
-            "candles_1h": ("1h", 96),
-            "candles_6h": ("6h", 56),
-            "candles_24h": ("1d", 35),
+            "futures_candles_15m": ("15m", 48),
+            "futures_candles_1h": ("1h", 48),
+            "futures_candles_6h": ("6h", 48),
+            "futures_candles_24h": ("1d", 48),
         }
 
         try:
@@ -264,15 +308,17 @@ class AlphaCollector:
         async def fetch_one(symbol):
             async with semaphore:
                 try:
+                    if futures_candles_current(symbol):
+                        return
                     for table, (interval, limit) in interval_map.items():
-                        resp = await self.client.get(
-                            "https://fapi.binance.com/fapi/v1/klines",
-                            params={"symbol": symbol, "interval": interval, "limit": limit},
-                        )
-                        if resp.status_code != 200:
-                            logger.debug("mapped futures klines failed %s %s: %s", symbol, interval, resp.status_code)
-                            continue
-                        for o in resp.json() or []:
+                        async def request():
+                            response = await self.client.get(
+                                "https://fapi.binance.com/fapi/v1/klines",
+                                params={"symbol": symbol, "interval": interval, "limit": limit},
+                            )
+                            response.raise_for_status()
+                            return response.json()
+                        for o in await retry_async(request, retries=2):
                             rows_by_table[table].append((
                                 _utc(o[0]),
                                 symbol,
@@ -301,22 +347,16 @@ class AlphaCollector:
             await asyncio.gather(*(fetch_one(symbol) for symbol in futures_symbols[i:i + 10]))
             await asyncio.sleep(0.4)
 
-        if rows_by_table["candles_1h"]:
-            insert_candles_1h(rows_by_table["candles_1h"])
-        if rows_by_table["candles_15m"]:
-            insert_candles_15m(rows_by_table["candles_15m"])
-        if rows_by_table["candles_6h"]:
-            insert_candles_6h(rows_by_table["candles_6h"])
-        if rows_by_table["candles_24h"]:
-            insert_candles_24h(rows_by_table["candles_24h"])
+        for table, rows in rows_by_table.items():
+            insert_futures_candles(table, rows)
         if rows_fut:
             insert_futures(rows_fut)
 
         logger.info(
             "mapped futures data: %s symbols, %s 1h, %s 15m, %s futures",
             len(futures_symbols),
-            len(rows_by_table["candles_1h"]),
-            len(rows_by_table["candles_15m"]),
+            len(rows_by_table["futures_candles_1h"]),
+            len(rows_by_table["futures_candles_15m"]),
             len(rows_fut),
         )
 

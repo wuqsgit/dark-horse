@@ -177,14 +177,9 @@ class CandidateSelector:
         try:
             row = conn.execute(
                 """
-                SELECT AVG(quote_vol) AS avg_quote_vol
-                FROM (
-                    SELECT quote_vol
-                    FROM candles_1h
-                    WHERE symbol = ?
-                    ORDER BY time DESC
-                    LIMIT 24
-                )
+                SELECT effective_quote_volume_24h AS avg_quote_vol
+                FROM market_universe
+                WHERE pool_type = 'normal' AND futures_symbol = ?
                 """,
                 (symbol,),
             ).fetchone()

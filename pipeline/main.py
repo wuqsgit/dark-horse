@@ -20,15 +20,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline")
 
-TOP_SYMBOLS = int(os.getenv("TOP_SYMBOLS", "200"))
+TOP_SYMBOLS = int(os.getenv("TOP_SYMBOLS", "150"))
 
 
 async def collect_binance(bc):
     logger.info("=== Binance ===")
     try:
-        symbols = await bc.get_top_pairs(limit=TOP_SYMBOLS)
-        if symbols:
-            await bc.collect_all(symbols)
+        universe = await bc.get_normal_universe(limit=TOP_SYMBOLS)
+        symbols = [row["source_symbol"] for row in universe]
+        if universe:
+            await bc.collect_all(universe)
             # 🆕 V4.0: 采集深度数据（只采前20个高成交量币种）
             try:
                 await bc.collect_depth(symbols, top_n=20)

@@ -9,6 +9,7 @@ from shared.db import (
     fetch_alpha_score_history,
     fetch_alpha_symbol_detail,
     fetch_latest_alpha_scan,
+    fetch_latest_alpha_trade_candidate,
     fetch_latest_alpha_trade_candidates,
     fetch_active_alpha_cooldowns,
     fetch_latest_scan,
@@ -18,15 +19,19 @@ from shared.db import (
     fetch_signal_outcome_summary,
     get_trading_runtime_controls,
     set_trading_runtime_control,
+    fetch_market_data_health,
     init_db,
 )
 from shared.policy_loop import (
     fetch_policy_loop_summary,
     fetch_exit_reviews,
     fetch_exit_review_summaries,
+    fetch_position_action_evidence,
     generate_and_activate_policies,
     label_decision_outcomes,
     review_position_trade_exits,
+    review_position_trade_entries,
+    summarize_entry_reviews,
     summarize_exit_reviews,
     clear_legacy_backtest_data,
 )
@@ -148,6 +153,8 @@ _response_cache = {}
 _versioned_cache = {}
 _scan_payload_cache = {"scan_id": None, "payload": None, "body": None, "time": 0}
 _scan_refresh_task = None
+
+
 _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
 _TRADING_CACHE_TTL = 10
@@ -366,6 +373,11 @@ async def get_user():
     return "admin"
 
 
+@app.get("/api/market-data/health")
+async def get_market_data_health(user=Depends(get_user)):
+    return json_response(await asyncio.to_thread(fetch_market_data_health))
+
+
 def _build_scan_payload(scan, rows):
     symbols = []
     for r in rows:
@@ -377,6 +389,7 @@ def _build_scan_payload(scan, rows):
             except Exception:
                 features = {}
         tech = features.get("technical", {})
+        market_phase = features.get("market_phase") or {}
         v3_signals = compute_v3_signals(r["symbol"], r, tech)
         try:
             from trader.entry_profiles import evaluate_profile_entry
@@ -406,6 +419,7 @@ def _build_scan_payload(scan, rows):
             "hold_alpha": float(r["hold_alpha"] or 0),
             "plain_signal": plain,
             "entry_profile": entry_profile,
+            "market_phase": market_phase,
             "market_section": compute_market_section({
                 "relative_strength": r["relative_strength"],
                 "composite_score": r["composite_score"],
@@ -531,6 +545,7 @@ async def get_latest_alpha_scan(user=Depends(get_user)):
         raw = _parse_json(r["raw_features"])
         candidate = candidate_by_alpha.get(r["alpha_symbol"]) or {}
         volume_price = raw.get("volume_price") or {}
+        market_phase = raw.get("market_phase") or {}
         symbols.append({
             "alpha_symbol": r["alpha_symbol"],
             "base_asset": r["base_asset"],
@@ -563,6 +578,7 @@ async def get_latest_alpha_scan(user=Depends(get_user)):
             "futures_oi_change_24h": (raw.get("futures_sync") or {}).get("oi_change_24h"),
             "alpha_trend": raw.get("alpha_trend") or {},
             "volume_price": volume_price,
+            "market_phase": market_phase,
             "normal_review": {
                 "normal_score": candidate.get("normal_score"),
                 "normal_grade": candidate.get("normal_grade"),
@@ -596,10 +612,7 @@ async def get_alpha_symbol_detail(alpha_symbol: str, user=Depends(get_user)):
         return {"error": "Not found", "symbol": alpha_symbol}
     raw = _parse_json(row["raw_features"])
     symbol_raw = _parse_json(row["symbol_raw_json"])
-    candidate = next(
-        (c for c in fetch_latest_alpha_trade_candidates(500) if c.get("alpha_symbol") == row["alpha_symbol"]),
-        None,
-    )
+    candidate = fetch_latest_alpha_trade_candidate(row["alpha_symbol"])
     history = [
         {
             "time": r["time"],
@@ -640,6 +653,7 @@ async def get_alpha_symbol_detail(alpha_symbol: str, user=Depends(get_user)):
         "liquidity": float(row["liquidity"] or 0),
         "percent_change_24h": float(row["percent_change_24h"] or 0),
         "raw_features": raw,
+        "market_phase": raw.get("market_phase") or {},
         "symbol_raw": symbol_raw,
         "history": history,
         "volume_price": raw.get("volume_price") or {},
@@ -730,6 +744,7 @@ async def get_symbol_detail(symbol: str, user=Depends(get_user)):
     fut = features.get("futures", {})
     onchain = features.get("onchain", {})
     depth = features.get("depth", {})
+    market_phase = features.get("market_phase") or {}
 
     absorption_score = tech.get("absorption_score", tech.get("abs_score", 50))
     chip_score = tech.get("chip_score", 50)
@@ -766,6 +781,7 @@ async def get_symbol_detail(symbol: str, user=Depends(get_user)):
         "onchain": onchain,
         "depth": depth,
         "score_layers": features.get("score_layers", {}),
+        "market_phase": market_phase,
         "heat_detail": heat,
         "plain_signal": explain_scan_row(row),
         # V3.0
@@ -818,13 +834,16 @@ async def get_backtest_summary(user=Depends(get_user)):
             "latest_run": data.get("latest_review_time"),
             "generated_at": data.get("generated_at"),
             "overview": overview,
-            "categories": data.get("categories", []),
-            "reviews": data.get("reviews", []),
             "candidates": data.get("candidates", []),
             "versions": data.get("versions", []),
-            "actions": data.get("actions", [])[:80],
+            "auto_policy_status": data.get("auto_policy_status", {}),
+            "entry_reviews": data.get("entry_reviews", [])[:100],
+            "entry_summaries": data.get("entry_summaries", [])[:100],
+            "entry_review_status": data.get("entry_review_status", {}),
             "exit_reviews": data.get("exit_reviews", [])[:100],
             "exit_summaries": data.get("exit_summaries", [])[:100],
+            "trade_reviews": data.get("trade_reviews", [])[:100],
+            "trade_review_summaries": data.get("trade_review_summaries", [])[:100],
             "entry_policy": data.get("entry_policy", {}),
             "exit_policy": data.get("exit_policy", {}),
             "grades": [],
@@ -835,25 +854,25 @@ async def get_backtest_summary(user=Depends(get_user)):
                 "stage_counts": [],
                 "result_counts": [],
                 "top_filter_reasons": [],
-                "recent": data.get("actions", [])[:12],
+                "recent": [],
             },
             "outcome_summary": overview,
             "backtest_status": {
-                "plain": "旧回测已替换为策略闭环复盘：重点看收益、错过大波段、过早平仓、自动生效策略。",
+                "plain": "策略闭环按完整仓位统一复盘开仓条件、平仓触发和后续走势；动作流水作为按仓位查询的后台证据。",
                 "backtest_rows": 0,
-                "review_rows": len(data.get("reviews", [])),
+                "review_rows": 0,
                 "factor_rows": 0,
             },
         })
     except Exception as e:
-        return {"mode": "policy_loop", "error": str(e), "overview": {}, "categories": [], "reviews": [], "actions": []}
+        return {"mode": "policy_loop", "error": str(e), "overview": {}, "actions": []}
 
 
 @app.get("/api/factor/performance")
 async def get_factor_performance(factor: str = None, user=Depends(get_user)):
     """Policy-loop diagnostics kept on the old path for compatibility."""
     try:
-        payload = fetch_policy_loop_summary(limit=200).get("reviews", [])
+        payload = fetch_policy_loop_summary(limit=200, include_diagnostics=True).get("reviews", [])
         if factor:
             payload = [r for r in payload if r.get("target_name") == factor or r.get("target_type") == factor]
         return {"rows": payload, "count": len(payload)}
@@ -878,7 +897,7 @@ async def get_backtest_signals(grade: str = "all", limit: int = 200, user=Depend
 async def get_factor_analysis(user=Depends(get_user)):
     """Return policy-loop factor/category diagnostics."""
     try:
-        data = fetch_policy_loop_summary()
+        data = fetch_policy_loop_summary(include_diagnostics=True)
         return {
             "mode": "policy_loop",
             "run_time": data.get("latest_review_time"),
@@ -896,7 +915,7 @@ async def get_factor_analysis(user=Depends(get_user)):
 async def get_backtest_review(user=Depends(get_user)):
     """Return latest policy-loop review."""
     try:
-        data = fetch_policy_loop_summary()
+        data = fetch_policy_loop_summary(include_diagnostics=True)
         return {
             "mode": "policy_loop",
             "_run_time": data.get("latest_review_time"),
@@ -921,7 +940,10 @@ async def get_backtest_review(user=Depends(get_user)):
 async def run_policy_review_now(user=Depends(get_user)):
     try:
         result = generate_and_activate_policies()
-        return {"status": "ok", **result}
+        entry_review = review_position_trade_entries(limit=1000)
+        entry_summary = summarize_entry_reviews(recent_limit=30)
+        _api_cache.pop("policy_loop_summary", None)
+        return {"status": "ok", **result, "entry_review": entry_review, "entry_summary": entry_summary}
     except Exception as e:
         return {"error": str(e)}
 
@@ -968,6 +990,14 @@ async def get_policy_actions(limit: int = 200, user=Depends(get_user)):
         return {"actions": fetch_policy_loop_summary(limit=limit).get("actions", [])}
     except Exception as e:
         return {"error": str(e), "actions": []}
+
+
+@app.get("/api/policy-loop/positions/{position_trade_id}/actions")
+async def get_position_actions(position_trade_id: str, limit: int = 100, user=Depends(get_user)):
+    try:
+        return {"position_trade_id": position_trade_id, "actions": fetch_position_action_evidence(position_trade_id, limit=min(limit, 200))}
+    except Exception as e:
+        return {"error": str(e), "position_trade_id": position_trade_id, "actions": []}
 
 
 @app.get("/api/policy/versions")
@@ -1332,6 +1362,8 @@ async def get_trading_status(user=Depends(get_user)):
         margin_data = ex.get_margin_balance()
         balance = margin_data["totalWalletBalance"]
         margin_balance = margin_data.get("totalMarginBalance") or balance
+        total_maint_margin = float(margin_data.get("totalMaintMargin") or 0)
+        cross_margin_ratio = (total_maint_margin / margin_balance * 100) if margin_balance else None
         positions = ex.get_positions()
         unrealized_total = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
         rebuild_position_trades_from_income(
@@ -1447,6 +1479,7 @@ async def get_trading_status(user=Depends(get_user)):
                     "trailing_enabled": False,
                     "trailing_atr_multiplier": None,
                     "r_multiple": 0,
+                    "initial_quantity": None,
                     "last_exit_reason": None,
                     "last_exit_plain": None,
                     "strategy_source": "normal",
@@ -1457,6 +1490,9 @@ async def get_trading_status(user=Depends(get_user)):
                     "alpha_score": None,
                     "alpha_suggested_position_pct": None,
                     "roll_layer": 0,
+                    "roll_status": "state_incomplete",
+                    "roll_price": None,
+                    "protected_stop": None,
                     "last_roll_time": None,
                     "protected_profit": 0,
                     "max_floating_pnl": 0,
@@ -1484,6 +1520,22 @@ async def get_trading_status(user=Depends(get_user)):
                 entry_time = entry_time_from_position_id(r["position_id"])
             if not entry_time:
                 entry_time = fallback_entry_time(symbol, side)
+            initial_quantity = float(r["initial_quantity"] or 0) if "initial_quantity" in r.keys() else 0
+            initial_stop = float(r["initial_stop_loss"] or 0) if "initial_stop_loss" in r.keys() else 0
+            atr_value = float(r["atr_value"] or 0) if "atr_value" in r.keys() else 0
+            roll_layer = int(r["roll_layer"] or 0) if "roll_layer" in r.keys() else 0
+            protected_stop = float(r["protected_stop"] or 0) if "protected_stop" in r.keys() else 0
+            roll_block_reason = r["roll_block_reason"] if "roll_block_reason" in r.keys() else None
+            if not initial_quantity or not initial_stop or not atr_value:
+                roll_status = "state_incomplete"
+            elif roll_layer >= 1:
+                roll_status = "rolled_protected" if protected_stop else "protection_missing"
+            elif roll_block_reason:
+                roll_status = roll_block_reason
+            elif not bool(r["tp1_hit"] if "tp1_hit" in r.keys() else 0):
+                roll_status = "waiting_tp1"
+            else:
+                roll_status = "waiting_1_5r"
             return {
                 **holding_fields(entry_time),
                 "entry_reason": r["entry_reason"],
@@ -1500,6 +1552,7 @@ async def get_trading_status(user=Depends(get_user)):
                 "trailing_enabled": bool(r["trailing_enabled"]) if "trailing_enabled" in r.keys() else False,
                 "trailing_atr_multiplier": float(r["trailing_atr_multiplier"] or 0) if "trailing_atr_multiplier" in r.keys() else None,
                 "r_multiple": float(r["r_multiple"] or 0) if "r_multiple" in r.keys() else 0,
+                "initial_quantity": initial_quantity or None,
                 "last_exit_reason": r["last_exit_reason"] if "last_exit_reason" in r.keys() else None,
                 "last_exit_plain": plain_reason(r["last_exit_reason"]) if "last_exit_reason" in r.keys() else None,
                 "strategy_source": r["strategy_source"] if "strategy_source" in r.keys() else "normal",
@@ -1509,12 +1562,15 @@ async def get_trading_status(user=Depends(get_user)):
                 "alpha_entry_level": r["alpha_entry_level"] if "alpha_entry_level" in r.keys() else None,
                 "alpha_score": float(r["alpha_score"] or 0) if "alpha_score" in r.keys() else None,
                 "alpha_suggested_position_pct": float(r["alpha_suggested_position_pct"] or 0) if "alpha_suggested_position_pct" in r.keys() else None,
-                "roll_layer": int(r["roll_layer"] or 0) if "roll_layer" in r.keys() else 0,
+                "roll_layer": roll_layer,
+                "roll_status": roll_status,
+                "roll_price": float(r["roll_price"] or 0) if "roll_price" in r.keys() else None,
+                "protected_stop": protected_stop or None,
                 "last_roll_time": r["last_roll_time"] if "last_roll_time" in r.keys() else None,
                 "protected_profit": float(r["protected_profit"] or 0) if "protected_profit" in r.keys() else 0,
                 "max_floating_pnl": float(r["max_floating_pnl"] or 0) if "max_floating_pnl" in r.keys() else 0,
                 "roll_enabled": bool(r["roll_enabled"]) if "roll_enabled" in r.keys() else False,
-                "roll_block_reason": r["roll_block_reason"] if "roll_block_reason" in r.keys() else None,
+                "roll_block_reason": roll_block_reason,
                 "alpha_current_score": float(alpha_context.get("alpha_score") or 0) if alpha_context else None,
                 "alpha_volume_price_state": alpha_context.get("volume_price_state") if alpha_context else None,
                 "alpha_volume_price_action": alpha_context.get("volume_price_action") if alpha_context else None,
@@ -1598,7 +1654,18 @@ async def get_trading_status(user=Depends(get_user)):
                     "unrealized_pnl": p["unrealized_pnl"],
                     "leverage": p["leverage"],
                     "margin": round(p.get("margin") or 0, 2),
-                    "margin_ratio": round((p.get("maint_margin") or 0) / margin_balance * 100, 4) if margin_balance else 0,
+                    "margin_ratio": (
+                        round(cross_margin_ratio, 4)
+                        if str(p.get("margin_type") or "").lower() in {"cross", "crossed"} and cross_margin_ratio is not None
+                        else round(
+                            (p.get("maint_margin") or 0)
+                            / ((p.get("isolated_margin") or 0) + (p.get("unrealized_pnl") or 0))
+                            * 100,
+                            4,
+                        )
+                        if ((p.get("isolated_margin") or 0) + (p.get("unrealized_pnl") or 0)) > 0
+                        else None
+                    ),
                     "pnl_pct": round(p["unrealized_pnl"] / p["margin"] * 100, 2) if p.get("margin") else 0,
                     "invested": round(p.get("notional") or (p["entry_price"] * p["quantity"]), 2),
                     "initial_margin": round(p.get("initial_margin") or 0, 2),
@@ -1650,6 +1717,13 @@ async def get_trading_status(user=Depends(get_user)):
         _trading_status_cache["time"] = time.time()
         return result
     except Exception as e:
+        stale = _trading_status_cache.get("data")
+        if stale:
+            fallback = dict(stale)
+            fallback["stale"] = True
+            fallback["binance_warning"] = f"Binance 查询暂时超时，当前展示最近成功数据: {e}"
+            fallback["stale_age_seconds"] = round(max(0, time.time() - _trading_status_cache.get("time", 0)), 1)
+            return fallback
         return {
             "error": str(e),
             "data_source": "binance_live",
@@ -1661,6 +1735,454 @@ async def get_trading_status(user=Depends(get_user)):
         }
     finally:
         ex.close()
+
+
+def _live_holding_fields(entry_time):
+    from datetime import datetime, timezone
+
+    if not entry_time:
+        return {"entry_time": None, "holding_seconds": None, "holding_time": "-"}
+    try:
+        text = str(entry_time).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        entered = datetime.fromisoformat(text)
+        if entered.tzinfo is None:
+            entered = entered.replace(tzinfo=timezone.utc)
+        seconds = max(0, int((datetime.now(timezone.utc) - entered.astimezone(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return {"entry_time": entry_time, "holding_seconds": None, "holding_time": "-"}
+
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        label = f"{days}天{hours}小时"
+    elif hours:
+        label = f"{hours}小时{minutes}分钟"
+    elif minutes:
+        label = f"{minutes}分钟"
+    else:
+        label = f"{secs}秒"
+    return {"entry_time": entry_time, "holding_seconds": seconds, "holding_time": label}
+
+
+def _live_position_management_fields(state: dict | None) -> dict:
+    if not state:
+        return {
+            "entry_reason": None, "entry_score": None,
+            "tp1_hit": False, "tp2_hit": False,
+            "highest_price": None, "lowest_price": None,
+            "stop_model": None, "initial_stop_loss": None, "stop_pct": None,
+            "current_stop_loss": None, "trailing_stop_price": None,
+            "trailing_enabled": False, "trailing_atr_multiplier": None,
+            "r_multiple": None, "initial_quantity": None,
+            "last_exit_reason": None, "last_exit_plain": None,
+            "strategy_source": "normal", "signal_source": None,
+            "alpha_symbol": None, "alpha_profile": None,
+            "alpha_entry_level": None, "alpha_score": None,
+            "alpha_suggested_position_pct": None,
+            "roll_layer": 0, "roll_status": "state_incomplete",
+            "roll_price": None, "protected_stop": None,
+            "last_roll_time": None, "protected_profit": 0,
+            "max_floating_pnl": 0, "roll_enabled": False,
+            "roll_block_reason": "state_incomplete",
+            "alpha_current_score": None,
+            "alpha_volume_price_state": None,
+            "alpha_volume_price_action": None,
+            "alpha_volume_price_reason": None,
+        }
+
+    def number(name, default=None):
+        value = state.get(name)
+        return float(value) if value is not None else default
+
+    roll_block_reason = state.get("roll_block_reason")
+    roll_layer = int(state.get("roll_layer") or 0)
+    if roll_block_reason:
+        roll_status = roll_block_reason
+    elif roll_layer >= 1:
+        roll_status = "rolled_protected" if number("protected_stop") else "protection_missing"
+    elif not number("initial_quantity") or not number("initial_stop_loss") or not number("atr_value"):
+        roll_status = "state_incomplete"
+    elif not bool(state.get("tp1_hit")):
+        roll_status = "waiting_tp1"
+    else:
+        roll_status = "waiting_1_5r"
+
+    return {
+        "entry_reason": state.get("entry_reason"),
+        "entry_score": number("entry_score"),
+        "tp1_hit": bool(state.get("tp1_hit")),
+        "tp2_hit": bool(state.get("tp2_hit")),
+        "highest_price": number("highest_price"),
+        "lowest_price": number("lowest_price"),
+        "stop_model": state.get("stop_model"),
+        "initial_stop_loss": number("initial_stop_loss"),
+        "stop_pct": number("stop_pct"),
+        "current_stop_loss": number("current_stop_loss"),
+        "trailing_stop_price": number("trailing_stop_price"),
+        "trailing_enabled": bool(state.get("trailing_enabled")),
+        "trailing_atr_multiplier": number("trailing_atr_multiplier"),
+        "r_multiple": number("r_multiple"),
+        "initial_quantity": number("initial_quantity"),
+        "last_exit_reason": state.get("last_exit_reason"),
+        "last_exit_plain": plain_reason(state.get("last_exit_reason")) if state.get("last_exit_reason") else None,
+        "strategy_source": state.get("strategy_source") or "normal",
+        "signal_source": state.get("signal_source"),
+        "alpha_symbol": state.get("alpha_symbol"),
+        "alpha_profile": state.get("alpha_profile"),
+        "alpha_entry_level": state.get("alpha_entry_level"),
+        "alpha_score": number("alpha_score"),
+        "alpha_suggested_position_pct": number("alpha_suggested_position_pct"),
+        "roll_layer": roll_layer,
+        "roll_status": roll_status,
+        "roll_price": number("roll_price"),
+        "protected_stop": number("protected_stop"),
+        "last_roll_time": state.get("last_roll_time"),
+        "protected_profit": number("protected_profit", 0),
+        "max_floating_pnl": number("max_floating_pnl", 0),
+        "roll_enabled": bool(state.get("roll_enabled")),
+        "roll_block_reason": roll_block_reason,
+        "alpha_current_score": None,
+        "alpha_volume_price_state": None,
+        "alpha_volume_price_action": None,
+        "alpha_volume_price_reason": None,
+    }
+
+
+def _account_decision_panel(conn, account_id: int) -> dict:
+    panel = {
+        "latest_run_id": None, "latest_time": None,
+        "last_execution_time": None, "top_reasons": [], "recent": [],
+        "entry_gate_mode": "per_symbol_entry_profile",
+        "entry_gate_plain": "开仓线按币种模板判断；全局60分不提前拦截试探仓。",
+        "regime_effect_plain": "行情状态只调整开仓名额和仓位，不直接抬高综合分门槛。",
+    }
+    try:
+        from shared.strategy_learning import load_entry_policy
+        policy = load_entry_policy()
+        panel["active_entry_policy_count"] = len(policy.get("rules") or [])
+        panel["active_entry_policy_version"] = policy.get("version")
+    except Exception:
+        panel["active_entry_policy_count"] = 0
+        panel["active_entry_policy_version"] = None
+
+    latest = conn.execute(
+        """SELECT run_id, time FROM strategy_decisions
+           WHERE account_id=? ORDER BY datetime(time) DESC, id DESC LIMIT 1""",
+        (account_id,),
+    ).fetchone()
+    if not latest:
+        return panel
+    panel["latest_run_id"] = latest["run_id"]
+    panel["latest_time"] = latest["time"]
+    panel["last_execution_time"] = latest["time"]
+    panel["top_reasons"] = [
+        {"reason": row["reason"], "plain": plain_reason(row["reason"]), "count": row["count"]}
+        for row in conn.execute(
+            """SELECT filter_reason AS reason, COUNT(*) AS count
+               FROM strategy_decisions
+               WHERE account_id=? AND run_id=?
+                 AND filter_reason IS NOT NULL AND filter_reason!=''
+               GROUP BY filter_reason ORDER BY count DESC LIMIT 6""",
+            (account_id, latest["run_id"]),
+        ).fetchall()
+    ]
+    panel["recent"] = [
+        {
+            "time": row["time"], "symbol": row["symbol"], "side": row["side"],
+            "stage": row["decision_stage"], "result": row["decision_result"],
+            "score": float(row["composite_score"] or 0),
+            "reason": row["filter_reason"], "plain": plain_reason(row["filter_reason"]),
+        }
+        for row in conn.execute(
+            """SELECT time, symbol, side, decision_stage, decision_result,
+                      filter_reason, composite_score
+               FROM strategy_decisions
+               WHERE account_id=? AND run_id=? ORDER BY id DESC LIMIT 10""",
+            (account_id, latest["run_id"]),
+        ).fetchall()
+    ]
+    return panel
+
+
+def _account_status_payload(account: dict) -> dict:
+    from shared.accounts import account_exchange_config
+    from shared.db import fetch_position_trade_groups, get_conn
+    from trader.exchange import BinanceFutures
+
+    ex = BinanceFutures(
+        config=account_exchange_config(account),
+        account_id=account["id"],
+        account_name=account["name"],
+    )
+    try:
+        margin = ex.get_margin_balance()
+        positions = ex.get_positions()
+        wallet = float(margin.get("totalWalletBalance") or 0)
+        equity = float(margin.get("totalMarginBalance") or wallet)
+        total_maint_margin = float(margin.get("totalMaintMargin") or 0)
+        cross_margin_ratio = (total_maint_margin / equity * 100) if equity > 0 else None
+        conn = get_conn()
+        try:
+            adjustments = float(conn.execute(
+                """SELECT COALESCE(SUM(CASE
+                       WHEN adjustment_type IN ('deposit','transfer_in') THEN amount
+                       WHEN adjustment_type IN ('withdraw','transfer_out') THEN -amount
+                       ELSE amount END), 0)
+                   FROM account_capital_adjustments WHERE account_id=?""",
+                (account["id"],),
+            ).fetchone()[0] or 0)
+            history = fetch_position_trade_groups(100, account_id=account["id"])
+            position_states = {
+                row["symbol"]: dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM account_position_history WHERE account_id=?",
+                    (account["id"],),
+                ).fetchall()
+            }
+            latest_open_orders = {
+                row["symbol"]: row["created_at"]
+                for row in conn.execute(
+                    """SELECT symbol, MAX(created_at) AS created_at
+                       FROM orders
+                       WHERE account_id=? AND order_type='MARKET'
+                       GROUP BY symbol""",
+                    (account["id"],),
+                ).fetchall()
+            }
+            decision_panel = _account_decision_panel(conn, account["id"])
+            latest_position_actions = {
+                row["symbol"]: row["filter_reason"] or row["decision_result"]
+                for row in conn.execute(
+                    """SELECT d.symbol, d.filter_reason, d.decision_result
+                       FROM strategy_decisions d
+                       JOIN (
+                         SELECT symbol, MAX(id) AS latest_id
+                         FROM strategy_decisions
+                         WHERE account_id=?
+                           AND decision_stage IN ('position_management','roll_position','execution')
+                         GROUP BY symbol
+                       ) latest ON latest.latest_id=d.id""",
+                    (account["id"],),
+                ).fetchall()
+            }
+            latest_market_phase = {}
+            for row in conn.execute(
+                """SELECT s.symbol, s.raw_features
+                   FROM alpha_scores s
+                   JOIN (
+                     SELECT symbol, MAX(time) AS max_time
+                     FROM alpha_scores GROUP BY symbol
+                   ) latest ON latest.symbol=s.symbol AND latest.max_time=s.time"""
+            ).fetchall():
+                raw = _parse_json(row["raw_features"], {})
+                latest_market_phase[row["symbol"]] = raw.get("market_phase") or {}
+            for row in conn.execute(
+                """SELECT s.alpha_symbol, s.futures_symbol, s.raw_features
+                   FROM alpha_scan_scores s
+                   JOIN (
+                     SELECT alpha_symbol, MAX(time) AS max_time
+                     FROM alpha_scan_scores GROUP BY alpha_symbol
+                   ) latest ON latest.alpha_symbol=s.alpha_symbol AND latest.max_time=s.time"""
+            ).fetchall():
+                raw = _parse_json(row["raw_features"], {})
+                phase = raw.get("market_phase") or {}
+                if row["futures_symbol"]:
+                    latest_market_phase[row["futures_symbol"]] = phase
+                latest_market_phase[row["alpha_symbol"]] = phase
+        finally:
+            conn.close()
+        initial = float(account.get("initial_capital") or 0)
+        total_pnl = equity - initial - adjustments
+        base = initial + adjustments
+        trade_rows = [row for row in history if row.get("symbol") != "ACCOUNT"]
+        win_count = sum(1 for row in trade_rows if float(row.get("pnl") or row.get("net_pnl") or 0) > 0)
+        loss_count = sum(1 for row in trade_rows if float(row.get("pnl") or row.get("net_pnl") or 0) < 0)
+        for position in positions:
+            position["account_id"] = account["id"]
+            position["account_name"] = account["name"]
+            state = position_states.get(position.get("symbol")) or {}
+            entry_time = state.get("entry_time") or latest_open_orders.get(position.get("symbol"))
+            position.update(_live_holding_fields(entry_time))
+            position.update(_live_position_management_fields(state))
+            position["market_phase"] = (
+                latest_market_phase.get(position.get("symbol"))
+                or latest_market_phase.get(state.get("alpha_symbol"))
+                or {}
+            )
+            position["last_system_action"] = latest_position_actions.get(position.get("symbol"))
+            position["invested"] = round(
+                float(position.get("notional") or 0)
+                or abs(float(position.get("entry_price") or 0) * float(position.get("quantity") or 0)),
+                2,
+            )
+            if state.get("strategy_source") == "alpha":
+                from shared.db import fetch_latest_alpha_position_context
+                alpha_context = fetch_latest_alpha_position_context(
+                    symbol=position.get("symbol"),
+                    alpha_symbol=state.get("alpha_symbol"),
+                ) or {}
+                reasons = _parse_json(alpha_context.get("volume_price_reasons_json"), [])
+                position.update({
+                    "alpha_current_score": float(alpha_context.get("alpha_score") or 0) if alpha_context else None,
+                    "alpha_volume_price_state": alpha_context.get("volume_price_state"),
+                    "alpha_volume_price_action": alpha_context.get("volume_price_action"),
+                    "alpha_volume_price_reason": reasons[0] if reasons else None,
+                })
+            entry_price = float(position.get("entry_price") or 0)
+            quantity = float(position.get("quantity") or 0)
+            tracked_price = (
+                float(position.get("highest_price") or entry_price)
+                if position.get("side") == "LONG"
+                else float(position.get("lowest_price") or entry_price)
+            )
+            tracked_pnl = (
+                (tracked_price - entry_price) * quantity
+                if position.get("side") == "LONG"
+                else (entry_price - tracked_price) * quantity
+            )
+            position["max_floating_pnl"] = round(
+                max(float(position.get("max_floating_pnl") or 0), tracked_pnl, 0),
+                2,
+            )
+            position_margin = float(position.get("margin") or position.get("position_initial_margin") or 0)
+            position["pnl_pct"] = round(float(position.get("unrealized_pnl") or 0) / position_margin * 100, 2) if position_margin > 0 else None
+            if str(position.get("margin_type") or "").lower() in {"cross", "crossed"}:
+                position["margin_ratio"] = round(cross_margin_ratio, 4) if cross_margin_ratio is not None else None
+            else:
+                isolated_balance = float(position.get("isolated_margin") or 0) + float(position.get("unrealized_pnl") or 0)
+                position["margin_ratio"] = round(float(position.get("maint_margin") or 0) / isolated_balance * 100, 4) if isolated_balance > 0 else None
+        return {
+            "account_id": account["id"], "account_name": account["name"],
+            "environment": account["environment"], "status": "ok", "stale": False,
+            "initial_capital": initial, "net_capital_adjustments": adjustments,
+            "wallet_balance": wallet, "equity": equity,
+            "available_balance": float(margin.get("availableBalance") or 0),
+            "unrealized_pnl": float(margin.get("totalUnrealizedProfit") or 0),
+            "total_pnl": total_pnl, "return_pct": (total_pnl / base * 100) if base else 0,
+            "max_positions": int(account.get("max_positions") or 5),
+            "position_count": len(positions), "positions": positions, "recent_trades": history,
+            "decision_panel": decision_panel,
+            "stats": {
+                "total_opens": len(trade_rows) + len(positions),
+                "total_closed": len(trade_rows),
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate": (win_count / len(trade_rows) * 100) if trade_rows else 0,
+            },
+            "normal_trading_enabled": bool(account.get("normal_trading_enabled")),
+            "alpha_trading_enabled": bool(account.get("alpha_trading_enabled")),
+            "auto_trading_enabled": bool(account.get("auto_trading_enabled")),
+        }
+    except Exception as exc:
+        return {
+            "account_id": account["id"], "account_name": account["name"],
+            "environment": account["environment"], "status": "degraded",
+            "error": str(exc), "positions": [], "recent_trades": [],
+            "initial_capital": float(account.get("initial_capital") or 0),
+            "max_positions": int(account.get("max_positions") or 5),
+        }
+    finally:
+        ex.close()
+
+
+@app.get("/api/trading/accounts")
+async def get_trading_accounts(user=Depends(get_user)):
+    from shared.accounts import list_accounts
+    return {"accounts": list_accounts()}
+
+
+@app.post("/api/trading/accounts")
+async def create_trading_account(body: dict, user=Depends(get_user)):
+    from shared.accounts import save_account
+    try:
+        account = save_account(body)
+        _clear_trading_caches()
+        return {"status": "ok", "account": account}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.patch("/api/trading/accounts/{account_id}")
+async def update_trading_account(account_id: int, body: dict, user=Depends(get_user)):
+    from shared.accounts import save_account
+    try:
+        account = save_account(body, account_id=account_id)
+        _clear_trading_caches()
+        return {"status": "ok", "account": account}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.delete("/api/trading/accounts/{account_id}")
+async def delete_trading_account(account_id: int, user=Depends(get_user)):
+    from shared.accounts import delete_account
+    try:
+        delete_account(account_id)
+        _clear_trading_caches()
+        return {"status": "ok"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/trading/accounts/{account_id}/test")
+async def test_trading_account(account_id: int, user=Depends(get_user)):
+    from shared.accounts import get_account
+    account = get_account(account_id, include_secrets=True)
+    if not account:
+        return {"error": "账户不存在"}
+    result = await asyncio.to_thread(_account_status_payload, account)
+    return result
+
+
+@app.post("/api/trading/accounts/{account_id}/capital-adjustments")
+async def add_account_capital_adjustment(account_id: int, body: dict, user=Depends(get_user)):
+    from shared.db import get_conn
+    adjustment_type = str(body.get("adjustment_type") or "correction")
+    if adjustment_type not in {"deposit", "withdraw", "transfer_in", "transfer_out", "correction"}:
+        return {"error": "无效的资金调整类型"}
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO account_capital_adjustments
+               (account_id, adjustment_type, amount, effective_time, note)
+               VALUES (?, ?, ?, COALESCE(?, datetime('now')), ?)""",
+            (account_id, adjustment_type, float(body.get("amount") or 0), body.get("effective_time"), body.get("note")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok"}
+
+
+@app.get("/api/trading/accounts/status")
+async def get_all_trading_account_status(user=Depends(get_user)):
+    from shared.accounts import list_accounts
+    accounts = list_accounts(include_secrets=True, enabled_only=True)
+    results = await asyncio.gather(*[asyncio.to_thread(_account_status_payload, account) for account in accounts])
+    healthy = [row for row in results if row.get("status") == "ok"]
+    environments = {row.get("environment") for row in healthy}
+    if len(environments) > 1:
+        environment_status = "MIXED"
+    elif environments == {"prod"}:
+        environment_status = "PROD LIVE"
+    elif environments == {"testnet"}:
+        environment_status = "TESTNET LIVE"
+    else:
+        environment_status = "LIVE DEGRADED"
+    return {
+        "accounts": results,
+        "environment_status": environment_status,
+        "summary": {
+            "initial_capital": sum(float(r.get("initial_capital") or 0) for r in healthy),
+            "equity": sum(float(r.get("equity") or 0) for r in healthy),
+            "total_pnl": sum(float(r.get("total_pnl") or 0) for r in healthy),
+            "unrealized_pnl": sum(float(r.get("unrealized_pnl") or 0) for r in healthy),
+            "position_count": sum(len(r.get("positions") or []) for r in healthy),
+        },
+    }
 
 
 @app.get("/api/trading/stats")

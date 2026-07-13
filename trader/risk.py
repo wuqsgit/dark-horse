@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -58,19 +59,32 @@ def _symbol_class(symbol: str, fallback: str = "narrative") -> str:
 def _position_sizing_config(symbol: str, category: str | None = None) -> tuple[str, dict]:
     sizing = TRADING_CONFIG.get("position_sizing") or {}
     class_key = category or _symbol_class(symbol)
-    return class_key, dict(sizing.get(class_key) or sizing.get("narrative") or {})
+    result = dict(sizing.get(class_key) or sizing.get("narrative") or {})
+    symbol_caps = (TRADING_CONFIG.get("dynamic_leverage") or {}).get("symbol_caps") or {}
+    symbol_cap = symbol_caps.get(str(symbol or "").upper())
+    if symbol_cap is not None:
+        result["leverage_max"] = int(symbol_cap)
+    return class_key, result
+
+
+def _leverage_stop_pct(atr_pct: float) -> float:
+    cfg = TRADING_CONFIG.get("dynamic_leverage") or {}
+    multiplier = float(cfg.get("atr_stop_multiplier", 2.0))
+    min_stop = float(cfg.get("min_stop_pct", 0.025))
+    max_stop = float(cfg.get("max_stop_pct", 0.10))
+    return min(max_stop, max(min_stop, max(0.0, float(atr_pct or 0)) * multiplier))
 
 
 def _dynamic_leverage(atr_pct: float, sizing: dict) -> int:
-    lev = int(sizing.get("leverage_base") or TRADING_CONFIG.get("leverage_max", 3) or 3)
-    for threshold, candidate in sizing.get("atr_leverage_steps") or []:
-        if atr_pct < float(threshold):
-            lev = int(candidate)
-            break
-    lev = max(int(sizing.get("leverage_min", 1)), lev)
-    lev = min(int(sizing.get("leverage_max", lev)), lev)
-    lev = min(int(TRADING_CONFIG.get("leverage_max", lev)), lev)
-    return max(1, lev)
+    cfg = TRADING_CONFIG.get("dynamic_leverage") or {}
+    stop_pct = _leverage_stop_pct(atr_pct)
+    target_margin_loss = float(cfg.get("target_margin_loss_pct", 0.20))
+    raw_leverage = math.floor(target_margin_loss / stop_pct) if stop_pct > 0 else 1
+    min_leverage = int(cfg.get("min_leverage", 2))
+    global_max = int(cfg.get("max_leverage", TRADING_CONFIG.get("leverage_max", 8)))
+    class_or_symbol_cap = int(sizing.get("leverage_max", global_max))
+    leverage_cap = max(1, min(global_max, class_or_symbol_cap))
+    return max(1, min(leverage_cap, max(min_leverage, raw_leverage)))
 
 
 def calculate_position(
@@ -93,6 +107,7 @@ def calculate_position(
     atr_pct = atr / price if price > 0 else 0.02
     class_key, sizing = _position_sizing_config(symbol, category)
     leverage = _dynamic_leverage(atr_pct, sizing)
+    leverage_stop_pct = _leverage_stop_pct(atr_pct)
     hard_stop_pct = float(sizing.get("hard_stop_pct", cfg.get("hard_stop_pct", 0.05)))
     min_stop_pct = float(sizing.get("min_stop_pct", sizing.get("min_effective_stop_pct", 0.003)))
     atr_multiplier = float(sizing.get("atr_stop_multiplier", 2.5))
@@ -146,6 +161,7 @@ def calculate_position(
         "trailing_atr_multiplier": float(sizing.get("trailing_atr_multiplier", cfg.get("trailing_stop_atr_multiplier", 1.5))),
         "atr_value": atr,
         "atr_pct": round(atr_pct, 6),
+        "leverage_stop_pct": round(leverage_stop_pct, 6),
         "leverage": leverage,
         "margin": margin,
         "target_margin": target_margin,

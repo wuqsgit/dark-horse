@@ -36,3 +36,4 @@ server.log
 
 # Exports and generated artifacts
 exports/
+.account_secret.key

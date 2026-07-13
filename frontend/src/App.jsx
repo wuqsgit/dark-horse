@@ -3,6 +3,8 @@ import ScanTable from './components/ScanTable';
 import AlphaScan from './components/AlphaScan';
 import BacktestPanel from './components/BacktestPanel';
 import LiveTrading from './components/LiveTrading';
+import MarketDataHealth from './components/MarketDataHealth';
+import TradingEnvironmentStatus from './components/TradingEnvironmentStatus';
 import './styles.css';
 
 export default function App() {
@@ -24,10 +26,8 @@ export default function App() {
           <button className={currentPage === 'backtest' ? 'active' : ''} onClick={() => setCurrentPage('backtest')}>回测</button>
           <button className={currentPage === 'trading' ? 'active' : ''} onClick={() => setCurrentPage('trading')}>实盘</button>
         </nav>
-        <div className="terminal-status">
-          <span className="live-dot" />
-          <span>TESTNET LIVE</span>
-        </div>
+        <MarketDataHealth />
+        <TradingEnvironmentStatus />
       </header>
 
       <main className="main">

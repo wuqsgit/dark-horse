@@ -22,6 +22,18 @@ function fmtPrice(v) {
   return `$${n.toFixed(2)}`;
 }
 
+function marketPhaseText(v) {
+  const map = {
+    trend_up: '上涨趋势',
+    trend_down: '下跌趋势',
+    range: '震荡',
+    breakout_pending: '突破待确认',
+    breakdown_risk: '破位风险',
+    uncertain: '不确定',
+  };
+  return map[v] || v || '-';
+}
+
 function DetailRow({ label, value, valueColor }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '7px 0', borderBottom: '1px solid #1f2937' }}>
@@ -213,6 +225,11 @@ function SymbolDetail({ symbol, onBack }) {
         </div>
         <div style={{ background: '#0d1117', border: '1px solid #1f2937', borderRadius: 10, padding: 18 }}>
           <div style={{ color: '#9ca3af', marginBottom: 8 }}>{detail.chip_phase || '-'} · {detail.trend_direction || '-'} · {detail.volatility_level || '-'}</div>
+          <div style={{ color: '#9ca3af', marginBottom: 8 }}>
+            市场状态：{marketPhaseText(detail.market_phase?.phase)}
+            {detail.market_phase?.confidence != null ? ` · ${fmt(detail.market_phase.confidence, 0)}分` : ''}
+            {detail.market_phase?.allow_roll ? ' · 允许滚仓' : ' · 不滚仓'}
+          </div>
           <div style={{ color: '#d0d5e0', fontSize: 20, fontWeight: 800 }}>{detail.risk_label || '-'}</div>
         </div>
       </div>
@@ -331,6 +348,10 @@ export default function ScanTable() {
               </div>
               <div style={{ color: '#c9d1d9', fontSize: 13, marginBottom: 10 }}>
                 {r.chip_phase || '-'} · {r.trend_direction || '-'} · {r.volatility_level || '-'}
+              </div>
+              <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 10 }}>
+                市场状态：{marketPhaseText(r.market_phase?.phase)}
+                {r.market_phase?.confidence != null ? ` · ${fmt(r.market_phase.confidence, 0)}分` : ''}
               </div>
               <div style={{ color: r.plain_signal?.headline?.includes('暂不') || r.plain_signal?.headline?.includes('观察') ? '#f97316' : '#22c55e', fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
                 {r.plain_signal?.headline || r.risk_label || '-'}

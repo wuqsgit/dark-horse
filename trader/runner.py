@@ -29,28 +29,38 @@ urllib3.disable_warnings()
 logger = logging.getLogger("trader")
 
 
-async def trading_loop():
+async def _account_trading_loop(account):
+    from shared.accounts import account_exchange_config
+    from shared.db import set_account_context
+    set_account_context(account["id"])
+    exchange_cfg = account_exchange_config(account)
     missing_vars = []
-    if not EXCHANGE_CONFIG.get("api_key"):
-        missing_vars.append("TESTNET_API_KEY" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_KEY")
-    if not EXCHANGE_CONFIG.get("api_secret"):
-        missing_vars.append("TESTNET_API_SECRET" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_SECRET")
+    if not exchange_cfg.get("api_key"):
+        missing_vars.append("API_KEY")
+    if not exchange_cfg.get("api_secret"):
+        missing_vars.append("API_SECRET")
     if missing_vars:
         logger.error("Binance API credentials missing: %s", ", ".join(missing_vars))
         return
 
-    network = "Testnet" if EXCHANGE_CONFIG.get("testnet") else "Mainnet"
+    network = "Testnet" if exchange_cfg.get("testnet") else "Mainnet"
     logger.info("=== 启动实盘交易引擎 (%s) ===", network)
 
     # 初始化
-    ex = BinanceFutures()
+    ex = BinanceFutures(exchange_cfg, account_id=account["id"], account_name=account["name"])
     engine = ExecutionEngine(ex)
+    engine.cfg = dict(engine.cfg)
+    engine.cfg["max_positions"] = int(account.get("max_positions") or 5)
+    engine.account_controls = {
+        "normal_trading_enabled": bool(account.get("normal_trading_enabled")),
+        "alpha_trading_enabled": bool(account.get("alpha_trading_enabled")),
+    }
     last_income_sync = 0  # 上次 income 同步时间
     loop_interval = int(TRADING_CONFIG.get("rebalance_interval_min", 5) * 60)
 
     while True:
         try:
-            run_id = f"live-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+            run_id = f"live-a{account['id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
             now = asyncio.get_event_loop().time()
             
             # 每 5 分钟同步一次 income 数据
@@ -143,6 +153,14 @@ async def trading_loop():
 
             # 3. 决策
             actions = engine.decide(top_symbols, positions, run_id=run_id)
+            actions = [
+                action for action in actions
+                if action.get("action") != "open"
+                or (
+                    (action.get("strategy_source") == "alpha" and bool(account.get("alpha_trading_enabled")))
+                    or (action.get("strategy_source") != "alpha" and bool(account.get("normal_trading_enabled")))
+                )
+            ]
 
             # 3.5 按类别打印评分排序 + 未开仓原因
             pending = [a.get('symbol') for a in actions if a.get('action') == 'open']
@@ -166,6 +184,44 @@ async def trading_loop():
     # === 以下在 while True 之外（不会执行），保留供手动调用 ===
 
 
+async def trading_loop():
+    from shared.accounts import list_accounts
+
+    tasks = {}
+    signatures = {}
+    while True:
+        try:
+            accounts = list_accounts(include_secrets=True, enabled_only=True)
+        except Exception as exc:
+            logger.warning("Trading account configuration temporarily unavailable: %s", exc)
+            await asyncio.sleep(5)
+            continue
+        active_ids = set()
+        for account in accounts:
+            if not account.get("auto_trading_enabled"):
+                continue
+            account_id = int(account["id"])
+            active_ids.add(account_id)
+            signature = (
+                account.get("environment"), account.get("api_key"), account.get("api_secret"),
+                account.get("max_positions"), account.get("normal_trading_enabled"),
+                account.get("alpha_trading_enabled"), account.get("auto_trading_enabled"),
+            )
+            if account_id in tasks and not tasks[account_id].done() and signatures.get(account_id) == signature:
+                continue
+            if account_id in tasks and not tasks[account_id].done():
+                tasks[account_id].cancel()
+            tasks[account_id] = asyncio.create_task(_account_trading_loop(account))
+            signatures[account_id] = signature
+        for account_id in list(tasks):
+            if account_id not in active_ids:
+                if not tasks[account_id].done():
+                    tasks[account_id].cancel()
+                tasks.pop(account_id, None)
+                signatures.pop(account_id, None)
+        await asyncio.sleep(30)
+
+
 def fetch_and_store_income(ex, days_back=7):
     """🔧 拉取币安 Income API 并写入 fills 表
 
@@ -180,10 +236,12 @@ def fetch_and_store_income(ex, days_back=7):
     )
     conn = get_conn()
     now = datetime.now(timezone.utc)
+    account_id = int(getattr(ex, "account_id", 1) or 1)
     
     # 获取最后一次同步的时间戳
     last_sync = conn.execute(
-        "SELECT MAX(created_at) FROM fills WHERE side='REALIZED_PNL'"
+        "SELECT MAX(created_at) FROM fills WHERE account_id=? AND side='REALIZED_PNL'",
+        (account_id,),
     ).fetchone()[0]
     
     # 默认查最近 7 天
@@ -241,8 +299,9 @@ def fetch_and_store_income(ex, days_back=7):
                 income = float(i["income"])
                 trade_id = i.get("tradeId", "")
                 # 检查是否已存在
+                stored_trade_id = f"A{account_id}:{trade_id}" if trade_id else ""
                 exists = conn.execute(
-                    "SELECT id FROM fills WHERE trade_id=?", (trade_id,)
+                    "SELECT id FROM fills WHERE account_id=? AND trade_id=?", (account_id, stored_trade_id)
                 ).fetchone()
                 if not exists:
                     insert_fill(sym, None, "REALIZED_PNL", abs(income), 0, income, 0, "USDT", trade_id)
@@ -259,12 +318,21 @@ def fetch_and_store_income(ex, days_back=7):
             logger.info(f"Position trade rebuild complete: {rebuilt} rows")
             _apply_recent_alpha_close_cooldowns()
             try:
-                from shared.policy_loop import review_position_trade_exits, summarize_exit_reviews
+                from shared.policy_loop import (
+                    review_position_trade_entries,
+                    review_position_trade_exits,
+                    summarize_entry_reviews,
+                    summarize_exit_reviews,
+                )
 
+                entry_reviewed = review_position_trade_entries(limit=300)
+                entry_summarized = summarize_entry_reviews(recent_limit=30)
                 reviewed = review_position_trade_exits(limit=200)
                 summarized = summarize_exit_reviews(window_days=7, recent_limit=30)
                 logger.info(
-                    "Exit review complete: reviewed=%s summaries=%s",
+                    "Position review complete: entries=%s entry_summaries=%s exits=%s exit_summaries=%s",
+                    entry_reviewed.get("reviewed", 0),
+                    len(entry_summarized.get("summaries", [])),
                     reviewed.get("reviewed", 0),
                     len(summarized.get("summaries", [])),
                 )
@@ -274,7 +342,10 @@ def fetch_and_store_income(ex, days_back=7):
             logger.warning(f"position trade rebuild error: {e}")
 
         total_income_pnl = sum(float(i["income"]) for i in real_pnl)
-        local_pnl = conn.execute("SELECT SUM(pnl) FROM trades WHERE source IN ('system','income_auto')").fetchone()[0] or 0
+        local_pnl = conn.execute(
+            "SELECT SUM(pnl) FROM trades WHERE account_id=? AND source IN ('system','income_auto')",
+            (account_id,),
+        ).fetchone()[0] or 0
         diff = abs(total_income_pnl - local_pnl)
         if diff > 1.0:
             logger.warning(f"⚠️ 对账差异: trades表=${local_pnl:.2f} vs incomeAPI=${total_income_pnl:.2f} 差${diff:.2f}")
@@ -298,6 +369,8 @@ def _apply_recent_alpha_close_cooldowns(minutes_back=12):
     stop_minutes = int(cfg.get("stop_cooldown_minutes", 180))
     conn = get_conn()
     try:
+        from shared.db import current_account_id
+        account_id = current_account_id()
         rows = conn.execute(
             """
             SELECT pt.symbol,
@@ -309,13 +382,15 @@ def _apply_recent_alpha_close_cooldowns(minutes_back=12):
                    EXISTS(
                        SELECT 1
                        FROM orders o
-                       WHERE o.symbol = pt.symbol
+                       WHERE o.account_id = pt.account_id
+                         AND o.symbol = pt.symbol
                          AND COALESCE(o.strategy_source, '') = 'alpha'
                          AND datetime(o.created_at) >= datetime(pt.exit_time, '-6 hours')
                          AND datetime(o.created_at) <= datetime(pt.exit_time, '+5 minutes')
                    ) AS has_alpha_order
             FROM position_trades pt
-            WHERE pt.symbol <> 'ACCOUNT'
+            WHERE pt.account_id=?
+              AND pt.symbol <> 'ACCOUNT'
               AND datetime(pt.exit_time) >= datetime('now', ?)
               AND (
                   COALESCE(pt.strategy_source, '') = 'alpha'
@@ -326,7 +401,7 @@ def _apply_recent_alpha_close_cooldowns(minutes_back=12):
             ORDER BY datetime(pt.exit_time) DESC
             LIMIT 100
             """,
-            (f"-{int(minutes_back)} minutes",),
+            (account_id, f"-{int(minutes_back)} minutes"),
         ).fetchall()
 
         for row in rows:

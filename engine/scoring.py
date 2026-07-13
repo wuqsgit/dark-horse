@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from shared.db import insert_training_samples, get_conn
+from shared.market_phase import detect_market_phase
 from engine.structure_metrics import compute_structure_metrics
 from engine.factor_engine import compute_score_layers
 
@@ -104,6 +105,7 @@ class ScoringEngine:
                 onc_feat = self._compute_onchain(df_onchain, sym)
                 depth_feat = self._compute_depth_factor(sym)
                 phase = self._detect_market_phase(tech, fut_feat)
+                market_phase = detect_market_phase(sym, tech, fut_feat, {})
                 alpha = self._compute_alpha_score(tech, fut_feat, onc_feat, phase)
                 ev = self._estimate_ev(tech, fut_feat)
                 score_layers = compute_score_layers(sym, tech, fut_feat, onc_feat, depth_feat, {})
@@ -114,6 +116,7 @@ class ScoringEngine:
                        "futures": {k: round(v,6) if isinstance(v,float) else v for k,v in fut_feat.items() if v is not None},
                        "onchain": {k: round(v,2) if isinstance(v,float) else v for k,v in onc_feat.items() if v is not None},
                        "depth": {k: round(v,4) if isinstance(v,float) else v for k,v in depth_feat.items() if v is not None},
+                       "market_phase": market_phase,
                        "score_layers": score_layers}
                 results.append({
                     "time": now, "symbol": sym,
@@ -974,12 +977,14 @@ class ScoringEngine:
 
         if n >= 50:
             ema20 = self._ema(c, 20); ema50 = self._ema(c, 50)
+            r["ema20"] = float(ema20[-1])
             r["ema20_slope"] = float((ema20[-1]-ema20[-5])/ema20[-5]*100) if len(ema20) >= 5 else 0
             r["ema20_50_ratio"] = float(ema20[-1]/ema50[-1]) if ema50[-1] > 0 else 1.0
             if ema20[-1] > ema50[-1]*1.02: r["trend_direction"], r["trend_score"] = "向上", 70
             elif ema20[-1] < ema50[-1]*0.98: r["trend_direction"], r["trend_score"] = "向下", 30
             else: r["trend_direction"], r["trend_score"] = "横盘", 50
         else:
+            r["ema20"] = float(c[-1]) if n else 0
             r["ema20_slope"] = 0; r["ema20_50_ratio"] = 1.0
             r["trend_direction"], r["trend_score"] = "横盘", 50
 

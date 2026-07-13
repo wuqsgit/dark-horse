@@ -1,6 +1,7 @@
 # Binance futures API wrapper with testnet support.
 import hashlib
 import hmac
+import logging
 import time
 from typing import Optional
 import urllib.parse
@@ -10,25 +11,42 @@ import httpx
 from trader.config import EXCHANGE_CONFIG
 
 
+logger = logging.getLogger("exchange")
+
+
 class BinanceFutures:
-    def __init__(self):
+    def __init__(self, config=None, account_id=None, account_name=None):
         import warnings
         import urllib3
 
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         urllib3.disable_warnings()
-        cfg = EXCHANGE_CONFIG
+        cfg = config or EXCHANGE_CONFIG
+        self.account_id = account_id
+        self.account_name = account_name
+        self.testnet = bool(cfg.get("testnet"))
         self.api_key = cfg["api_key"]
         self.api_secret = cfg["api_secret"]
-        base = "https://testnet.binancefuture.com" if cfg["testnet"] else "https://fapi.binance.com"
+        base = "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
         self.base_rest = base
-        self.client = httpx.Client(timeout=10, verify=False, headers={"X-MBX-APIKEY": self.api_key})
+        self.client = self._new_client()
         self.time_offset_ms = 0
         self._last_time_sync = 0.0
 
     def _ensure_client(self):
         if self.client.is_closed:
-            self.client = httpx.Client(timeout=10, verify=False, headers={"X-MBX-APIKEY": self.api_key})
+            self.client = self._new_client()
+
+    def _new_client(self):
+        timeout = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=5.0)
+        return httpx.Client(timeout=timeout, verify=False, headers={"X-MBX-APIKEY": self.api_key})
+
+    def _reset_client(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = self._new_client()
 
     @staticmethod
     def _local_timestamp_ms() -> int:
@@ -74,7 +92,26 @@ class BinanceFutures:
                 request_kwargs["params"] = params
             return self.client.request(method, url, **request_kwargs)
 
-        resp = send_request()
+        attempts = 3 if method.upper() == "GET" else 1
+        resp = None
+        for attempt in range(attempts):
+            try:
+                resp = send_request()
+                break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt + 1 >= attempts:
+                    raise
+                logger.warning(
+                    "Binance query retry %s/%s for %s after %s",
+                    attempt + 1,
+                    attempts - 1,
+                    path,
+                    type(exc).__name__,
+                )
+                self._reset_client()
+                time.sleep(0.25 * (attempt + 1))
+        if resp is None:
+            raise RuntimeError(f"Binance request produced no response: {path}")
         if resp.status_code != 200 and signed and '"code":-1021' in resp.text:
             self._sync_time(force=True)
             resp = send_request()
@@ -104,6 +141,8 @@ class BinanceFutures:
         return {
             "totalWalletBalance": float(data.get("totalWalletBalance", 0)),
             "totalMarginBalance": float(data.get("totalMarginBalance", 0)),
+            "totalMaintMargin": float(data.get("totalMaintMargin", 0)),
+            "totalInitialMargin": float(data.get("totalInitialMargin", 0)),
             "totalUnrealizedProfit": float(data.get("totalUnrealizedProfit", 0)),
             "availableBalance": float(data.get("availableBalance", 0)),
             "usdt_wallet": usdt_wallet,
@@ -219,17 +258,32 @@ class BinanceFutures:
             data = resp.json()
             for s in data.get("symbols", []):
                 if s["symbol"] == symbol:
-                    qty_filter = [f for f in s["filters"] if f["filterType"] == "LOT_SIZE"]
+                    filters = {f.get("filterType"): f for f in s.get("filters", [])}
+                    qty_filter = filters.get("LOT_SIZE")
                     if qty_filter:
+                        notional_filter = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
+                        price_filter = filters.get("PRICE_FILTER") or {}
                         return {
-                            "step_size": float(qty_filter[0]["stepSize"]),
-                            "min_qty": float(qty_filter[0]["minQty"]),
-                            "max_qty": float(qty_filter[0]["maxQty"]),
+                            "step_size": float(qty_filter["stepSize"]),
+                            "min_qty": float(qty_filter["minQty"]),
+                            "max_qty": float(qty_filter["maxQty"]),
+                            "min_notional": float(
+                                notional_filter.get("minNotional")
+                                or notional_filter.get("notional")
+                                or 0
+                            ),
+                            "tick_size": float(price_filter.get("tickSize") or 0),
                         }
                     break
         except Exception:
             pass
-        return {"step_size": 0.001, "min_qty": 0.001, "max_qty": 99999}
+        return {
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "max_qty": 99999,
+            "min_notional": 0.0,
+            "tick_size": 0.0,
+        }
 
     def set_leverage(self, symbol: str, leverage: int = 10):
         params = {"symbol": symbol, "leverage": leverage}
@@ -254,6 +308,7 @@ class BinanceFutures:
         }
         if reduce_only:
             params["reduceOnly"] = True
+            params["newOrderRespType"] = "RESULT"
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
     def close_position_market(self, symbol: str, side: str, quantity: float) -> dict:
@@ -272,6 +327,23 @@ class BinanceFutures:
             "workingType": "MARK_PRICE",
         }
         return self._request("POST", "/fapi/v1/algoOrder", signed=True, params=params)
+
+    def cancel_other_protective_stops(self, symbol: str, keep_order_id=None):
+        orders = self._request(
+            "GET", "/fapi/v1/openAlgoOrders", signed=True, params={"symbol": symbol}
+        )
+        for order in orders or []:
+            order_id = order.get("algoId") or order.get("orderId")
+            if order_id is None or str(order_id) == str(keep_order_id):
+                continue
+            if str(order.get("type") or "").upper() not in {"STOP", "STOP_MARKET"}:
+                continue
+            self._request(
+                "DELETE",
+                "/fapi/v1/algoOrder",
+                signed=True,
+                params={"symbol": symbol, "algoId": order_id},
+            )
 
     def place_take_profit_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
         self.adjust_quantity(symbol, quantity)

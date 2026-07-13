@@ -137,6 +137,48 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
             metrics=metrics,
         )
 
+    # Opening an Alpha long requires both markets and futures positioning to
+    # confirm the move. Discovery score must never compensate for weak OI.
+    min_trend_score = 72.0
+    min_alpha_volume = 1.8
+    min_futures_volume = 1.5
+    if trend_score < min_trend_score:
+        return _state(
+            "alpha_entry_confirmation_missing",
+            "observe",
+            reasons=[f"trend score {trend_score:.1f} < {min_trend_score:.0f}"],
+            metrics=metrics,
+        )
+    if alpha_volume_growth_6h < min_alpha_volume or futures_volume_growth_6h < min_futures_volume:
+        return _state(
+            "alpha_entry_confirmation_missing",
+            "observe",
+            reasons=[
+                f"dual volume not confirmed: alpha {alpha_volume_growth_6h:.1f}x/{min_alpha_volume:.1f}x, "
+                f"futures {futures_volume_growth_6h:.1f}x/{min_futures_volume:.1f}x"
+            ],
+            metrics=metrics,
+        )
+
+    oi_confirmed = oi_change_4h >= 0 and oi_change_24h >= -0.01
+    oi_waiver = (
+        -0.005 <= oi_change_4h < 0
+        and alpha_volume_growth_6h >= 3.0
+        and futures_volume_growth_6h >= 2.0
+    )
+    metrics["oi_confirmed"] = oi_confirmed
+    metrics["oi_volume_waiver"] = oi_waiver
+    if not oi_confirmed and not oi_waiver:
+        return _state(
+            "alpha_oi_not_confirmed",
+            "observe",
+            reasons=[
+                f"OI not confirmed: 4h {oi_change_4h:.2%}, 24h {oi_change_24h:.2%}; "
+                f"waiver needs OI4h >= -0.50%, alpha volume 3.0x and futures volume 2.0x"
+            ],
+            metrics=metrics,
+        )
+
     sell_pressure = ask_depth > 0 and bid_depth > 0 and ask_depth / max(bid_depth, 1e-9) > 1.35
     near_high = pullback_from_high_pct < 2
     if near_high and alpha_volume_growth_6h > 2 and ret_1h < 2 and (sell_pressure or imbalance < 0.85):
@@ -152,14 +194,14 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
 
     futures_ok = (
         bool(futures_sync.get("available"))
-        and futures_volume_growth_6h >= 1.3
-        and (oi_change_4h >= 0.03 or oi_change_24h >= 0.06)
+        and futures_volume_growth_6h >= min_futures_volume
+        and (oi_confirmed or oi_waiver)
         and abs(funding_rate) <= 0.0012
     )
     futures_probe_ok = (
         bool(futures_sync.get("available"))
-        and futures_volume_growth_6h >= 0.9
-        and (oi_change_4h >= -0.002 or oi_change_24h >= -0.005 or futures_sync_score >= 35)
+        and futures_volume_growth_6h >= min_futures_volume
+        and (oi_confirmed or oi_waiver)
         and abs(funding_rate) <= 0.0015
     )
     degraded_reasons = []

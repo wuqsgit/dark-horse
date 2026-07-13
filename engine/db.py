@@ -35,7 +35,7 @@ async def fetch_klines_1h(symbols: list, hours=72):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT time, symbol, open, high, low, close, volume, quote_vol
-               FROM candles_1h
+               FROM futures_candles_1h
                WHERE symbol = ANY($1::text[]) AND time > NOW() - INTERVAL '72 hours'
                ORDER BY symbol, time""",
             symbols,
@@ -49,7 +49,7 @@ async def fetch_klines_15m(symbols: list, hours=12):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT time, symbol, open, high, low, close, volume, quote_vol
-               FROM candles_15m
+               FROM futures_candles_15m
                WHERE symbol = ANY($1::text[]) AND time > NOW() - INTERVAL '12 hours'
                ORDER BY symbol, time""",
             symbols,
@@ -89,7 +89,11 @@ async def fetch_active_symbols():
     """获取活跃币种列表"""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT symbol FROM symbols WHERE is_active = TRUE")
+        rows = await conn.fetch(
+            """SELECT futures_symbol AS symbol FROM market_universe
+               WHERE pool_type = 'normal' AND selected = TRUE AND data_ready = TRUE
+               ORDER BY universe_rank"""
+        )
         return [r["symbol"] for r in rows]
 
 
@@ -136,7 +140,7 @@ async def fetch_price_history(symbols: list, hours_back=720):
                FROM (
                  SELECT date_trunc('1h', time) as time_bucket, symbol,
                         LAST(close, time) as close
-                 FROM candles_1h
+                 FROM futures_candles_1h
                  WHERE symbol = ANY($1::text[])
                    AND time > NOW() - INTERVAL '720 hours'
                  GROUP BY time_bucket, symbol
