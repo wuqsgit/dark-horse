@@ -29,10 +29,6 @@ from shared.policy_loop import (
     fetch_position_action_evidence,
     generate_and_activate_policies,
     label_decision_outcomes,
-    review_position_trade_exits,
-    review_position_trade_entries,
-    summarize_entry_reviews,
-    summarize_exit_reviews,
     clear_legacy_backtest_data,
 )
 
@@ -932,29 +928,6 @@ async def get_backtest_review(user=Depends(get_user)):
             "candidates": data.get("candidates", []),
             "versions": data.get("versions", []),
         }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/policy/review/run")
-async def run_policy_review_now(user=Depends(get_user)):
-    try:
-        result = generate_and_activate_policies()
-        entry_review = review_position_trade_entries(limit=1000)
-        entry_summary = summarize_entry_reviews(recent_limit=30)
-        _api_cache.pop("policy_loop_summary", None)
-        return {"status": "ok", **result, "entry_review": entry_review, "entry_summary": entry_summary}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/policy/exit-review/run")
-async def run_exit_review_now(user=Depends(get_user)):
-    try:
-        reviewed = review_position_trade_exits(limit=1000)
-        summary = summarize_exit_reviews(window_days=7, recent_limit=30)
-        _api_cache.pop("policy_loop_summary", None)
-        return {"status": "ok", "reviewed": reviewed, "summary": summary}
     except Exception as e:
         return {"error": str(e)}
 

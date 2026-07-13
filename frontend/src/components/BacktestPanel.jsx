@@ -5,15 +5,6 @@ async function apiGet(path) {
   return res.json();
 }
 
-async function apiPost(path, body = {}) {
-  const res = await fetch(`/api${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
-
 function pct(value, digits = 2) {
   if (value == null || Number.isNaN(Number(value))) return '-';
   const n = Number(value) * 100;
@@ -63,7 +54,6 @@ export default function BacktestPanel() {
   const [tab, setTab] = useState('overview');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
   const [actionDetails, setActionDetails] = useState({});
 
@@ -84,26 +74,6 @@ export default function BacktestPanel() {
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, []);
-
-  const runReview = async () => {
-    setRunning(true);
-    try {
-      await apiPost('/policy/review/run');
-      await load();
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  const runExitReview = async () => {
-    setRunning(true);
-    try {
-      await apiPost('/policy/exit-review/run');
-      await load();
-    } finally {
-      setRunning(false);
-    }
-  };
 
   const overview = data?.overview || {};
   const exitReviews = data?.exit_reviews || [];
@@ -135,20 +105,6 @@ export default function BacktestPanel() {
             最近复盘: {timeText(data?.latest_run)} · 生成: {timeText(data?.generated_at)}
           </div>
         </div>
-        <button
-          onClick={runReview}
-          disabled={running}
-          style={{ background: '#f59e0b', color: '#111827', border: 0, borderRadius: 6, padding: '8px 14px', fontWeight: 700, cursor: running ? 'wait' : 'pointer' }}
-        >
-          {running ? '复盘中...' : '立即复盘并自动生效'}
-        </button>
-        <button
-          onClick={runExitReview}
-          disabled={running}
-          style={{ background: '#22c55e', color: '#04130a', border: 0, borderRadius: 6, padding: '8px 14px', fontWeight: 700, cursor: running ? 'wait' : 'pointer' }}
-        >
-          {running ? '复盘中...' : '复盘平仓'}
-        </button>
       </div>
 
       <div className="nav" style={{ marginBottom: 16 }}>
