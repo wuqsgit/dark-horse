@@ -70,7 +70,7 @@ TRADING_CONFIG = {
     "trailing_stop_atr_multiplier": 1.5,  # 移动止盈 = 最高点 - ATR×1.5
 
     # ── 硬止损 ──
-    "hard_stop_pct": 0.12,             # 浮亏 12% 强制平仓
+    "hard_stop_pct": 0.12,             # 当前仓位保证金亏损 12% 强制平仓
 
     # ── 调度 ──
     "soft_exit_profit_pct": 2.0,
@@ -268,7 +268,7 @@ TRADING_CONFIG = {
         "position_min_trend_score": 50,
         "position_soft_exit_profit_pct": 2.0,
         "position_profit_protect_close_pct": 0.25,
-        "position_hard_stop_pct": 0.10,
+        "position_hard_stop_pct": 0.10,  # 当前仓位保证金亏损 10% 强制平仓
         "post_close_cooldown_minutes": 45,
         "loss_cooldown_minutes": 120,
         "stop_cooldown_minutes": 180,

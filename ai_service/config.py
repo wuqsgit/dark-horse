@@ -1,0 +1,20 @@
+from pathlib import Path
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+AI_DB_PATH = ROOT_DIR / "db" / "ai_quality.db"
+MAIN_DB_PATH = ROOT_DIR / "alphadog.db"
+MODEL_DIR = ROOT_DIR / "models" / "entry_quality"
+
+SERVICE_HOST = "0.0.0.0"
+SERVICE_PORT = 8010
+MODEL_KEYS = ("alpha", "normal")
+MIN_TRAINING_SAMPLES = 300
+MIN_VALIDATION_SAMPLES = 60
+VALIDATION_FRACTION = 0.20
+MODEL_MAX_AGE_HOURS = 48
+ALLOW_THRESHOLD = 62.0
+PROBE_THRESHOLD = 55.0
+PROBE_MARGIN_PCT = 0.05
+SAMPLE_RETENTION_DAYS = 180
+DECISION_RETENTION_DAYS = 180

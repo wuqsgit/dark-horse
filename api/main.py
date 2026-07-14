@@ -3,6 +3,7 @@ import asyncio
 import os, sys, json, time
 from fastapi import FastAPI, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from api.ai_proxy import AIServiceProxy
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.db import (
@@ -143,6 +144,17 @@ def compute_market_section(row):
 
 app = FastAPI(title="AlphaDog API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+_ai_proxy = AIServiceProxy()
+
+
+@app.get("/api/ai/status")
+async def ai_status():
+    return await _ai_proxy.status()
+
+
+@app.get("/api/ai/decisions")
+async def ai_decisions(limit: int = 100):
+    return await _ai_proxy.decisions(limit)
 
 _api_cache = {}
 _response_cache = {}

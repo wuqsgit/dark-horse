@@ -92,9 +92,16 @@ class NormalSoftExitTest(unittest.TestCase):
         actions = self._actions({
             "ema20": 95, "ema20_slope": -1.0, "ema20_50_ratio": 0.98,
             "return_6h": -0.05, "return_24h": -0.10,
-        }, pos=position(mark=85, pnl=-1500), cooldown=True)
+        }, pos=position(mark=99, pnl=-1201), cooldown=True)
         self.assertEqual(actions[0]["action"], "close")
-        self.assertIn("hard_stop", actions[0]["reason"])
+        self.assertIn("margin_hard_stop", actions[0]["reason"])
+
+    def test_loss_above_hard_stop_ignores_ordinary_weak_signals(self):
+        actions = self._actions({
+            "ema20": 101, "ema20_slope": -1.0, "ema20_50_ratio": 0.98,
+            "return_6h": -0.05, "return_24h": -0.10,
+        }, pos=position(mark=94, pnl=-1100), hold_alpha=20)
+        self.assertEqual(actions, [])
 
     def test_cooldown_reads_recent_planned_soft_exit_from_decision_log(self):
         with tempfile.TemporaryDirectory() as tmp:

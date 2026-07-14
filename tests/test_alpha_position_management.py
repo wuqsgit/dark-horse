@@ -193,7 +193,7 @@ class AlphaPositionManagementTest(unittest.TestCase):
 
         self.assertIsNone(action)
 
-    def test_alpha_clear_structural_breakdown_still_closes(self):
+    def test_alpha_clear_structural_breakdown_holds_above_margin_hard_stop(self):
         engine = self._soft_loss_engine()
         engine._latest_alpha_position_context = lambda symbol, hist: {
             "alpha_score": 60.0,
@@ -211,9 +211,11 @@ class AlphaPositionManagementTest(unittest.TestCase):
         }
         action = self._soft_loss_action(engine, pnl_pct=-6.0, mark_price=94.0)
 
-        self.assertIsNotNone(action)
-        self.assertEqual(action["action"], "close")
-        self.assertIn("alpha_structural_breakdown", action["reason"])
+        self.assertIsNone(action)
+        self.assertTrue(any(
+            "alpha soft hold" in str(item.get("filter_reason", ""))
+            for item in engine.recorded_decisions
+        ))
 
     def test_alpha_small_loss_cancels_exit_when_next_15m_candle_recovers(self):
         engine = self._soft_loss_engine()
@@ -237,10 +239,10 @@ class AlphaPositionManagementTest(unittest.TestCase):
         engine = self._soft_loss_engine()
         with patch.object(execution, "_latest_alpha_soft_exit_confirmation", return_value=None, create=True), \
              patch.object(execution, "_fetch_closed_futures_15m", return_value=[], create=True):
-            action = self._soft_loss_action(engine, pnl_pct=-10.5, mark_price=89.5)
+            action = self._soft_loss_action(engine, pnl_pct=-10.5, mark_price=99.0)
 
         self.assertIsNotNone(action)
-        self.assertIn("alpha_hard_stop", action["reason"])
+        self.assertIn("margin_hard_stop", action["reason"])
 
 
 if __name__ == "__main__":

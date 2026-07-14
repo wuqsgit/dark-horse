@@ -20,6 +20,7 @@ from shared.db import (
 )
 from trader.exchange import BinanceFutures
 from trader.execution import ExecutionEngine
+from trader.ai_client import apply_entry_quality_gate, observe_entry_quality_candidates
 from trader.config import EXCHANGE_CONFIG, TRADING_CONFIG
 from trader.risk import get_symbol_threshold, get_category_config
 
@@ -153,6 +154,13 @@ async def _account_trading_loop(account):
 
             # 3. 决策
             actions = engine.decide(top_symbols, positions, run_id=run_id)
+            observation = observe_entry_quality_candidates(
+                engine.ai_learning_actions,
+                top_symbols,
+                account_id=account["id"],
+            )
+            if observation.get("sent"):
+                logger.info("AI learning candidates observed: %s", observation["sent"])
             actions = [
                 action for action in actions
                 if action.get("action") != "open"
@@ -161,6 +169,13 @@ async def _account_trading_loop(account):
                     or (action.get("strategy_source") != "alpha" and bool(account.get("normal_trading_enabled")))
                 )
             ]
+            actions = apply_entry_quality_gate(
+                actions,
+                top_symbols,
+                balance=balance,
+                exchange=ex,
+                account_id=account["id"],
+            )
 
             # 3.5 按类别打印评分排序 + 未开仓原因
             pending = [a.get('symbol') for a in actions if a.get('action') == 'open']

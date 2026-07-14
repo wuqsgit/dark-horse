@@ -112,7 +112,7 @@ def calculate_position(
     min_stop_pct = float(sizing.get("min_stop_pct", sizing.get("min_effective_stop_pct", 0.003)))
     atr_multiplier = float(sizing.get("atr_stop_multiplier", 2.5))
     raw_stop_pct = atr_pct * atr_multiplier
-    stop_pct = min(max(raw_stop_pct, min_stop_pct), hard_stop_pct)
+    stop_pct = hard_stop_pct / leverage
     stop_distance = price * stop_pct
 
     mode = str(entry_mode or "confirmed").lower()
@@ -152,11 +152,12 @@ def calculate_position(
         "take_profit": round(stop_distance * 2, 8),
         "tp1_distance": round(stop_distance, 8),
         "tp2_distance": round(stop_distance * 2, 8),
-        "stop_model": "atr_clamped",
+        "stop_model": "margin_hard_stop",
         "stop_pct": round(stop_pct, 6),
         "raw_stop_pct": round(raw_stop_pct, 6),
         "min_stop_pct": round(min_stop_pct, 6),
         "hard_stop_pct": round(hard_stop_pct, 6),
+        "hard_stop_price_pct": round(stop_pct, 6),
         "atr_stop_multiplier": atr_multiplier,
         "trailing_atr_multiplier": float(sizing.get("trailing_atr_multiplier", cfg.get("trailing_stop_atr_multiplier", 1.5))),
         "atr_value": atr,

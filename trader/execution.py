@@ -16,6 +16,7 @@ from trader.cooldown_manager import is_in_cooldown, record_stop, record_profit
 from trader.market_regime import detect_current_regime, adjust_strategy_for_regime, get_regime_adjustment_message
 from trader.selection import BluechipTrendSelector, CandidateSelector  # V5: 鍊欓夐夋嫨鍣?
 from trader.symbol_risk import get_symbol_risk
+from trader.ai_client import build_learning_action
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 logger = logging.getLogger("execution")
 
@@ -723,6 +724,7 @@ class ExecutionEngine:
         self.cfg = TRADING_CONFIG
         self.account_controls = None
         self._trading_symbols = None
+        self.ai_learning_actions = []
         # V3.1: 绠鍖栫殑鎸佷粨璺熻釜
         # {symbol: {"highest_price": float, "entry_price": float}}
         self._pos_tracker = {}
@@ -859,10 +861,12 @@ class ExecutionEngine:
             return item
 
         alpha_cfg = _alpha_cfg() or {}
-        alpha_hard_stop_pct = float(alpha_cfg.get("position_hard_stop_pct", self.cfg.get("hard_stop_pct", 0.05))) * 100
-        price_ret_pct = _price_return_pct(side, pos.get("entry_price"), mark_price) * 100
-        if price_ret_pct <= -alpha_hard_stop_pct:
-            return add(f"alpha_hard_stop price_ret={price_ret_pct:.1f}% pnl={pnl_pct:.1f}%", is_stop=True)
+        alpha_hard_stop_pct = float(alpha_cfg.get("position_hard_stop_pct", 0.10)) * 100
+        if pnl_pct <= -alpha_hard_stop_pct:
+            return add(
+                f"margin_hard_stop roi={pnl_pct:.2f}% threshold=-{alpha_hard_stop_pct:.2f}%",
+                is_stop=True,
+            )
         r_state = _position_r_state(side, pos.get("entry_price"), mark_price, hist, atr, highest_price=highest_price)
         try:
             from shared.db import update_position_management
@@ -991,18 +995,16 @@ class ExecutionEngine:
             soft_hold_reason = f"alpha soft hold: short_momentum_reversal ret15={ret_15m:.2f}% ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}% pnl={pnl_pct:.1f}%"
 
         structural_states = {"breakdown", "breakdown_volume_long_only", "dumping"}
-        structural_breakdown = (
+        if (
             side == "LONG"
             and vp_state in structural_states
             and trend_score <= 45
             and ret_1h <= -3
             and ret_6h <= -8
-        )
-        if structural_breakdown:
-            return add(
-                f"alpha_structural_breakdown state={vp_state} trend={trend_score:.1f} "
-                f"ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}% pnl={pnl_pct:.1f}%",
-                score=current_score,
+        ):
+            soft_hold_reason = (
+                f"alpha soft hold: structural_breakdown state={vp_state} trend={trend_score:.1f} "
+                f"ret1h={ret_1h:.2f}% ret6h={ret_6h:.2f}% pnl={pnl_pct:.1f}%"
             )
 
         time_stop_h = float(self.cfg.get("time_stop_hours", 12))
@@ -1290,7 +1292,6 @@ class ExecutionEngine:
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
             soft_exit_profit_pct = float(self.cfg.get("soft_exit_profit_pct", 2.0))
             soft_exit_loss_pct = -float(self.cfg.get("soft_exit_max_loss_pct", 3.5))
-            price_ret_pct = _price_return_pct(side, entry_price, mark_price) * 100
             r_state = _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=highest_price, lowest_price=lowest_price)
             try:
                 from shared.db import update_position_management
@@ -1374,15 +1375,38 @@ class ExecutionEngine:
                     actions.append(alpha_action)
                 continue
 
+            hard_stop_pct = float(self.cfg.get("hard_stop_pct", 0.12)) * 100
             if hist.get("signal_source") == "bluechip_trend":
                 bluechip_cfg = _bluechip_cfg()
-                bluechip_stop = float(bluechip_cfg.get("hard_stop_pct", 0.03)) * 100
+                hard_stop_pct = float(bluechip_cfg.get("hard_stop_pct", 0.12)) * 100
+
+            if pnl_pct <= -hard_stop_pct:
+                add(
+                    "close",
+                    f"margin_hard_stop roi={pnl_pct:.2f}% threshold=-{hard_stop_pct:.2f}% "
+                    f"margin={margin:.2f} pnl={pnl:.2f} leverage={leverage:g}",
+                    is_stop=True,
+                )
+                continue
+            if pnl_pct < 0:
+                self._record_decision(
+                    latest,
+                    run_id=run_id,
+                    side=side,
+                    decision_stage="position_management",
+                    decision_result="hold",
+                    filter_reason=(
+                        f"loss_hold_until_margin_hard_stop roi={pnl_pct:.2f}% "
+                        f"threshold=-{hard_stop_pct:.2f}%"
+                    ),
+                )
+                continue
+
+            if hist.get("signal_source") == "bluechip_trend":
+                bluechip_cfg = _bluechip_cfg()
                 min_entry_alpha = float(bluechip_cfg.get("exit_min_entry_alpha", 35))
                 ema_ratio = float(tech.get("ema20_50_ratio") or 1.0)
                 ema_slope = float(tech.get("ema20_slope") or 0)
-                if price_ret_pct <= -bluechip_stop:
-                    add("close", f"bluechip_hard_stop price_ret={price_ret_pct:.1f}% pnl={pnl_pct:.1f}%", is_stop=True)
-                    continue
                 if r_state.get("stop_triggered"):
                     add("close", f"bluechip_trailing_stop r={float(r_state.get('r_multiple') or 0):.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}")
                     continue
@@ -1405,9 +1429,6 @@ class ExecutionEngine:
                     else:
                         add("partial_close", f"bluechip_trend_warning ema_ratio={ema_ratio:.4f} slope={ema_slope:.4f} pnl={pnl_pct:.1f}%", 0.25)
                     continue
-            if price_ret_pct <= -float(self.cfg.get("hard_stop_pct", 0.05)) * 100:
-                add("close", f"hard_stop price_ret={price_ret_pct:.1f}% pnl={pnl_pct:.1f}%", is_stop=True)
-                continue
             if r_state.get("stop_triggered"):
                 add("close", f"trailing_stop r={float(r_state.get('r_multiple') or 0):.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}")
                 continue
@@ -1692,6 +1713,16 @@ class ExecutionEngine:
                 reject("already planned this loop")
                 continue
 
+            learning_action = build_learning_action(
+                row,
+                side="LONG",
+                strategy_source="alpha",
+                category="alpha",
+                symbol=symbol,
+            )
+            if learning_action:
+                self.ai_learning_actions.append(learning_action)
+
             cooldown = get_alpha_cooldown(symbol) or get_alpha_cooldown("*")
             if cooldown:
                 reject(f"alpha cooldown active: {cooldown.get('reason')} until {cooldown.get('cooldown_until')}")
@@ -1888,6 +1919,12 @@ class ExecutionEngine:
                 "alpha_entry_level": entry_profile.get("status"),
                 "alpha_score": discovery_score,
                 "alpha_suggested_position_pct": round(float(pos_info.get("margin") or 0) / balance, 4) if balance else 0,
+                "ai_features": {
+                    **(normal_row.get("raw_features") or {}),
+                    "trend_score": entry_profile.get("trend_score") or normal_row.get("trend_score") or 0,
+                    "spread_pct": ob_info.get("spread_pct") or 0,
+                    "volume_sync_score": volume_price.get("sync_score") or 0,
+                },
             }
             actions.append(action)
             record_candidate(None, status="planned_open")
@@ -2098,6 +2135,7 @@ class ExecutionEngine:
 
     def decide(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
         """Build open, close and partial-close actions."""
+        self.ai_learning_actions = []
         actions = []
         pos_symbols = {p["symbol"] for p in current_positions}
         balance = self.get_balance()
@@ -2282,6 +2320,16 @@ class ExecutionEngine:
                         filter_reason="already_has_pending_action",
                     )
                     continue
+
+                learning_side = determine_side(s)
+                learning_action = build_learning_action(
+                    s,
+                    side=learning_side,
+                    strategy_source="normal",
+                    category=(get_symbol_risk(sym) or {}).get("class"),
+                )
+                if learning_action:
+                    self.ai_learning_actions.append(learning_action)
 
                 ok, filter_reason = meets_safety_filters(s)
                 if not ok:
@@ -2513,6 +2561,9 @@ class ExecutionEngine:
                     "run_id": run_id,
                     "scan_id": s.get("scan_id"),
                     "entry_mode": entry_profile.get("status"),
+                    "strategy_source": "normal",
+                    "signal_source": entry_profile.get("template"),
+                    "category": symbol_risk.get("class"),
                 })
                 self._record_decision(
                     s,
@@ -2610,6 +2661,15 @@ class ExecutionEngine:
                         market_regime=regime,
                     )
                     continue
+                learning_action = build_learning_action(
+                    s,
+                    side=side,
+                    strategy_source="normal",
+                    category="core_bluechip",
+                )
+                if learning_action:
+                    self.ai_learning_actions.append(learning_action)
+
                 can_open, reason = cooldown_selector.can_open(sym)
                 if not can_open:
                     self._record_decision(
@@ -2722,6 +2782,7 @@ class ExecutionEngine:
                     "entry_mode": s.get("bluechip_entry_mode"),
                     "strategy_source": "normal",
                     "signal_source": "bluechip_trend",
+                    "category": "core_bluechip",
                 }
                 actions.append(action)
                 self._record_decision(
@@ -2886,6 +2947,11 @@ class ExecutionEngine:
                 "tp2_price": act.get("tp2_price"),
                 "atr_value": act.get("atr_value"),
                 "order_id": order.get("orderId"),
+                "ai_quality_status": act.get("ai_quality_status"),
+                "ai_quality_decision": act.get("ai_quality_decision"),
+                "ai_quality_score": act.get("ai_quality_score"),
+                "ai_model_version": act.get("ai_model_version"),
+                "ai_quality_reasons": act.get("ai_quality_reasons"),
             },
             reason={"reason": act.get("reason")},
         )

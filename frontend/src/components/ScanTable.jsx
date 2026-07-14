@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { AIQualityBadge, useAIQualityDecisions } from './aiQuality.jsx';
 
 const API_BASE = '/api';
 const gradeColor = { S1: '#f59e0b', S2: '#22c55e', A1: '#3b82f6', A2: '#8b5cf6', B: '#9ca3af', C: '#f97316', D: '#ef4444' };
@@ -283,6 +284,7 @@ export default function ScanTable() {
   const [keyword, setKeyword] = useState('');
   const [sortField, setSortField] = useState('composite_score');
   const [sortDir, setSortDir] = useState('desc');
+  const aiDecisions = useAIQualityDecisions();
 
   useEffect(() => {
     const load = () => fetch(`${API_BASE}/scan/latest`).then((r) => r.json()).then((d) => {
@@ -339,6 +341,7 @@ export default function ScanTable() {
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
                 <div style={{ color: '#d0d5e0', fontSize: 18, fontWeight: 800 }}>{r.symbol}</div>
+                <AIQualityBadge decision={aiDecisions[String(r.symbol || '').toUpperCase()]} />
                 <span className={`grade grade-${r.grade || 'unknown'}`} style={{ marginLeft: 'auto' }}>{r.grade}</span>
                 <V3Badge row={r} />
               </div>

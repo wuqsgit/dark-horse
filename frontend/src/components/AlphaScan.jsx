@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { AIQualityBadge, useAIQualityDecisions } from './aiQuality.jsx';
 
 const API_BASE = '/api';
 
@@ -227,6 +228,7 @@ export default function AlphaScan() {
   const [selected, setSelected] = useState(null);
   const [keyword, setKeyword] = useState('');
   const [filter, setFilter] = useState('all');
+  const aiDecisions = useAIQualityDecisions();
 
   useEffect(() => {
     const load = () => fetch(`${API_BASE}/alpha/scan/latest`)
@@ -268,6 +270,7 @@ export default function AlphaScan() {
               <div>
                 <div style={{ color: '#d0d5e0', fontSize: 18, fontWeight: 800 }}>{r.base_asset}</div>
                 <div className="scan-plain">{r.name || r.alpha_symbol}</div>
+                <AIQualityBadge decision={aiDecisions[String(r.futures_symbol || `${r.base_asset}USDT`).toUpperCase()]} />
               </div>
               <div style={{ color: scoreColor(r.alpha_score), fontSize: 26, fontWeight: 900 }}>{fmt(r.alpha_score, 1)}</div>
             </div>

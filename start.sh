@@ -34,6 +34,7 @@ stop_from_pidfile /tmp/alphadog_pipeline.pid
 stop_from_pidfile /tmp/alphadog_alpha_pipeline.pid
 stop_from_pidfile /tmp/alphadog_engine.pid
 stop_from_pidfile /tmp/alphadog_alpha_engine.pid
+stop_from_pidfile /tmp/alphadog_ai.pid
 stop_from_pidfile /tmp/alphadog_trader.pid
 stop_from_pidfile /tmp/alphadog_api.pid
 stop_from_pidfile /tmp/alphadog_frontend.pid
@@ -49,6 +50,11 @@ start_service "Engine" /tmp/alphadog_engine.pid /tmp/alphadog_engine.log \
 
 start_service "Alpha Engine" /tmp/alphadog_alpha_engine.pid /tmp/alphadog_alpha_engine.log \
   python3 -m alpha_engine.run
+
+start_service "AI Entry Quality" /tmp/alphadog_ai.pid /tmp/alphadog_ai.log \
+  python3 -m uvicorn ai_service.main:app --host 0.0.0.0 --port 8010
+
+sleep 1
 
 start_service "Trader" /tmp/alphadog_trader.pid /tmp/alphadog_trader.log \
   python3 -m trader.runner
@@ -67,6 +73,7 @@ start_service "API" /tmp/alphadog_api.pid /tmp/alphadog_api.log \
 echo ""
 echo "  Frontend: http://localhost:3000"
 echo "  API:      http://localhost:8000"
+echo "  AI:       http://localhost:8010/v1/status"
 echo "  Logs:     tail -f /tmp/alphadog_*.log"
 echo ""
-echo "  Stop:     kill \$(cat /tmp/alphadog_pipeline.pid) \$(cat /tmp/alphadog_alpha_pipeline.pid) \$(cat /tmp/alphadog_engine.pid) \$(cat /tmp/alphadog_alpha_engine.pid) \$(cat /tmp/alphadog_trader.pid) \$(cat /tmp/alphadog_api.pid) \$(cat /tmp/alphadog_frontend.pid)"
+echo "  Stop:     kill \$(cat /tmp/alphadog_pipeline.pid) \$(cat /tmp/alphadog_alpha_pipeline.pid) \$(cat /tmp/alphadog_engine.pid) \$(cat /tmp/alphadog_alpha_engine.pid) \$(cat /tmp/alphadog_ai.pid) \$(cat /tmp/alphadog_trader.pid) \$(cat /tmp/alphadog_api.pid) \$(cat /tmp/alphadog_frontend.pid)"

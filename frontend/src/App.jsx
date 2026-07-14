@@ -5,6 +5,7 @@ import BacktestPanel from './components/BacktestPanel';
 import LiveTrading from './components/LiveTrading';
 import MarketDataHealth from './components/MarketDataHealth';
 import TradingEnvironmentStatus from './components/TradingEnvironmentStatus';
+import AIQualityStatus from './components/AIQualityStatus';
 import './styles.css';
 
 export default function App() {
@@ -27,6 +28,7 @@ export default function App() {
           <button className={currentPage === 'trading' ? 'active' : ''} onClick={() => setCurrentPage('trading')}>实盘</button>
         </nav>
         <MarketDataHealth />
+        <AIQualityStatus />
         <TradingEnvironmentStatus />
       </header>
 
