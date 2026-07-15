@@ -574,14 +574,12 @@ CREATE TABLE position_trades (
             income_count INTEGER DEFAULT 0,
             entry_reason TEXT,
             exit_reason TEXT,
-            grade_at_entry TEXT,
-            score_at_entry REAL,
             source TEXT DEFAULT 'reconstructed',
             reconcile_status TEXT DEFAULT 'ok',
             raw_json TEXT,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
-        , account_id INTEGER NOT NULL DEFAULT 1);
+        , account_id INTEGER NOT NULL DEFAULT 1, grade_at_entry TEXT, score_at_entry REAL);
 
 CREATE TABLE positions_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -826,7 +824,7 @@ CREATE TABLE trades (
     grade_at_entry TEXT,
     score_at_entry REAL,
     created_at TEXT DEFAULT (datetime('now'))
-, source TEXT DEFAULT 'system', income_id TEXT, entry_reason TEXT, position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, account_id INTEGER NOT NULL DEFAULT 1);
+, source TEXT DEFAULT 'system', income_id TEXT, entry_reason TEXT, position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, account_id INTEGER NOT NULL DEFAULT 1, position_side TEXT);
 
 CREATE TABLE trades_paginated (
     page INTEGER,
