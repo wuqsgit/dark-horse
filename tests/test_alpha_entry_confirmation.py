@@ -2,7 +2,12 @@ import unittest
 
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 from trader.config import TRADING_CONFIG
-from trader.execution import ExecutionEngine, _evaluate_alpha_breakout_bars, _promote_confirmed_alpha_probe
+from trader.execution import (
+    ExecutionEngine,
+    _alpha_position_factor,
+    _evaluate_alpha_breakout_bars,
+    _promote_confirmed_alpha_probe,
+)
 
 
 class FakeDepthExchange:
@@ -59,8 +64,20 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         self.assertTrue(result["allow_long"])
         self.assertEqual(result["action"], "normal_review")
         self.assertEqual(result["state"], "alpha_pre_breakout_volume_sync")
-        self.assertGreater(result["max_position_factor"], 0.25)
-        self.assertLess(result["max_position_factor"], 1.0)
+        self.assertGreater(result["max_position_factor"], 0.5)
+        self.assertLess(result["max_position_factor"], 2.0)
+
+    def test_pre_breakout_volume_sync_uses_double_normal_position_at_tight_spread(self):
+        raw = _features(alpha_volume=2.05, futures_volume=1.85, trend=61.25)
+
+        result = evaluate_alpha_volume_price(raw)
+
+        self.assertEqual(result["state"], "alpha_pre_breakout_volume_sync")
+        self.assertEqual(result["max_position_factor"], 2.0)
+
+    def test_execution_preserves_double_position_factor(self):
+        self.assertEqual(_alpha_position_factor({"max_position_factor": 2.0}), 2.0)
+        self.assertEqual(_alpha_position_factor({"max_position_factor": 3.0}), 2.0)
 
     def test_spread_wider_than_hard_limit_degrades_position_instead_of_observing(self):
         raw = _features(alpha_volume=3.2, futures_volume=2.1, oi4=0.01, oi24=0.0, trend=78)

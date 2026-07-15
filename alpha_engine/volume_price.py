@@ -161,9 +161,13 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
     )
     metrics["pre_breakout_volume_sync"] = pre_breakout_volume_sync
     if pre_breakout_volume_sync:
+        base_position_factor = 2.0
+        position_factor = base_position_factor * spread_position_factor
+        metrics["base_position_factor"] = base_position_factor
         reasons = [
             f"pre-breakout volume sync: alpha volume {alpha_volume_growth_6h:.1f}x, futures volume {futures_volume_growth_6h:.1f}x",
             f"futures sync {futures_sync_score:.0f}, trend {trend_score:.1f}",
+            f"double normal position adjusted by spread to {position_factor:.2f}x",
         ]
         if spread_degraded:
             reasons.append(f"alpha spread {spread_pct:.3f}% sizes position factor {spread_position_factor:.2f}")
@@ -171,7 +175,7 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
             "alpha_pre_breakout_volume_sync",
             "normal_review",
             allow_long=True,
-            max_position_factor=spread_position_factor,
+            max_position_factor=position_factor,
             reasons=reasons,
             metrics=metrics,
         )

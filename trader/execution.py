@@ -95,6 +95,10 @@ def _market_phase_gate(raw: dict) -> dict:
     return phase
 
 
+def _alpha_position_factor(volume_price: dict) -> float:
+    return max(0.0, min(2.0, float((volume_price or {}).get("max_position_factor") or 0)))
+
+
 def _market_phase_entry_decision(market_phase: dict, current_status: str) -> tuple[bool, str, str]:
     phase = str((market_phase or {}).get("phase") or "")
     if phase in {"breakdown_risk", "uncertain"}:
@@ -1780,7 +1784,7 @@ class ExecutionEngine:
                 continue
             symbol_risk = get_symbol_risk(symbol)
 
-            vp_factor = max(0.0, min(1.0, float(volume_price.get("max_position_factor") or 0)))
+            vp_factor = _alpha_position_factor(volume_price)
             entry_status = "probe" if vp_action == "normal_review_probe" or vp_factor <= 0.25 else "pass"
             entry_profile = {
                 "status": entry_status,
