@@ -1539,13 +1539,10 @@ class ExecutionEngine:
             "spread_network": network,
             "entry_profile": profile,
         })
-        if spread_pct > hard_max:
-            return False, f"spread too wide: {spread_pct:.4%} > hard_max {hard_max:.2%} ({network}/{profile})", info
         if spread_pct > soft_limit:
-            if network == "testnet":
-                info["spread_degraded"] = True
-                return True, f"testnet spread degraded: {spread_pct:.4%} > soft {soft_limit:.2%} ({profile})", info
-            return False, f"spread too wide: {spread_pct:.4%} > soft {soft_limit:.2%} ({network}/{profile})", info
+            info["spread_degraded"] = True
+            info["spread_size_multiplier"] = max(0.10, min(1.0, soft_limit / max(spread_pct, 1e-9)))
+            return True, f"spread degraded: {spread_pct:.4%} > soft {soft_limit:.2%} ({network}/{profile})", info
         if side == "LONG" and bid_ask_ratio < 0.65:
             return False, f"live depth against LONG: bid/ask={bid_ask_ratio:.2f}", info
         if side == "SHORT" and ask_bid_ratio < 0.65:
@@ -1859,7 +1856,9 @@ class ExecutionEngine:
 
             alpha_execution_score = float(discovery_score or 0)
             alpha_entry_mode = "probe" if entry_profile.get("status") == "probe" else ("strong" if vp_factor >= 0.30 else "confirmed")
-            size_multiplier = 0.75 if ob_info.get("spread_degraded") else 1.0
+            size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
+            if vp_factor > 0:
+                size_multiplier *= vp_factor
             if market_phase.get("phase") == "range":
                 size_multiplier *= 0.75
             pos_info = calculate_position(
@@ -2482,7 +2481,7 @@ class ExecutionEngine:
                     logger.info(f"  {sym}: {ob_reason}, skip")
                     continue
                 if ob_info.get("spread_degraded"):
-                    logger.info(f"  {sym}: {ob_reason}, allow with testnet spread profile")
+                    logger.info(f"  {sym}: {ob_reason}, allow with spread sizing multiplier")
 
                 price = s.get("price", 0) or s.get("market_price", 0)
                 if price <= 0:
@@ -2498,7 +2497,7 @@ class ExecutionEngine:
 
                 symbol_risk = entry_profile.get("risk_profile") or get_symbol_risk(sym)
                 sizing_mode = "probe" if entry_profile.get("status") == "probe" else "confirmed"
-                size_multiplier = 0.75 if ob_info.get("spread_degraded") else 1.0
+                size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
                 if market_phase.get("phase") == "range":
                     size_multiplier *= 0.75
                 pos_info = calculate_position(
@@ -2726,7 +2725,7 @@ class ExecutionEngine:
 
                 score = float(s.get("bluechip_trend_score") or s.get("composite_score") or 0)
                 bluechip_mode = "strong" if s.get("bluechip_entry_mode") == "trend_confirmed" else "probe"
-                size_multiplier = 0.75 if ob_info.get("spread_degraded") else 1.0
+                size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
                 pos_info = calculate_position(
                     self.ex,
                     sym,

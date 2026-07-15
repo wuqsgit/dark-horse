@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { fetchTradingAccountsStatus } from '../api/tradingAccountsStatus';
 
 export default function TradingEnvironmentStatus() {
   const [label, setLabel] = useState('LIVE CHECKING');
@@ -6,8 +7,7 @@ export default function TradingEnvironmentStatus() {
     let active = true;
     const load = async () => {
       try {
-        const response = await fetch('/api/trading/accounts/status');
-        const data = await response.json();
+        const data = await fetchTradingAccountsStatus();
         if (active) setLabel(data.environment_status || 'LIVE DEGRADED');
       } catch { if (active) setLabel('LIVE DEGRADED'); }
     };

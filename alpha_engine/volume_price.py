@@ -19,6 +19,20 @@ def _pct(value):
     return _num(value, 0.0)
 
 
+def _spread_position_factor(spread_pct, soft_spread_pct, hard_spread_pct):
+    """Convert alpha-side spread into a sizing multiplier instead of a hard gate."""
+    spread = max(0.0, _num(spread_pct, 99.0))
+    if spread <= soft_spread_pct:
+        return 1.0
+    if spread <= hard_spread_pct:
+        span = max(hard_spread_pct - soft_spread_pct, 1e-9)
+        return 1.0 - ((spread - soft_spread_pct) / span) * 0.35
+    if spread <= 1.0:
+        span = max(1.0 - hard_spread_pct, 1e-9)
+        return 0.65 - ((spread - hard_spread_pct) / span) * 0.30
+    return max(0.10, 0.35 / max(spread, 1.0))
+
+
 def _state(
     state,
     action,
@@ -101,12 +115,11 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
     soft_spread_pct = 0.12
     hard_spread_pct = 0.35
     spread_degraded = spread_pct > soft_spread_pct
+    spread_position_factor = _spread_position_factor(spread_pct, soft_spread_pct, hard_spread_pct)
     metrics["spread_degraded"] = spread_degraded
     metrics["soft_spread_pct"] = soft_spread_pct
     metrics["hard_spread_pct"] = hard_spread_pct
-
-    if spread_pct > hard_spread_pct:
-        return _state("wide_spread", "observe", reasons=[f"alpha spread {spread_pct:.3f}% > {hard_spread_pct:.2f}%"], metrics=metrics)
+    metrics["spread_position_factor"] = round(spread_position_factor, 4)
 
     if (
         volume_regime in {"overheated", "extreme", "suspicious"}
@@ -134,6 +147,32 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
                 f"breakdown volume: 1h {ret_1h:.1f}%, 6h {ret_6h:.1f}%, alpha volume {alpha_volume_growth_6h:.1f}x",
                 "alpha is long-only; no short execution",
             ],
+            metrics=metrics,
+        )
+
+    pre_breakout_volume_sync = (
+        alpha_volume_growth_6h >= 2.0
+        and futures_volume_growth_6h >= 1.5
+        and futures_sync_score >= 65
+        and 60 <= trend_score < 68
+        and -3 <= ret_15m <= 3
+        and -5 <= ret_1h <= 5
+        and -8 <= ret_6h <= 8
+    )
+    metrics["pre_breakout_volume_sync"] = pre_breakout_volume_sync
+    if pre_breakout_volume_sync:
+        reasons = [
+            f"pre-breakout volume sync: alpha volume {alpha_volume_growth_6h:.1f}x, futures volume {futures_volume_growth_6h:.1f}x",
+            f"futures sync {futures_sync_score:.0f}, trend {trend_score:.1f}",
+        ]
+        if spread_degraded:
+            reasons.append(f"alpha spread {spread_pct:.3f}% sizes position factor {spread_position_factor:.2f}")
+        return _state(
+            "alpha_pre_breakout_volume_sync",
+            "normal_review",
+            allow_long=True,
+            max_position_factor=spread_position_factor,
+            reasons=reasons,
             metrics=metrics,
         )
 
@@ -206,7 +245,7 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
     )
     degraded_reasons = []
     if spread_degraded:
-        degraded_reasons.append(f"alpha spread {spread_pct:.3f}% soft-degraded")
+        degraded_reasons.append(f"alpha spread {spread_pct:.3f}% sizes position factor {spread_position_factor:.2f}")
     if futures_probe_ok and not futures_ok:
         degraded_reasons.append(
             f"early futures sync: futures volume {futures_volume_growth_6h:.1f}x, OI4h {oi_change_4h:.2%}, OI24h {oi_change_24h:.2%}"
@@ -223,27 +262,29 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         )
 
     if trend_state == "trend_confirmed":
-        factor = 0.22 if (spread_degraded or not futures_ok) else 0.35
+        base_factor = 0.22 if not futures_ok else 0.35
+        factor = base_factor * spread_position_factor
         return _state(
-            "alpha_trend_confirmed" if futures_ok and not spread_degraded else "alpha_trend_confirmed_probe",
-            "normal_review" if futures_ok and not spread_degraded else "normal_review_probe",
+            "alpha_trend_confirmed" if futures_ok else "alpha_trend_confirmed_probe",
+            "normal_review" if futures_ok else "normal_review_probe",
             allow_long=True,
             max_position_factor=factor,
             reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha trend confirmed"] + degraded_reasons,
             metrics=metrics,
         )
     if trend_state == "trend_candidate":
-        factor = 0.16 if (spread_degraded or not futures_ok) else 0.25
+        base_factor = 0.16 if not futures_ok else 0.25
+        factor = base_factor * spread_position_factor
         return _state(
-            "alpha_trend_candidate" if futures_ok and not spread_degraded else "alpha_trend_candidate_probe",
-            "normal_review" if futures_ok and not spread_degraded else "normal_review_probe",
+            "alpha_trend_candidate" if futures_ok else "alpha_trend_candidate_probe",
+            "normal_review" if futures_ok else "normal_review_probe",
             allow_long=True,
             max_position_factor=factor,
             reasons=(alpha_trend.get("reasons") or []) + ["long-only alpha trend candidate"] + degraded_reasons,
             metrics=metrics,
         )
     if trend_state == "probe":
-        factor = 0.08 if spread_degraded else 0.12
+        factor = 0.12 * spread_position_factor
         return _state(
             "alpha_trend_probe",
             "normal_review_probe",
@@ -263,10 +304,11 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         and 1.0 <= imbalance <= 4.0
         and futures_probe_ok
     ):
-        factor = 0.12 if (spread_degraded or not futures_ok) else 0.20
+        base_factor = 0.12 if not futures_ok else 0.20
+        factor = base_factor * spread_position_factor
         return _state(
-            "breakout_pullback" if futures_ok and not spread_degraded else "breakout_pullback_probe",
-            "normal_review" if futures_ok and not spread_degraded else "normal_review_probe",
+            "breakout_pullback" if futures_ok else "breakout_pullback_probe",
+            "normal_review" if futures_ok else "normal_review_probe",
             allow_long=True,
             max_position_factor=factor,
             reasons=[f"breakout pullback: alpha volume {alpha_volume_growth_6h:.1f}x"] + (["futures sync confirmed"] if futures_ok else degraded_reasons),
@@ -283,9 +325,10 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         and 0.8 <= imbalance <= 3.5
         and futures_probe_ok
     ):
-        factor = 0.08 if (spread_degraded or not futures_ok) else 0.12
+        base_factor = 0.08 if not futures_ok else 0.12
+        factor = base_factor * spread_position_factor
         return _state(
-            "accumulation_volume" if futures_ok and not spread_degraded else "accumulation_volume_probe",
+            "accumulation_volume" if futures_ok else "accumulation_volume_probe",
             "normal_review_probe",
             allow_long=True,
             max_position_factor=factor,

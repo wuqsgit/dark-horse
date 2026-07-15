@@ -1,9 +1,12 @@
 ﻿"""AlphaDog API Server 鈥?FastAPI (SQLite)"""
 import asyncio
+import logging
 import os, sys, json, time
 from fastapi import FastAPI, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from api.ai_proxy import AIServiceProxy
+from ai_service.config import AI_DB_PATH, MAIN_DB_PATH
+from shared.strategy_insights import generate_strategy_insights
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.db import (
@@ -145,6 +148,7 @@ def compute_market_section(row):
 app = FastAPI(title="AlphaDog API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 _ai_proxy = AIServiceProxy()
+logger = logging.getLogger("api")
 
 
 @app.get("/api/ai/status")
@@ -156,16 +160,25 @@ async def ai_status():
 async def ai_decisions(limit: int = 100):
     return await _ai_proxy.decisions(limit)
 
+
+@app.get("/api/ai/strategy-insights")
+async def ai_strategy_insights(limit: int = 8):
+    return generate_strategy_insights(MAIN_DB_PATH, AI_DB_PATH, limit=limit)
+
 _api_cache = {}
 _response_cache = {}
 _versioned_cache = {}
 _scan_payload_cache = {"scan_id": None, "payload": None, "body": None, "time": 0}
 _scan_refresh_task = None
+_account_status_snapshot = {"data": None, "time": 0.0}
+_account_status_refresh_task = None
+_account_status_refresher_task = None
 
 
 _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
 _TRADING_CACHE_TTL = 10
+_TRADING_ACCOUNT_STATUS_CACHE_TTL = 30
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _FAST_CACHE_PATHS = {
     "/api/scan/latest",
@@ -181,6 +194,18 @@ _FAST_CACHE_PATHS = {
     "/api/trading/status",
     "/api/trading/statu",
 }
+
+
+def _cache_ttl_for_path(path: str) -> int:
+    if path == "/api/trading/accounts/status":
+        return _TRADING_ACCOUNT_STATUS_CACHE_TTL
+    if path.startswith("/api/trading/"):
+        return _TRADING_CACHE_TTL
+    if path.startswith("/api/scan/"):
+        return _SCAN_CACHE_TTL
+    if path in {"/api/backtest/review", "/api/backtest/factor_analysis"}:
+        return 5
+    return _BACKTEST_CACHE_TTL
 
 
 def compute_v3_signals(symbol, row, tech):
@@ -304,14 +329,7 @@ async def fast_path_cache(request, call_next):
         return await call_next(request)
     key = str(request.url)
     item = _response_cache.get(key)
-    if request.url.path.startswith("/api/trading/"):
-        ttl = _TRADING_CACHE_TTL
-    elif request.url.path.startswith("/api/scan/"):
-        ttl = _SCAN_CACHE_TTL
-    elif request.url.path in {"/api/backtest/review", "/api/backtest/factor_analysis"}:
-        ttl = 5
-    else:
-        ttl = _BACKTEST_CACHE_TTL
+    ttl = _cache_ttl_for_path(request.url.path)
     if item and time.time() - item["time"] < ttl:
         return Response(
             content=item["body"],
@@ -356,8 +374,10 @@ async def fast_path_cache(request, call_next):
 
 @app.on_event("startup")
 async def startup():
-    global _scan_refresh_task
+    global _scan_refresh_task, _account_status_refresher_task
     init_db()
+    if _account_status_refresher_task is None:
+        _account_status_refresher_task = asyncio.create_task(_account_status_snapshot_refresher())
     try:
         await asyncio.to_thread(_refresh_scan_payload_sync)
         if _scan_refresh_task is None:
@@ -2073,6 +2093,92 @@ def _account_status_payload(account: dict) -> dict:
         ex.close()
 
 
+async def _build_all_trading_account_status() -> dict:
+    from shared.accounts import list_accounts
+
+    accounts = list_accounts(include_secrets=True, enabled_only=True)
+    results = await asyncio.gather(*[
+        asyncio.to_thread(_account_status_payload, account)
+        for account in accounts
+    ])
+    healthy = [row for row in results if row.get("status") == "ok"]
+    environments = {row.get("environment") for row in healthy}
+    if len(environments) > 1:
+        environment_status = "MIXED"
+    elif environments == {"prod"}:
+        environment_status = "PROD LIVE"
+    elif environments == {"testnet"}:
+        environment_status = "TESTNET LIVE"
+    else:
+        environment_status = "LIVE DEGRADED"
+    return {
+        "accounts": results,
+        "environment_status": environment_status,
+        "summary": {
+            "initial_capital": sum(float(r.get("initial_capital") or 0) for r in healthy),
+            "equity": sum(float(r.get("equity") or 0) for r in healthy),
+            "total_pnl": sum(float(r.get("total_pnl") or 0) for r in healthy),
+            "unrealized_pnl": sum(float(r.get("unrealized_pnl") or 0) for r in healthy),
+            "position_count": sum(len(r.get("positions") or []) for r in healthy),
+        },
+    }
+
+
+async def _run_trading_account_status_refresh() -> dict:
+    global _account_status_refresh_task
+    try:
+        data = await _build_all_trading_account_status()
+        _account_status_snapshot.update({"data": data, "time": time.time()})
+        return data
+    except Exception:
+        logger.exception("Trading account status refresh failed")
+        if _account_status_snapshot.get("data") is not None:
+            return _account_status_snapshot["data"]
+        raise
+    finally:
+        if asyncio.current_task() is _account_status_refresh_task:
+            _account_status_refresh_task = None
+
+
+def _ensure_trading_account_status_refresh() -> asyncio.Task:
+    global _account_status_refresh_task
+    if _account_status_refresh_task is None or _account_status_refresh_task.done():
+        _account_status_refresh_task = asyncio.create_task(_run_trading_account_status_refresh())
+    return _account_status_refresh_task
+
+
+async def _get_trading_account_status_snapshot() -> tuple[dict, str]:
+    data = _account_status_snapshot.get("data")
+    age = max(0.0, time.time() - float(_account_status_snapshot.get("time") or 0))
+    if data is None:
+        await _ensure_trading_account_status_refresh()
+        cache_status = "MISS"
+    elif age >= _TRADING_ACCOUNT_STATUS_CACHE_TTL:
+        _ensure_trading_account_status_refresh()
+        cache_status = "STALE"
+    else:
+        cache_status = "HIT"
+
+    data = _account_status_snapshot.get("data") or {}
+    age = max(0.0, time.time() - float(_account_status_snapshot.get("time") or 0))
+    payload = dict(data)
+    payload["data_age_seconds"] = round(age, 1)
+    payload["stale"] = cache_status == "STALE"
+    payload["cache_status"] = cache_status.lower()
+    return payload, cache_status
+
+
+async def _account_status_snapshot_refresher():
+    while True:
+        started = time.monotonic()
+        try:
+            await _ensure_trading_account_status_refresh()
+        except Exception:
+            pass
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(1.0, _TRADING_ACCOUNT_STATUS_CACHE_TTL - elapsed))
+
+
 @app.get("/api/trading/accounts")
 async def get_trading_accounts(user=Depends(get_user)):
     from shared.accounts import list_accounts
@@ -2143,31 +2249,10 @@ async def add_account_capital_adjustment(account_id: int, body: dict, user=Depen
 
 
 @app.get("/api/trading/accounts/status")
-async def get_all_trading_account_status(user=Depends(get_user)):
-    from shared.accounts import list_accounts
-    accounts = list_accounts(include_secrets=True, enabled_only=True)
-    results = await asyncio.gather(*[asyncio.to_thread(_account_status_payload, account) for account in accounts])
-    healthy = [row for row in results if row.get("status") == "ok"]
-    environments = {row.get("environment") for row in healthy}
-    if len(environments) > 1:
-        environment_status = "MIXED"
-    elif environments == {"prod"}:
-        environment_status = "PROD LIVE"
-    elif environments == {"testnet"}:
-        environment_status = "TESTNET LIVE"
-    else:
-        environment_status = "LIVE DEGRADED"
-    return {
-        "accounts": results,
-        "environment_status": environment_status,
-        "summary": {
-            "initial_capital": sum(float(r.get("initial_capital") or 0) for r in healthy),
-            "equity": sum(float(r.get("equity") or 0) for r in healthy),
-            "total_pnl": sum(float(r.get("total_pnl") or 0) for r in healthy),
-            "unrealized_pnl": sum(float(r.get("unrealized_pnl") or 0) for r in healthy),
-            "position_count": sum(len(r.get("positions") or []) for r in healthy),
-        },
-    }
+async def get_all_trading_account_status(response: Response, user=Depends(get_user)):
+    payload, cache_status = await _get_trading_account_status_snapshot()
+    response.headers["X-Cache"] = cache_status
+    return payload
 
 
 @app.get("/api/trading/stats")

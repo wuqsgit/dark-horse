@@ -53,6 +53,7 @@ function Metric({ label, value, detail, color }) {
 export default function BacktestPanel() {
   const [tab, setTab] = useState('overview');
   const [data, setData] = useState(null);
+  const [aiInsights, setAiInsights] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [actionDetails, setActionDetails] = useState({});
@@ -60,8 +61,12 @@ export default function BacktestPanel() {
   const load = async () => {
     try {
       setError(null);
-      const summary = await apiGet('/backtest/summary');
+      const [summary, insights] = await Promise.all([
+        apiGet('/backtest/summary'),
+        apiGet('/ai/strategy-insights'),
+      ]);
       setData(summary);
+      setAiInsights(insights);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -112,6 +117,7 @@ export default function BacktestPanel() {
           ['overview', '闭环总览'],
           ['tradeReview', '完整交易复盘'],
           ['categoryReview', '分类优化建议'],
+          ['aiInsights', 'AI策略洞察'],
         ].map(([key, label]) => (
           <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>{label}</button>
         ))}
@@ -233,6 +239,61 @@ export default function BacktestPanel() {
                 </tr>
               ))}
               {tradeReviewSummaries.length === 0 && <tr><td colSpan={6} style={{ textAlign: 'center', color: '#6b7280' }}>当前没有达到样本与集中度门槛的问题</td></tr>}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      )}
+
+      {tab === 'aiInsights' && (
+        <div className="trading-section">
+          <h3>AI策略洞察</h3>
+          <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 12 }}>
+            基于真实交易复盘和 AI 已标注候选样本生成；只给策略建议，不自动改实盘规则。
+            <span style={{ marginLeft: 12 }}>
+              交易复盘 {aiInsights?.sample_overview?.trade_reviews || 0} · AI已标注 {aiInsights?.sample_overview?.ai_labeled_samples || 0}
+            </span>
+          </div>
+          <div className="review-table-wrap">
+          <table className="trade-table review-table category-review-table">
+            <colgroup>
+              <col style={{ width: '9%' }} />
+              <col style={{ width: '13%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '20%' }} />
+              <col style={{ width: '17%' }} />
+              <col style={{ width: '29%' }} />
+            </colgroup>
+            <thead><tr><th>优先级</th><th>来源 / 分类</th><th>样本</th><th>关键指标</th><th>统计证据</th><th>落地建议</th></tr></thead>
+            <tbody>
+              {(aiInsights?.insights || []).map((r, idx) => (
+                <tr key={`${r.source}-${r.strategy_source}-${r.category}-${r.template}-${idx}`}>
+                  <td style={{ color: r.priority === '急需修复' ? '#ef4444' : '#fbbf24', fontWeight: 800 }}>{r.priority || '-'}</td>
+                  <td>
+                    <div style={{ fontWeight: 800 }}>{r.source === 'ai_candidates' ? 'AI候选' : '真实交易'}</div>
+                    <div style={{ color: '#94a3b8' }}>{r.strategy_source || '-'} / {r.category || '-'}</div>
+                    <div style={{ color: '#cbd5e1', marginTop: 4 }}>{r.template || '-'}</div>
+                  </td>
+                  <td style={{ lineHeight: 1.65 }}>
+                    <div>{r.sample_size || 0} 笔</div>
+                    <div>问题/失败 {r.issue_count || 0}</div>
+                    <div>置信 {num((r.confidence || 0) * 100, 0)}%</div>
+                  </td>
+                  <td style={{ color: '#cbd5e1', lineHeight: 1.65 }}>
+                    {(r.key_metrics || []).join('、') || '-'}
+                    {(r.representative_symbols || []).length > 0 && (
+                      <div style={{ color: '#64748b', marginTop: 6 }}>
+                        代表：{r.representative_symbols.join('、')}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{ color: '#cbd5e1', lineHeight: 1.65 }}>{r.evidence || r.conclusion || '-'}</td>
+                  <td style={{ color: '#94a3b8', lineHeight: 1.65 }}>{r.recommendation || '-'}</td>
+                </tr>
+              ))}
+              {(aiInsights?.insights || []).length === 0 && (
+                <tr><td colSpan={6} style={{ textAlign: 'center', color: '#6b7280' }}>样本还不够，暂不生成强建议</td></tr>
+              )}
             </tbody>
           </table>
           </div>

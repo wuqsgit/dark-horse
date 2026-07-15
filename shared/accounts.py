@@ -37,6 +37,16 @@ def decrypt_secret(value: str) -> str:
 
 
 def ensure_default_account() -> int:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT id FROM trading_accounts ORDER BY is_default DESC, id LIMIT 1").fetchone()
+        if row:
+            return int(row["id"])
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
     init_db()
     conn = get_conn()
     try:

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { fetchTradingAccountsStatus } from '../api/tradingAccountsStatus';
 import TradingAccountManager from './TradingAccountManager';
 import { findSelectedAccount, normalizeSelectedAccount } from './liveTradingAccountSelection';
 
@@ -167,10 +168,10 @@ export default function LiveTrading() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [res, accountsRes, configsRes] = await Promise.all([
-        fetch('/api/trading/status'), fetch('/api/trading/accounts/status'), fetch('/api/trading/accounts'),
+      const [res, multi, configsRes] = await Promise.all([
+        fetch('/api/trading/status'), fetchTradingAccountsStatus(), fetch('/api/trading/accounts'),
       ]);
-      const [data, multi, configs] = await Promise.all([res.json(), accountsRes.json(), configsRes.json()]);
+      const [data, configs] = await Promise.all([res.json(), configsRes.json()]);
       setAccountsData(multi);
       setAccountConfigs(configs.accounts || []);
       if (data.error) {
