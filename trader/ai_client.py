@@ -1,10 +1,25 @@
+import json
 import logging
 from datetime import datetime, timezone
 
 import httpx
 
+from ai_service.features import FEATURE_SCHEMA_VERSION, extract_feature_payload
+
 
 logger = logging.getLogger("trader.ai")
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
 
 
 class AIEntryQualityClient:
@@ -83,32 +98,73 @@ def build_learning_action(
 
 def build_candidate(action, scan_rows, account_id):
     row = next((item for item in scan_rows if item.get("symbol") == action.get("symbol")), {})
-    features = _flatten_features(row.get("raw_features") or {})
-    features.update(_flatten_features(action.get("ai_features") or {}))
-    features.update({
-        "score": float(action.get("score") or row.get("composite_score") or 0),
-        "entry_alpha": float(row.get("entry_alpha") or features.get("entry_alpha") or 0),
-        "hold_alpha": float(row.get("hold_alpha") or features.get("hold_alpha") or 0),
-        "relative_strength": float(row.get("relative_strength") or features.get("relative_strength") or 0),
-    })
     is_alpha = action.get("strategy_source") == "alpha"
+    category = "alpha" if is_alpha else action.get("category") or row.get("category") or "unknown"
+    action_context = {
+        **action,
+        "score": float(action.get("score") or row.get("composite_score") or 0),
+        "entry_alpha": row.get("entry_alpha"),
+        "hold_alpha": row.get("hold_alpha"),
+        "relative_strength": row.get("relative_strength"),
+    }
+    features, feature_quality = extract_feature_payload(
+        action_context,
+        _json_object(action.get("ai_features")),
+        row,
+        _json_object(row.get("raw_features")),
+        category=category,
+    )
     return {
         "account_id": int(account_id),
         "model_key": "alpha" if is_alpha else "normal",
         "symbol": action["symbol"],
         "side": action.get("position_side") or ("LONG" if action.get("side") == "BUY" else "SHORT"),
         "template": action.get("ai_sample_template") or ("alpha_entry" if is_alpha else "normal_entry"),
-        "category": "alpha" if is_alpha else action.get("category") or features.get("category") or "unknown",
+        "category": category,
         "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "entry_price": float(action.get("entry_price") or 0),
         "stop_pct": float(action.get("stop_pct") or 0),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_quality": feature_quality,
         "features": features,
     }
 
 
 def observe_entry_quality_candidates(actions, scan_rows, *, account_id, observe=None):
     observe = observe or AIEntryQualityClient().observe_many
-    candidates = [build_candidate(action, scan_rows, account_id) for action in actions or []]
+    learning_actions = list(actions or [])
+    existing = {
+        (
+            str(action.get("symbol") or "").upper(),
+            str(action.get("strategy_source") or "normal"),
+        )
+        for action in learning_actions
+    }
+    try:
+        from trader.risk import determine_side
+        from trader.symbol_risk import get_symbol_risk
+
+        for row in scan_rows or []:
+            symbol = str(row.get("symbol") or "").upper()
+            key = (symbol, "normal")
+            if not symbol or key in existing:
+                continue
+            action = build_learning_action(
+                row,
+                side=determine_side(row),
+                strategy_source="normal",
+                category=(get_symbol_risk(symbol) or {}).get("class"),
+            )
+            if action:
+                learning_actions.append(action)
+                existing.add(key)
+    except Exception as exc:
+        logger.warning("AI full-scan candidate expansion unavailable: %s", exc)
+
+    candidates = [
+        build_candidate(action, scan_rows, account_id)
+        for action in learning_actions
+    ]
     if not candidates:
         return {"sent": 0}
     try:
@@ -129,7 +185,12 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
         try:
             decision = evaluate(build_candidate(action, scan_rows, account_id))
         except Exception as exc:
-            logger.error("AI entry-quality unavailable; block new %s entry: %s", action.get("symbol"), exc)
+            logger.warning("AI entry-quality unavailable; use rule decision for %s: %s", action.get("symbol"), exc)
+            action = dict(action)
+            action["ai_quality_status"] = "fallback"
+            action["ai_quality_decision"] = "rule_fallback"
+            action["ai_quality_reasons"] = [str(exc)]
+            filtered.append(action)
             continue
 
         action = dict(action)
@@ -138,7 +199,12 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
         action["ai_quality_score"] = decision.get("quality_score")
         action["ai_model_version"] = decision.get("model_version")
         action["ai_quality_reasons"] = decision.get("reasons") or []
+        action["ai_expected_r"] = decision.get("expected_r")
+        action["ai_position_factor"] = decision.get("position_factor")
 
+        if decision.get("applied") is False:
+            filtered.append(action)
+            continue
         if decision.get("decision") == "reject":
             logger.info("AI rejected %s entry at quality=%s", action.get("symbol"), decision.get("quality_score"))
             continue
@@ -157,5 +223,15 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
                 continue
             action["invested"] = round(price * action["quantity"], 2)
             action["ai_target_margin_pct"] = margin_pct
+        elif decision.get("position_factor") is not None:
+            factor = max(0.0, float(decision["position_factor"]))
+            action["quantity"] = exchange.adjust_quantity(
+                action["symbol"], float(action.get("quantity") or 0) * factor,
+            )
+            if action["quantity"] <= 0:
+                continue
+            action["invested"] = round(
+                float(action.get("entry_price") or 0) * action["quantity"], 2,
+            )
         filtered.append(action)
     return filtered

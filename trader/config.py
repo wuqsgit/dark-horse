@@ -43,7 +43,7 @@ TRADING_CONFIG = {
     # ── 评分阈值（统一标准） ──
     "min_score": 60,                    # 🔧 统一开仓门槛从 50→60
     "consecutive_scans_required": 2,    # 🔧 连续 2 轮评分确认
-    "max_signal_age_minutes": 45,       # V5: keep fresh enough without skipping normal scan cadence
+    "max_signal_age_minutes": 75,       # Allow for collection/scoring jitter without accepting old signals
 
     # ── 时间止损（alpha-prd.md §5.4.3） ──
     "time_stop_hours": 12,              # 🔧 持仓超 12h 检查
@@ -244,7 +244,8 @@ TRADING_CONFIG = {
         "max_account_exposure": 0.30,
         "max_positions": 3,
         "max_normal_reviews_per_loop": 2,
-        "min_score": 80,
+        "min_score": 78,
+        "full_position_score": 80,
         "entry_confirmation": {
             "min_trend_score": 72,
             "min_alpha_volume_6h": 1.8,
@@ -277,9 +278,15 @@ TRADING_CONFIG = {
     },
     "roll_trading": {
         "enabled": True,
-        "max_layers": 1,
+        "max_layers": 3,
         "trigger_r": 1.5,
         "add_initial_qty_pct": 0.25,
+        "layer_add_initial_qty_pct": [0.25, 0.20, 0.15],
+        "max_total_qty_multiple": 1.10,
+        "repeat_pullback_atr": 0.75,
+        "repeat_recover_to_peak_atr": 0.25,
+        "repeat_min_r": 1.0,
+        "min_minutes_between_layers": 20,
         "break_even_buffer_pct": 0.0015,
         "trailing_atr_multiplier": 2.0,
         "min_remaining_margin": 5.0,

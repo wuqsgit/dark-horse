@@ -92,7 +92,7 @@ class SimpleRollPlanningTest(unittest.TestCase):
         self.assertAlmostEqual(actions[0]["current_r"], 2.0)
         update.assert_called()
 
-    def test_range_market_phase_prevents_roll_even_after_tp1_and_r_trigger(self):
+    def test_range_market_phase_allows_roll_when_trend_confirms(self):
         engine = ExecutionEngine(RollPlanningExchange())
         engine._record_decision = lambda *args, **kwargs: None
         position = {
@@ -121,8 +121,70 @@ class SimpleRollPlanningTest(unittest.TestCase):
              patch("shared.db.update_position_management") as update:
             actions = engine._build_roll_actions(scores, [position], [], 5000, run_id="run1")
 
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["roll_layer"], 1)
+        update.assert_called()
+
+    def test_builds_second_roll_after_armed_pullback_recovers(self):
+        engine = ExecutionEngine(RollPlanningExchange())
+        engine._record_decision = lambda *args, **kwargs: None
+        position = {
+            "symbol": "BTCUSDT", "side": "LONG", "quantity": 7,
+            "entry_price": 100, "mark_price": 111.6, "leverage": 3,
+            "unrealized_pnl": 81.2,
+        }
+        state = {
+            "position_id": "p1", "strategy_source": "normal",
+            "initial_quantity": 10, "initial_stop_loss": 95, "atr_value": 2,
+            "tp1_hit": 1, "roll_layer": 1, "roll_price": 108,
+            "roll_cycle_peak_price": 112, "roll_pullback_armed": 1,
+        }
+        scores = [{
+            "symbol": "BTCUSDT", "composite_score": 80,
+            "raw_features": {"technical": {"ema20": 108, "ema20_slope": 1.2}},
+        }]
+
+        with patch("shared.db.get_position_history", return_value=state), \
+             patch("shared.db.update_position_management") as update:
+            actions = engine._build_roll_actions(scores, [position], [], 5000, run_id="run1")
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["roll_layer"], 2)
+        self.assertEqual(actions[0]["quantity"], 2.0)
+        self.assertIn("pullback_recovered", actions[0]["reason"])
+        update.assert_called()
+
+    def test_data_insufficient_uncertain_market_phase_still_prevents_roll(self):
+        engine = ExecutionEngine(RollPlanningExchange())
+        engine._record_decision = lambda *args, **kwargs: None
+        position = {
+            "symbol": "BTCUSDT", "side": "LONG", "quantity": 6,
+            "entry_price": 100, "mark_price": 110, "leverage": 3,
+            "unrealized_pnl": 60,
+        }
+        state = {
+            "position_id": "p1", "strategy_source": "normal",
+            "initial_quantity": 10, "initial_stop_loss": 95, "atr_value": 2,
+            "tp1_hit": 1, "roll_layer": 0,
+        }
+        scores = [{
+            "symbol": "BTCUSDT", "composite_score": 80,
+            "raw_features": {
+                "technical": {"ema20": 105, "ema20_slope": 1.2},
+                "market_phase": {
+                    "phase": "uncertain",
+                    "confidence": 20,
+                    "position_style": "skip",
+                },
+            },
+        }]
+
+        with patch("shared.db.get_position_history", return_value=state), \
+             patch("shared.db.update_position_management") as update:
+            actions = engine._build_roll_actions(scores, [position], [], 5000, run_id="run1")
+
         self.assertEqual(actions, [])
-        self.assertEqual(update.call_args.kwargs["roll_block_reason"], "market_phase_range")
+        self.assertEqual(update.call_args.kwargs["roll_block_reason"], "market_phase_uncertain")
 
     def test_planned_close_prevents_roll(self):
         engine = ExecutionEngine(RollPlanningExchange())

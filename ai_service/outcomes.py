@@ -1,6 +1,8 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import httpx
+
 from ai_service.labels import label_path
 
 
@@ -14,10 +16,22 @@ def _iso(value):
 
 
 class OutcomeLabeler:
-    def __init__(self, store, market_db_path, *, now_fn=None):
+    def __init__(
+        self,
+        store,
+        market_db_path,
+        *,
+        now_fn=None,
+        enable_backfill=False,
+        backfill_limit=20,
+        http_get=None,
+    ):
         self.store = store
         self.market_db_path = str(market_db_path)
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self.enable_backfill = bool(enable_backfill)
+        self.backfill_limit = int(backfill_limit)
+        self.http_get = http_get or httpx.get
 
     def _candles(self, sample):
         start = _parse_time(sample["observed_at"])
@@ -42,18 +56,58 @@ class OutcomeLabeler:
         end = _parse_time(sample["observed_at"]) + timedelta(hours=24)
         return _parse_time(candles[-1]["time"]) >= end - timedelta(minutes=15)
 
+    def _backfill_candles(self, sample):
+        start = _parse_time(sample["observed_at"])
+        end = start + timedelta(hours=24)
+        response = self.http_get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={
+                "symbol": sample["symbol"],
+                "interval": "15m",
+                "startTime": int(start.timestamp() * 1000),
+                "endTime": int(end.timestamp() * 1000),
+                "limit": 100,
+            },
+            timeout=5,
+        )
+        response.raise_for_status()
+        return [
+            {
+                "time": _iso(datetime.fromtimestamp(float(row[0]) / 1000, tz=timezone.utc)),
+                "high": float(row[2]),
+                "low": float(row[3]),
+            }
+            for row in response.json()
+        ]
+
     def label_pending(self, limit=1000):
         now = self.now_fn()
         mature_before = _iso(now - timedelta(hours=24))
-        result = {"checked": 0, "labeled": 0, "waiting_for_candles": 0, "missing": 0}
+        result = {
+            "checked": 0, "labeled": 0, "waiting_for_candles": 0,
+            "missing": 0, "backfilled": 0,
+        }
         for sample in self.store.pending_samples(mature_before, limit=limit):
             result["checked"] += 1
             try:
                 candles = self._candles(sample)
             except (sqlite3.Error, OSError):
                 candles = []
+            age = now - _parse_time(sample["observed_at"])
+            if (
+                not self._path_is_complete(sample, candles)
+                and self.enable_backfill
+                and age >= timedelta(hours=48)
+                and result["backfilled"] < self.backfill_limit
+            ):
+                try:
+                    remote = self._backfill_candles(sample)
+                    if self._path_is_complete(sample, remote):
+                        candles = remote
+                        result["backfilled"] += 1
+                except (httpx.HTTPError, TypeError, ValueError):
+                    pass
             if not self._path_is_complete(sample, candles):
-                age = now - _parse_time(sample["observed_at"])
                 if age >= timedelta(hours=72):
                     self.store.mark_sample_missing(sample["id"], "futures_15m_path_missing")
                     result["missing"] += 1

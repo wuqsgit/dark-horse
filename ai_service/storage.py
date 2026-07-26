@@ -8,11 +8,13 @@ def _json(value) -> str:
     return json.dumps(value if value is not None else {}, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-def _hour_bucket(value: str) -> str:
+def _sample_bucket(value: str) -> str:
     dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
+    dt = dt.astimezone(timezone.utc)
+    minute = (dt.minute // 15) * 15
+    return dt.replace(minute=minute, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 class AIStore:
@@ -46,6 +48,8 @@ class AIStore:
                     entry_price REAL NOT NULL,
                     stop_pct REAL NOT NULL,
                     features_json TEXT NOT NULL,
+                    feature_schema_version INTEGER NOT NULL DEFAULT 1,
+                    quality_json TEXT NOT NULL DEFAULT '{}',
                     label INTEGER,
                     first_event TEXT,
                     mfe_r REAL,
@@ -70,6 +74,8 @@ class AIStore:
                     decision TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     size_factor REAL,
+                    expected_r REAL,
+                    applied INTEGER NOT NULL DEFAULT 0,
                     reasons_json TEXT NOT NULL,
                     features_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -90,16 +96,60 @@ class AIStore:
                     baseline_mean_r REAL,
                     allowed_mean_r REAL,
                     metrics_json TEXT NOT NULL,
+                    feature_schema_version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_model_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_key TEXT NOT NULL,
+                    version TEXT,
+                    status TEXT NOT NULL,
+                    trained_at TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    validation_count INTEGER NOT NULL DEFAULT 0,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    feature_schema_version INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_model_runs_key_time
+                    ON ai_model_runs(model_key, trained_at DESC);
+
+                CREATE TABLE IF NOT EXISTS ai_trade_attribution (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_id INTEGER,
+                    account_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    model_key TEXT NOT NULL,
+                    model_version TEXT,
+                    rule_decision TEXT,
+                    ai_decision TEXT,
+                    execution_decision TEXT,
+                    realized_pnl REAL,
+                    realized_r REAL,
+                    exit_reason TEXT,
+                    opened_at TEXT,
+                    closed_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 """
             )
+            self._ensure_column(conn, "entry_quality_samples", "feature_schema_version", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "entry_quality_samples", "quality_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "entry_quality_decisions", "expected_r", "REAL")
+            self._ensure_column(conn, "entry_quality_decisions", "applied", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "entry_quality_models", "feature_schema_version", "INTEGER NOT NULL DEFAULT 1")
             conn.commit()
         finally:
             conn.close()
 
+    @staticmethod
+    def _ensure_column(conn, table: str, column: str, definition: str) -> None:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def add_sample(self, sample: dict) -> tuple[int, bool]:
-        bucket = _hour_bucket(sample["observed_at"])
+        bucket = _sample_bucket(sample["observed_at"])
         template = str(sample.get("template") or "default")
         model_key = str(sample["model_key"])
         symbol = str(sample["symbol"]).upper()
@@ -110,12 +160,15 @@ class AIStore:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO entry_quality_samples
                    (sample_key, model_key, symbol, side, template, category, observed_at,
-                    hour_bucket, entry_price, stop_pct, features_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    hour_bucket, entry_price, stop_pct, features_json,
+                    feature_schema_version, quality_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     sample_key, model_key, symbol, side, template, sample.get("category"),
                     sample["observed_at"], bucket, float(sample["entry_price"]),
                     float(sample["stop_pct"]), _json(sample.get("features")),
+                    int(sample.get("feature_schema_version") or 1),
+                    _json(sample.get("feature_quality")),
                 ),
             )
             created = cursor.rowcount == 1
@@ -153,19 +206,52 @@ class AIStore:
         finally:
             conn.close()
 
+    def feature_quality_summary(self, model_key: str, schema_version: int) -> dict:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """SELECT quality_json FROM entry_quality_samples
+                   WHERE model_key=? AND feature_schema_version=?
+                   ORDER BY id DESC LIMIT 1000""",
+                (model_key, int(schema_version)),
+            ).fetchall()
+            qualities = [json.loads(row["quality_json"] or "{}") for row in rows]
+            if not qualities:
+                return {
+                    "schema_version": int(schema_version),
+                    "samples": 0,
+                    "average_coverage": 0.0,
+                    "average_present_count": 0.0,
+                }
+            return {
+                "schema_version": int(schema_version),
+                "samples": len(qualities),
+                "average_coverage": round(
+                    sum(float(item.get("coverage") or 0) for item in qualities) / len(qualities),
+                    4,
+                ),
+                "average_present_count": round(
+                    sum(float(item.get("present_count") or 0) for item in qualities) / len(qualities),
+                    2,
+                ),
+            }
+        finally:
+            conn.close()
+
     def record_decision(self, decision: dict) -> int:
         conn = self.connect()
         try:
             cursor = conn.execute(
                 """INSERT INTO entry_quality_decisions
                    (observed_at, account_id, model_key, symbol, model_version, quality_score,
-                    decision, mode, size_factor, reasons_json, features_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    decision, mode, size_factor, expected_r, applied, reasons_json, features_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     decision["observed_at"], decision.get("account_id"), decision["model_key"],
                     str(decision["symbol"]).upper(), decision.get("model_version"),
                     decision.get("quality_score"), decision["decision"], decision.get("mode") or "live",
-                    decision.get("size_factor"), _json(decision.get("reasons")),
+                    decision.get("size_factor"), decision.get("expected_r"),
+                    1 if decision.get("applied") else 0, _json(decision.get("reasons")),
                     _json(decision.get("features")),
                 ),
             )
@@ -210,6 +296,7 @@ class AIStore:
             for row in rows:
                 item = dict(row)
                 item["features"] = json.loads(item.pop("features_json") or "{}")
+                item["feature_quality"] = json.loads(item.pop("quality_json") or "{}")
                 result.append(item)
             return result
         finally:
@@ -228,6 +315,7 @@ class AIStore:
             for row in rows:
                 item = dict(row)
                 item["features"] = json.loads(item.pop("features_json") or "{}")
+                item["feature_quality"] = json.loads(item.pop("quality_json") or "{}")
                 result.append(item)
             return result
         finally:
@@ -251,19 +339,34 @@ class AIStore:
             conn.execute(
                 """INSERT INTO entry_quality_models
                    (model_key, version, status, artifact_path, trained_at, sample_count,
-                    validation_count, baseline_mean_r, allowed_mean_r, metrics_json, updated_at)
-                   VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    validation_count, baseline_mean_r, allowed_mean_r, metrics_json,
+                    feature_schema_version, updated_at)
+                   VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                    ON CONFLICT(model_key) DO UPDATE SET
                      version=excluded.version, status='ready', artifact_path=excluded.artifact_path,
                      trained_at=excluded.trained_at, sample_count=excluded.sample_count,
                      validation_count=excluded.validation_count,
                      baseline_mean_r=excluded.baseline_mean_r,
                      allowed_mean_r=excluded.allowed_mean_r,
-                     metrics_json=excluded.metrics_json, updated_at=datetime('now')""",
+                     metrics_json=excluded.metrics_json,
+                     feature_schema_version=excluded.feature_schema_version,
+                     updated_at=datetime('now')""",
                 (
                     model["model_key"], model["version"], model["artifact_path"], model["trained_at"],
                     int(model["sample_count"]), int(model["validation_count"]),
-                    model.get("baseline_mean_r"), model.get("allowed_mean_r"), _json(model.get("metrics")),
+                    model.get("baseline_mean_r"), model.get("allowed_mean_r"),
+                    _json(model.get("metrics")), int(model.get("feature_schema_version") or 1),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO ai_model_runs
+                   (model_key, version, status, trained_at, sample_count, validation_count,
+                    metrics_json, feature_schema_version)
+                   VALUES (?, ?, 'published', ?, ?, ?, ?, ?)""",
+                (
+                    model["model_key"], model["version"], model["trained_at"],
+                    int(model["sample_count"]), int(model["validation_count"]),
+                    _json(model.get("metrics")), int(model.get("feature_schema_version") or 1),
                 ),
             )
             conn.commit()

@@ -50,14 +50,12 @@ class NormalSoftExitTest(unittest.TestCase):
                 run_id="run1",
             )
 
-    def test_strong_trend_weak_hold_alpha_reduces_twenty_percent_once(self):
+    def test_strong_trend_weak_hold_alpha_holds_for_trend_capture(self):
         actions = self._actions({
             "ema20": 101, "ema20_slope": 1.0, "ema20_50_ratio": 1.01,
             "return_6h": 0.02, "return_24h": 0.05,
         })
-        self.assertEqual(actions[0]["action"], "partial_close")
-        self.assertEqual(actions[0]["close_pct"], 0.20)
-        self.assertIn("strong_trend", actions[0]["reason"])
+        self.assertEqual(actions, [])
 
     def test_confirmed_weak_trend_reduces_twenty_five_percent(self):
         actions = self._actions({

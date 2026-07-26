@@ -56,7 +56,7 @@ CREATE TABLE account_position_history(
   initial_quantity REAL,
   roll_price REAL,
   protected_stop REAL
-);
+, roll_cycle_peak_price REAL, roll_pullback_armed INTEGER DEFAULT 0);
 
 CREATE TABLE alpha_candles_15m (
             time TEXT, alpha_symbol TEXT,
@@ -535,7 +535,7 @@ CREATE TABLE position_history (
     entry_score REAL, entry_time TEXT,
     tp3_price REAL, atr_value REAL,
     update_time TEXT DEFAULT (datetime('now'))
-, tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, highest_price REAL, last_exit_reason TEXT, position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, roll_layer INTEGER DEFAULT 0, last_roll_time TEXT, roll_parent_trade_id TEXT, protected_profit REAL DEFAULT 0, max_floating_pnl REAL DEFAULT 0, roll_enabled INTEGER DEFAULT 0, roll_block_reason TEXT, lowest_price REAL, stop_model TEXT, initial_stop_loss REAL, stop_pct REAL, current_stop_loss REAL, trailing_stop_price REAL, trailing_enabled INTEGER DEFAULT 0, trailing_atr_multiplier REAL, r_multiple REAL DEFAULT 0, alpha_volume_protect_regime TEXT, alpha_volume_protect_time TEXT, initial_quantity REAL, roll_price REAL, protected_stop REAL);
+, tp1_hit INTEGER DEFAULT 0, tp2_hit INTEGER DEFAULT 0, highest_price REAL, last_exit_reason TEXT, position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, roll_layer INTEGER DEFAULT 0, last_roll_time TEXT, roll_parent_trade_id TEXT, protected_profit REAL DEFAULT 0, max_floating_pnl REAL DEFAULT 0, roll_enabled INTEGER DEFAULT 0, roll_block_reason TEXT, lowest_price REAL, stop_model TEXT, initial_stop_loss REAL, stop_pct REAL, current_stop_loss REAL, trailing_stop_price REAL, trailing_enabled INTEGER DEFAULT 0, trailing_atr_multiplier REAL, r_multiple REAL DEFAULT 0, alpha_volume_protect_regime TEXT, alpha_volume_protect_time TEXT, initial_quantity REAL, roll_price REAL, protected_stop REAL, roll_cycle_peak_price REAL, roll_pullback_armed INTEGER DEFAULT 0);
 
 CREATE TABLE position_roll_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

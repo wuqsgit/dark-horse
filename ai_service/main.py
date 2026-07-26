@@ -22,7 +22,9 @@ def create_app(
     start_scheduler: bool = True,
 ) -> FastAPI:
     quality = service or EntryQualityService(AIStore(AI_DB_PATH), XGBoostBackend(), model_dir=MODEL_DIR)
-    outcomes = labeler or OutcomeLabeler(quality.store, MAIN_DB_PATH)
+    outcomes = labeler or OutcomeLabeler(
+        quality.store, MAIN_DB_PATH, enable_backfill=True,
+    )
     maintenance = {"last_label": None, "last_label_result": None, "last_train": None, "last_error": None}
 
     async def maintenance_loop():

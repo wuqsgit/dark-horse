@@ -99,13 +99,35 @@ def _alpha_position_factor(volume_price: dict) -> float:
     return max(0.0, min(2.0, float((volume_price or {}).get("max_position_factor") or 0)))
 
 
+def _alpha_discovery_position_factor(score: float, min_score: float = 78, full_score: float = 80) -> float:
+    value = float(score or 0)
+    if value < min_score:
+        return 0.0
+    return 0.5 if value < full_score else 1.0
+
+
 def _market_phase_entry_decision(market_phase: dict, current_status: str) -> tuple[bool, str, str]:
     phase = str((market_phase or {}).get("phase") or "")
-    if phase in {"breakdown_risk", "uncertain"}:
+    confidence = float((market_phase or {}).get("confidence") or 0)
+    style = str((market_phase or {}).get("position_style") or "")
+    if phase == "breakdown_risk":
         return False, "blocked", f"market_phase_{phase}"
+    if phase == "uncertain" and (confidence <= 25 or style == "skip"):
+        return False, "blocked", "market_phase_uncertain_data_insufficient"
     if phase == "breakout_pending":
-        return True, "probe", "market_phase_breakout_pending_probe"
+        return True, current_status, "market_phase_breakout_pending_soft_pass"
+    if phase == "uncertain":
+        return True, current_status, "market_phase_uncertain_soft_pass"
     return True, current_status, "market_phase_ok"
+
+
+def _market_phase_size_factor(market_phase: dict) -> float:
+    phase = str((market_phase or {}).get("phase") or "")
+    if phase == "range":
+        return 0.75
+    if phase == "uncertain":
+        return 0.85
+    return 1.0
 
 
 def _alpha_probe_entry_decision(
@@ -442,48 +464,6 @@ def _price_return_pct(side, entry_price, mark_price):
         return 0.0
     raw = (mark - entry) / entry
     return -raw if str(side or "").upper() == "SHORT" else raw
-
-
-def _promote_confirmed_alpha_probe(volume_price: dict, raw_alpha: dict, breakout_confirmed: bool) -> dict:
-    """Allow a 68-72 trend probe only after independent market confirmation."""
-    if volume_price.get("allow_long") or not breakout_confirmed:
-        return volume_price
-    alpha_trend = raw_alpha.get("alpha_trend") or {}
-    volume = raw_alpha.get("volume") or {}
-    futures = raw_alpha.get("futures_sync") or {}
-    trend_score = float(alpha_trend.get("trend_continuation_score") or 0)
-    alpha_volume = float(volume.get("alpha_volume_growth_6h") or 0)
-    futures_volume = float(futures.get("futures_volume_growth_6h") or 0)
-    oi4 = float(futures.get("oi_change_4h") or 0)
-    oi24 = float(futures.get("oi_change_24h") or 0)
-    funding = abs(float(futures.get("funding_rate") or 0))
-    oi_confirmed = oi4 >= 0 and oi24 >= -0.01
-    oi_waiver = -0.005 <= oi4 < 0 and alpha_volume >= 3.0 and futures_volume >= 2.0
-    confirmed = (
-        68 <= trend_score < 72
-        and alpha_volume >= 1.8
-        and bool(futures.get("available"))
-        and futures_volume >= 1.5
-        and (oi_confirmed or oi_waiver)
-        and funding <= 0.0015
-    )
-    if not confirmed:
-        return volume_price
-    promoted = dict(volume_price)
-    promoted.update({
-        "state": "alpha_trend_probe_confirmed_15m",
-        "action": "normal_review_probe",
-        "allow_long": True,
-        "allow_short": False,
-        "max_position_factor": 0.12,
-        "reasons": list(volume_price.get("reasons") or [])
-        + [f"trend {trend_score:.1f} confirmed by dual market volume and closed 15m breakout hold"],
-    })
-    metrics = dict(promoted.get("metrics") or {})
-    metrics["trend_score"] = round(trend_score, 2)
-    metrics["breakout_15m_confirmed"] = True
-    promoted["metrics"] = metrics
-    return promoted
 
 
 def _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=None, lowest_price=None):
@@ -1344,10 +1324,10 @@ class ExecutionEngine:
                     )
                     return
                 if soft_trend_state == "strong" and pnl_pct >= soft_exit_profit_pct:
-                    add(
-                        "partial_close",
-                        f"normal_soft_exit strong_trend source={source} pnl={pnl_pct:.1f}%",
-                        float(soft_cfg.get("strong_trend_close_pct", 0.20)),
+                    self._record_decision(
+                        latest, run_id=run_id, side=side,
+                        decision_stage="position_management", decision_result="hold",
+                        filter_reason=f"soft_hold_strong_trend source={source} pnl={pnl_pct:.1f}%",
                     )
                     return
                 if soft_trend_state == "weak":
@@ -1537,15 +1517,28 @@ class ExecutionEngine:
             "ask_bid_ratio": ask_bid_ratio,
         }
         soft_limit, hard_max, network, profile = self._spread_limit_for_profile(entry_profile)
+        if str(profile).startswith("alpha_"):
+            soft_limit, hard_max = 0.0012, 0.0035
         info.update({
             "spread_soft_limit": soft_limit,
             "spread_hard_max": hard_max,
             "spread_network": network,
             "entry_profile": profile,
         })
+        if spread_pct >= hard_max:
+            return False, f"spread hard blocked: {spread_pct:.4%} >= {hard_max:.2%} ({network}/{profile})", info
         if spread_pct > soft_limit:
             info["spread_degraded"] = True
-            info["spread_size_multiplier"] = max(0.10, min(1.0, soft_limit / max(spread_pct, 1e-9)))
+            if str(profile).startswith("alpha_"):
+                span = max(hard_max - soft_limit, 1e-9)
+                info["spread_size_multiplier"] = max(
+                    0.50,
+                    1.0 - ((spread_pct - soft_limit) / span) * 0.50,
+                )
+            else:
+                info["spread_size_multiplier"] = max(
+                    0.10, min(1.0, soft_limit / max(spread_pct, 1e-9)),
+                )
             return True, f"spread degraded: {spread_pct:.4%} > soft {soft_limit:.2%} ({network}/{profile})", info
         if side == "LONG" and bid_ask_ratio < 0.65:
             return False, f"live depth against LONG: bid/ask={bid_ask_ratio:.2f}", info
@@ -1605,6 +1598,7 @@ class ExecutionEngine:
         ttl = float(cfg.get("signal_ttl_minutes", 15))
         vp_ttl = float(cfg.get("volume_price_ttl_minutes", 20))
         min_score = float(cfg.get("min_score", 68))
+        full_position_score = float(cfg.get("full_position_score", 80))
         actions = []
 
         candidates = sorted(
@@ -1629,7 +1623,7 @@ class ExecutionEngine:
             adapter_quality = 100.0
             missing_fields = []
             entry_profile = {}
-            volume_price = raw_alpha.get("volume_price") or evaluate_alpha_volume_price(
+            volume_price = evaluate_alpha_volume_price(
                 raw_alpha,
                 row.get("market_price") or 0,
             )
@@ -1729,11 +1723,6 @@ class ExecutionEngine:
                 reject(f"alpha cooldown active: {cooldown.get('reason')} until {cooldown.get('cooldown_until')}")
                 continue
 
-            confirmation_cfg = cfg.get("entry_confirmation") or {}
-            breakout_ok, breakout_reason, breakout_info = True, None, {}
-            if confirmation_cfg.get("require_15m_breakout_confirmation", True):
-                breakout_ok, breakout_reason, breakout_info = _check_alpha_futures_breakout_confirmation(symbol)
-            volume_price = _promote_confirmed_alpha_probe(volume_price, raw_alpha, breakout_ok)
             vp_action = volume_price.get("action")
             if vp_action == "cooldown":
                 try:
@@ -1767,9 +1756,6 @@ class ExecutionEngine:
             if not volume_price.get("allow_long"):
                 reject(f"alpha long not allowed by volume trend gate: {volume_price.get('state')}", {"volume_price": volume_price})
                 continue
-            if confirmation_cfg.get("require_15m_breakout_confirmation", True) and not breakout_ok:
-                reject(breakout_reason, {"alpha_15m_confirmation": breakout_info, "volume_price": volume_price})
-                continue
             side = "LONG"
             action_side = "BUY"
             if no_open_slots_reason:
@@ -1785,6 +1771,9 @@ class ExecutionEngine:
             symbol_risk = get_symbol_risk(symbol)
 
             vp_factor = _alpha_position_factor(volume_price)
+            discovery_factor = _alpha_discovery_position_factor(
+                discovery_score, min_score, full_position_score,
+            )
             entry_status = "probe" if vp_action == "normal_review_probe" or vp_factor <= 0.25 else "pass"
             entry_profile = {
                 "status": entry_status,
@@ -1860,11 +1849,19 @@ class ExecutionEngine:
 
             alpha_execution_score = float(discovery_score or 0)
             alpha_entry_mode = "probe" if entry_profile.get("status") == "probe" else ("strong" if vp_factor >= 0.30 else "confirmed")
-            size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
+            raw_spread_factor = float(
+                (volume_price.get("metrics") or {}).get("spread_position_factor") or 1.0
+            )
+            live_spread_factor = (
+                float(ob_info.get("spread_size_multiplier") or 1.0)
+                if ob_info.get("spread_degraded")
+                else 1.0
+            )
+            size_multiplier = min(1.0, live_spread_factor / max(raw_spread_factor, 1e-9))
             if vp_factor > 0:
                 size_multiplier *= vp_factor
-            if market_phase.get("phase") == "range":
-                size_multiplier *= 0.75
+            size_multiplier *= discovery_factor
+            size_multiplier *= _market_phase_size_factor(market_phase)
             pos_info = calculate_position(
                 self.ex,
                 symbol,
@@ -1921,6 +1918,7 @@ class ExecutionEngine:
                 "alpha_profile": profile,
                 "alpha_entry_level": entry_profile.get("status"),
                 "alpha_score": discovery_score,
+                "alpha_score_position_factor": discovery_factor,
                 "alpha_suggested_position_pct": round(float(pos_info.get("margin") or 0) / balance, 4) if balance else 0,
                 "ai_features": {
                     **(normal_row.get("raw_features") or {}),
@@ -2016,7 +2014,7 @@ class ExecutionEngine:
         latest_map = _latest_by_symbol(top_symbols)
         blocked_symbols = {
             a.get("symbol") for a in planned_actions
-            if a.get("action") in ("close", "partial_close")
+            if a.get("action") == "close"
         }
 
         for pos in current_positions:
@@ -2053,9 +2051,13 @@ class ExecutionEngine:
                     },
                 )
 
-            if market_phase and not bool(market_phase.get("allow_roll")):
-                phase_name = str(market_phase.get("phase") or "unknown")
-                block(f"market_phase_{phase_name}")
+            phase_name = str(market_phase.get("phase") or "")
+            phase_confidence = float(market_phase.get("confidence") or 0)
+            phase_style = str(market_phase.get("position_style") or "")
+            if phase_name == "breakdown_risk" or (
+                phase_name == "uncertain" and (phase_confidence <= 25 or phase_style == "skip")
+            ):
+                block(f"market_phase_{phase_name or 'unknown'}")
                 continue
 
             decision = evaluate_roll(
@@ -2065,13 +2067,37 @@ class ExecutionEngine:
                 alpha_sync=alpha_sync,
                 config=cfg,
             )
+            current_layer = int(hist.get("roll_layer") or 0)
+            if current_layer >= 1:
+                update_position_management(
+                    sym,
+                    roll_cycle_peak_price=decision.cycle_peak_price or hist.get("roll_cycle_peak_price"),
+                    roll_pullback_armed=1 if decision.pullback_armed else 0,
+                )
             if not decision.eligible:
                 block(decision.status)
                 continue
 
+            min_layer_gap = float(cfg.get("min_minutes_between_layers") or 0)
+            last_roll_age_h = _age_hours(hist.get("last_roll_time"))
+            if (
+                current_layer >= 1
+                and min_layer_gap > 0
+                and last_roll_age_h is not None
+                and last_roll_age_h * 60 < min_layer_gap
+            ):
+                block(f"roll_layer_cooldown_{min_layer_gap:.0f}m")
+                continue
+
+            next_layer = current_layer + 1
             exchange_info = self.ex.get_symbol_info(sym)
             add_qty = calculate_roll_quantity(
-                hist.get("initial_quantity"), exchange_info, mark_price, cfg
+                hist.get("initial_quantity"),
+                exchange_info,
+                mark_price,
+                cfg,
+                roll_layer=next_layer,
+                current_quantity=pos.get("quantity"),
             )
             if add_qty <= 0:
                 block("roll quantity <= 0")
@@ -2082,7 +2108,14 @@ class ExecutionEngine:
             entry_price = float(pos.get("entry_price") or 0)
             blended_entry = ((entry_price * current_qty) + (mark_price * add_qty)) / (current_qty + add_qty)
             stop_price = calculate_protected_stop(side, blended_entry, cfg)
-            reason = f"roll_add_once: tp1_confirmed current_r={decision.current_r:.2f} trend_confirmed"
+            reason = (
+                f"roll_add_layer_{next_layer}: tp1_confirmed current_r={decision.current_r:.2f} "
+                f"{'pullback_recovered ' if current_layer >= 1 else ''}trend_confirmed"
+            )
+            planned_actions[:] = [
+                a for a in planned_actions
+                if not (a.get("symbol") == sym and a.get("action") == "partial_close")
+            ]
             actions.append({
                 "action": "roll_add",
                 "symbol": sym,
@@ -2104,7 +2137,7 @@ class ExecutionEngine:
                 "alpha_entry_level": hist.get("alpha_entry_level"),
                 "alpha_score": hist.get("alpha_score"),
                 "alpha_suggested_position_pct": hist.get("alpha_suggested_position_pct"),
-                "roll_layer": 1,
+                "roll_layer": next_layer,
                 "current_r": decision.current_r,
                 "risk_before": {
                     "quantity": current_qty,
@@ -2113,6 +2146,7 @@ class ExecutionEngine:
                 },
                 "risk_after": {
                     "add_qty": add_qty,
+                    "roll_layer": next_layer,
                     "estimated_blended_entry": blended_entry,
                     "estimated_protected_stop": stop_price,
                 },
@@ -2502,8 +2536,7 @@ class ExecutionEngine:
                 symbol_risk = entry_profile.get("risk_profile") or get_symbol_risk(sym)
                 sizing_mode = "probe" if entry_profile.get("status") == "probe" else "confirmed"
                 size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
-                if market_phase.get("phase") == "range":
-                    size_multiplier *= 0.75
+                size_multiplier *= _market_phase_size_factor(market_phase)
                 pos_info = calculate_position(
                     self.ex,
                     sym,
@@ -3140,9 +3173,11 @@ class ExecutionEngine:
         roll_price = float((order or {}).get("avgPrice") or act.get("entry_price") or 0)
         update_position_management(
             act["symbol"],
-            roll_layer=1,
+            roll_layer=int(act.get("roll_layer") or 1),
             last_roll_time=datetime.now(timezone.utc).isoformat(),
             roll_price=roll_price,
+            roll_cycle_peak_price=roll_price,
+            roll_pullback_armed=0,
             protected_stop=protected_stop,
             current_stop_loss=protected_stop,
             trailing_enabled=1,
@@ -3155,7 +3190,8 @@ class ExecutionEngine:
         )
         record_position_roll_event(
             symbol=act["symbol"], position_side=act.get("position_side"),
-            strategy_source=act.get("strategy_source", "normal"), roll_layer=1,
+            strategy_source=act.get("strategy_source", "normal"),
+            roll_layer=int(act.get("roll_layer") or 1),
             roll_qty=confirmed_add_qty, roll_price=roll_price, roll_reason=act.get("reason"),
             position_id=act.get("position_id"), risk_before=act.get("risk_before"),
             risk_after={**(act.get("risk_after") or {}), "protected_stop": protected_stop, "total_quantity": actual_qty},

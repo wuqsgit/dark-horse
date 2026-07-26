@@ -49,4 +49,25 @@ class XGBoostBackend:
         booster = model.get_booster()
         scores = booster.get_score(importance_type="gain")
         top = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:2]
-        return [f"{name} is influential" for name, _ in top] or ["model probability threshold"]
+        names = list(getattr(model, "feature_names_in_", []) or [])
+
+        def display_name(name):
+            if name.startswith("f") and name[1:].isdigit():
+                index = int(name[1:])
+                if 0 <= index < len(names):
+                    return str(names[index])
+            return name
+
+        return [f"{display_name(name)} is influential" for name, _ in top] or ["model probability threshold"]
+
+    def feature_importance(self, model, feature_names):
+        raw = model.get_booster().get_score(importance_type="gain")
+        result = {}
+        for key, value in raw.items():
+            name = key
+            if key.startswith("f") and key[1:].isdigit():
+                index = int(key[1:])
+                if 0 <= index < len(feature_names):
+                    name = feature_names[index]
+            result[name] = float(value)
+        return result

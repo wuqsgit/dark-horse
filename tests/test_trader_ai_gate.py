@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest.mock import patch
 
 
@@ -63,6 +64,25 @@ class TraderAIGateTest(unittest.TestCase):
         self.assertEqual(candidate["features"]["spread_pct"], 0.0005)
         self.assertEqual(candidate["features"]["score"], 82.0)
 
+    def test_candidate_parses_database_json_feature_payload(self):
+        action = open_action(source="normal")
+        rows = [{
+            "symbol": "B2USDT",
+            "composite_score": 84,
+            "entry_alpha": 71,
+            "raw_features": json.dumps({
+                "technical": {"trend_score": 79, "return_6h": 0.12},
+                "futures": {"oi_change_pct": 0.08},
+            }),
+        }]
+
+        candidate = build_candidate(action, rows, account_id=7)
+
+        self.assertEqual(candidate["features"]["trend_score"], 79)
+        self.assertEqual(candidate["features"]["return_6h"], 0.12)
+        self.assertEqual(candidate["features"]["oi_change_pct"], 0.08)
+        self.assertGreaterEqual(candidate["feature_quality"]["present_count"], 5)
+
     def test_collecting_and_allow_keep_original_entry(self):
         actions = [open_action(), {"action": "close", "symbol": "ETHUSDT"}]
         for decision in ("collecting", "allow"):
@@ -99,7 +119,7 @@ class TraderAIGateTest(unittest.TestCase):
         self.assertEqual(action["invested"], 750.0)
         self.assertEqual(action["ai_quality_score"], 58)
 
-    def test_ai_failure_blocks_open_but_keeps_position_management(self):
+    def test_ai_failure_falls_back_to_rule_entry_and_keeps_position_management(self):
         close = {"action": "partial_close", "symbol": "ETHUSDT"}
 
         def unavailable(candidate):
@@ -109,7 +129,9 @@ class TraderAIGateTest(unittest.TestCase):
             [open_action(), close], [], balance=5000, exchange=FakeExchange(), account_id=1,
             evaluate=unavailable,
         )
-        self.assertEqual(result, [close])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["ai_quality_decision"], "rule_fallback")
+        self.assertEqual(result[1], close)
 
     def test_candidate_observation_is_batched_and_does_not_change_actions(self):
         observed = []

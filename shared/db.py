@@ -1001,6 +1001,8 @@ def init_db():
         "initial_quantity": "REAL",
         "roll_price": "REAL",
         "protected_stop": "REAL",
+        "roll_cycle_peak_price": "REAL",
+        "roll_pullback_armed": "INTEGER DEFAULT 0",
         "alpha_volume_protect_regime": "TEXT",
         "alpha_volume_protect_time": "TEXT",
     }.items():
@@ -2050,6 +2052,8 @@ def update_position_management(symbol, **fields):
         "r_multiple",
         "roll_price",
         "protected_stop",
+        "roll_cycle_peak_price",
+        "roll_pullback_armed",
         "alpha_volume_protect_regime",
         "alpha_volume_protect_time",
     }

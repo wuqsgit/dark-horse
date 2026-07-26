@@ -13,7 +13,7 @@ class AIQualityStorageTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_samples_are_deduplicated_by_model_symbol_side_template_and_hour(self):
+    def test_samples_are_deduplicated_by_model_symbol_side_template_and_quarter_hour(self):
         sample = {
             "model_key": "alpha",
             "symbol": "B2USDT",
@@ -25,8 +25,8 @@ class AIQualityStorageTest(unittest.TestCase):
             "features": {"score": 82.0},
         }
         first_id, first_created = self.store.add_sample(sample)
-        second_id, second_created = self.store.add_sample({**sample, "observed_at": "2026-07-14T10:55:00Z"})
-        third_id, third_created = self.store.add_sample({**sample, "observed_at": "2026-07-14T11:01:00Z"})
+        second_id, second_created = self.store.add_sample({**sample, "observed_at": "2026-07-14T10:10:00Z"})
+        third_id, third_created = self.store.add_sample({**sample, "observed_at": "2026-07-14T10:16:00Z"})
 
         self.assertTrue(first_created)
         self.assertFalse(second_created)

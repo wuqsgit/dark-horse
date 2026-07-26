@@ -1,5 +1,6 @@
 """交易主循环 — 定时拉评分 Top → 决策 → 执行"""
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -28,6 +29,18 @@ import warnings, urllib3
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 urllib3.disable_warnings()
 logger = logging.getLogger("trader")
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
 
 
 async def _account_trading_loop(account):
@@ -120,7 +133,7 @@ async def _account_trading_loop(account):
                     "relative_strength": float(r["relative_strength"] or 50),
                     "entry_alpha": float(r["entry_alpha"] or 0),
                     "hold_alpha": float(r["hold_alpha"] or 0),
-                    "raw_features": r["raw_features"],
+                    "raw_features": _json_object(r["raw_features"]),
                 })
 
             record_strategy_decisions([

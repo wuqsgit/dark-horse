@@ -33,8 +33,8 @@ def classify_alpha_volume_regime(raw_features: dict) -> dict:
     reasons = []
 
     sell_pressure = ask > 0 and bid > 0 and ask / max(bid, 1e-9) > 1.35
-    if spread > 0.12:
-        reasons.append(f"spread {spread:.3f}% > 0.12%")
+    if spread >= 0.35:
+        reasons.append(f"spread {spread:.3f}% >= 0.35%")
         return {"regime": "suspicious", "volume_growth_6h": vg, "reasons": reasons, "is_chase_risk": False, "is_tradeable_impulse": False}
     if sell_pressure:
         reasons.append("ask depth pressure too high")

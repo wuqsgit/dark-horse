@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from ai_service.service import EntryQualityService, ModelUnavailable
 from ai_service.storage import AIStore
+from ai_service.features import FEATURE_SCHEMA_VERSION, extract_feature_payload
 
 
 class FakeBackend:
@@ -38,6 +39,10 @@ class FakeBackend:
 
 
 def candidate(score=82.0):
+    features, quality = extract_feature_payload(
+        {"score": score, "trend_score": 75, "spread_pct": 0.0004},
+        category="alpha",
+    )
     return {
         "account_id": 1,
         "model_key": "alpha",
@@ -48,7 +53,9 @@ def candidate(score=82.0):
         "observed_at": "2026-07-14T10:05:00Z",
         "entry_price": 0.5,
         "stop_pct": 0.04,
-        "features": {"score": score, "trend_score": 75, "spread_pct": 0.0004},
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_quality": quality,
+        "features": features,
     }
 
 
@@ -66,6 +73,8 @@ class AIQualityServiceTest(unittest.TestCase):
             self.store,
             FakeBackend(probability),
             model_dir=self.model_dir,
+            min_usable_features=1,
+            execution_mode="live",
             now_fn=lambda: now or datetime(2026, 7, 14, 11, tzinfo=timezone.utc),
         )
 
@@ -81,6 +90,7 @@ class AIQualityServiceTest(unittest.TestCase):
             "baseline_mean_r": 0.02,
             "allowed_mean_r": 0.25,
             "metrics": {"validation_accuracy": 0.61},
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
         })
 
     def test_collecting_model_records_sample_but_does_not_gate_entry(self):
@@ -94,7 +104,7 @@ class AIQualityServiceTest(unittest.TestCase):
         service = self.service()
         payload = [
             candidate(),
-            {**candidate(), "observed_at": "2026-07-14T10:45:00Z"},
+            {**candidate(), "observed_at": "2026-07-14T10:10:00Z"},
             {**candidate(), "symbol": "AKEUSDT", "observed_at": "2026-07-14T10:10:00Z"},
         ]
 
@@ -130,10 +140,28 @@ class AIQualityServiceTest(unittest.TestCase):
         self.assertEqual(reject["decision"], "reject")
         self.assertTrue(all(item["applied"] for item in (allow, probe, reject)))
 
-    def test_expired_model_raises_instead_of_falling_back(self):
-        self.publish("2026-07-11T09:00:00Z")
-        with self.assertRaises(ModelUnavailable):
-            self.service().evaluate(candidate())
+    def test_shadow_model_records_decision_without_applying_gate(self):
+        self.publish()
+        service = EntryQualityService(
+            self.store,
+            FakeBackend(0.40),
+            model_dir=self.model_dir,
+            min_usable_features=1,
+            execution_mode="shadow",
+            now_fn=lambda: datetime(2026, 7, 14, 11, tzinfo=timezone.utc),
+        )
+
+        result = service.evaluate(candidate())
+
+        self.assertEqual(result["status"], "shadow")
+        self.assertEqual(result["decision"], "reject")
+        self.assertFalse(result["applied"])
+
+    def test_model_older_than_last_known_good_falls_back_to_rules(self):
+        self.publish("2026-07-05T09:00:00Z")
+        result = self.service().evaluate(candidate())
+        self.assertEqual(result["decision"], "rule_fallback")
+        self.assertFalse(result["applied"])
 
     def test_training_does_not_publish_below_minimum_sample_count(self):
         service = EntryQualityService(
@@ -142,6 +170,8 @@ class AIQualityServiceTest(unittest.TestCase):
             model_dir=self.model_dir,
             min_training_samples=3,
             min_validation_samples=1,
+            min_usable_features=1,
+            execution_mode="live",
             now_fn=lambda: datetime(2026, 7, 14, 11, tzinfo=timezone.utc),
         )
         for idx in range(2):
@@ -162,7 +192,9 @@ class AIQualityServiceTest(unittest.TestCase):
             backend,
             model_dir=self.model_dir,
             min_training_samples=5,
-            min_validation_samples=1,
+            min_validation_samples=2,
+            min_usable_features=1,
+            execution_mode="live",
             now_fn=lambda: datetime(2026, 7, 14, 11, tzinfo=timezone.utc),
         )
         for idx, label in enumerate([0, 1, 0, 0, 1]):
@@ -188,6 +220,8 @@ class AIQualityServiceTest(unittest.TestCase):
             model_dir=self.model_dir,
             min_training_samples=3,
             min_validation_samples=1,
+            min_usable_features=1,
+            execution_mode="live",
             now_fn=lambda: datetime(2026, 7, 14, 11, tzinfo=timezone.utc),
         )
         for idx in range(3):

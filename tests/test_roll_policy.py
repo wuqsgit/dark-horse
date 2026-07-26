@@ -10,8 +10,14 @@ from trader.execution import _position_r_state
 
 
 CONFIG = {
+    "max_layers": 3,
     "trigger_r": 1.5,
     "add_initial_qty_pct": 0.25,
+    "layer_add_initial_qty_pct": [0.25, 0.20, 0.15],
+    "max_total_qty_multiple": 1.1,
+    "repeat_pullback_atr": 0.75,
+    "repeat_recover_to_peak_atr": 0.25,
+    "repeat_min_r": 1.0,
     "break_even_buffer_pct": 0.0015,
     "min_remaining_margin": 5.0,
     "min_notional_multiplier": 1.5,
@@ -91,6 +97,74 @@ class RollPolicyTest(unittest.TestCase):
             config=CONFIG,
         )
         self.assertEqual(qty, 2.5)
+
+    def test_repeat_roll_arms_after_healthy_pullback(self):
+        decision = evaluate_roll(
+            {"side": "LONG", "entry_price": 100, "mark_price": 110},
+            complete_state(
+                roll_layer=1,
+                roll_price=108,
+                roll_cycle_peak_price=112,
+                roll_pullback_armed=0,
+            ),
+            {"ema20": 105, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config=CONFIG,
+        )
+
+        self.assertFalse(decision.eligible)
+        self.assertTrue(decision.pullback_armed)
+        self.assertEqual(decision.status, "waiting_pullback_recovery")
+
+    def test_repeat_roll_enters_after_pullback_recovers_near_peak(self):
+        decision = evaluate_roll(
+            {"side": "LONG", "entry_price": 100, "mark_price": 111.6},
+            complete_state(
+                roll_layer=1,
+                roll_price=108,
+                roll_cycle_peak_price=112,
+                roll_pullback_armed=1,
+            ),
+            {"ema20": 108, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config=CONFIG,
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.status, "ready")
+
+    def test_repeat_roll_stops_at_configured_layer_limit(self):
+        decision = evaluate_roll(
+            {"side": "LONG", "entry_price": 100, "mark_price": 115},
+            complete_state(roll_layer=3),
+            {"ema20": 110, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config=CONFIG,
+        )
+
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.status, "roll_completed")
+
+    def test_roll_quantity_decreases_by_layer_and_respects_total_cap(self):
+        second = calculate_roll_quantity(
+            10,
+            {"step_size": 0.1, "min_qty": 0.1, "min_notional": 5},
+            mark_price=100,
+            config=CONFIG,
+            roll_layer=2,
+            current_quantity=7,
+        )
+        capped_third = calculate_roll_quantity(
+            10,
+            {"step_size": 0.1, "min_qty": 0.1, "min_notional": 5},
+            mark_price=100,
+            config=CONFIG,
+            roll_layer=3,
+            current_quantity=10.4,
+        )
+
+        self.assertEqual(second, 2.0)
+        self.assertEqual(capped_third, 0.6)
 
     def test_protected_stop_includes_cost_buffer(self):
         self.assertAlmostEqual(calculate_protected_stop("LONG", 100, CONFIG), 100.15)
