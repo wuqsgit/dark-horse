@@ -23,14 +23,27 @@ def _parse_time(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def _candle_state(conn, table_15m, table_1h, symbol, symbol_column="symbol"):
+def _candle_state(
+    conn,
+    table_15m,
+    table_1h,
+    symbol,
+    symbol_column="symbol",
+    source_env=None,
+):
+    env_clause = " AND source_env = ?" if source_env else ""
+    params = (symbol, source_env) if source_env else (symbol,)
     row_15m = conn.execute(
-        f"SELECT MAX(time) latest, COUNT(*) count FROM {table_15m} WHERE {symbol_column} = ?",
-        (symbol,),
+        f"""SELECT MAX(time) latest, COUNT(*) count
+            FROM {table_15m}
+            WHERE {symbol_column} = ?{env_clause}""",
+        params,
     ).fetchone()
     row_1h = conn.execute(
-        f"SELECT MAX(time) latest, COUNT(*) count FROM {table_1h} WHERE {symbol_column} = ?",
-        (symbol,),
+        f"""SELECT MAX(time) latest, COUNT(*) count
+            FROM {table_1h}
+            WHERE {symbol_column} = ?{env_clause}""",
+        params,
     ).fetchone()
     return CandleState(
         _parse_time(row_15m["latest"]),
@@ -40,7 +53,7 @@ def _candle_state(conn, table_15m, table_1h, symbol, symbol_column="symbol"):
     )
 
 
-def refresh_universe_readiness(pool_type, now=None):
+def refresh_universe_readiness(pool_type, now=None, futures_source_env=None):
     now = now or datetime.now(timezone.utc)
     rows = fetch_market_universe(pool_type)
     conn = get_conn()
@@ -51,13 +64,18 @@ def refresh_universe_readiness(pool_type, now=None):
                 spot = _candle_state(
                     conn, "alpha_candles_15m", "alpha_candles_1h",
                     row["source_symbol"], "alpha_symbol",
+                    source_env="mainnet",
                 )
             else:
                 spot = _candle_state(
                     conn, "candles_15m", "candles_1h", row["spot_symbol"],
                 )
             futures = _candle_state(
-                conn, "futures_candles_15m", "futures_candles_1h", row["futures_symbol"],
+                conn,
+                "futures_candles_15m",
+                "futures_candles_1h",
+                row["futures_symbol"],
+                source_env=futures_source_env,
             )
             result = assess_dual_market_readiness(now, spot, futures)
             results[row["source_symbol"]] = result

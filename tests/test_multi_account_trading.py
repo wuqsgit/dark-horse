@@ -84,6 +84,57 @@ class MultiAccountTradingTest(unittest.TestCase):
 
         self.assertEqual(len(accounts), 1)
 
+    def test_default_account_never_bootstraps_credentials_from_environment(self):
+        from shared.accounts import ensure_default_account, get_account
+
+        with patch.dict(os.environ, {
+            "TESTNET_API_KEY": "environment-ak",
+            "TESTNET_API_SECRET": "environment-sk",
+            "BINANCE_API_KEY": "environment-prod-ak",
+            "BINANCE_API_SECRET": "environment-prod-sk",
+        }):
+            account_id = ensure_default_account()
+            account = get_account(account_id, include_secrets=True)
+
+        self.assertEqual(account["api_key"], "")
+        self.assertEqual(account["api_secret"], "")
+
+    def test_no_argument_exchange_loads_default_credentials_from_database(self):
+        from shared.accounts import ensure_default_account, save_account
+        from trader.exchange import BinanceFutures
+
+        account_id = ensure_default_account()
+        save_account(
+            {
+                "name": "db-default",
+                "environment": "prod",
+                "api_key": "database-ak",
+                "api_secret": "database-sk",
+            },
+            account_id=account_id,
+        )
+
+        with patch.dict(os.environ, {
+            "TESTNET_API_KEY": "wrong-environment-ak",
+            "TESTNET_API_SECRET": "wrong-environment-sk",
+        }):
+            exchange = BinanceFutures()
+        try:
+            self.assertEqual(exchange.account_id, account_id)
+            self.assertEqual(exchange.account_name, "db-default")
+            self.assertEqual(exchange.api_key, "database-ak")
+            self.assertEqual(exchange.api_secret, "database-sk")
+            self.assertFalse(exchange.testnet)
+        finally:
+            exchange.close()
+
+    def test_required_account_credentials_report_database_configuration(self):
+        from shared.accounts import account_exchange_config, get_default_account
+
+        account = get_default_account(include_secrets=True)
+        with self.assertRaisesRegex(ValueError, "trading_accounts.*AK/SK"):
+            account_exchange_config(account, require_credentials=True)
+
     def test_account_status_endpoint_uses_snapshot_ttl_instead_of_fast_cache_path(self):
         from api.main import _FAST_CACHE_PATHS, _cache_ttl_for_path
 
@@ -216,6 +267,7 @@ class MultiAccountTradingTest(unittest.TestCase):
 
         account = {
             "id": 1, "name": "test", "environment": "testnet",
+            "api_key": "db-ak", "api_secret": "db-sk",
             "initial_capital": 5000, "max_positions": 5,
             "normal_trading_enabled": 1, "alpha_trading_enabled": 1,
             "auto_trading_enabled": 1,

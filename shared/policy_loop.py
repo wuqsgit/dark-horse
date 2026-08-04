@@ -1010,6 +1010,14 @@ def _exit_reason_text(trade: dict | Any) -> str:
     reason = str(_trade_value(trade, "exit_reason") or "").strip()
     pnl_pct = _trade_value(trade, "pnl_pct")
     pnl_text = _pct_text(pnl_pct)
+    if "alpha_profit_lock_stage" in reason:
+        return f"达到 Alpha 分档浮盈保护线；当时仓位收益约 {pnl_text}，系统减仓落袋并抬高剩余仓位保护线。"
+    if "alpha_profit_lock_exit" in reason or "alpha_peak_giveback_exit" in reason:
+        return f"历史浮盈回撤到动态保护线；当时仓位收益约 {pnl_text}，系统退出剩余仓位，避免盈利交易退化成硬止损。"
+    if "alpha_trade_profit_budget_exit" in reason:
+        return f"剩余仓位回撤触及整笔交易利润预算；当时仓位收益约 {pnl_text}，系统保住此前已经落袋的大部分利润。"
+    if "alpha_spike_stall" in reason:
+        return f"Alpha 冲高后连续闭合K线没有继续创新高；当时仓位收益约 {pnl_text}，系统执行停滞保护。"
     if "alpha_volume_regime_profit_protect" in reason:
         return f"触发 Alpha 成交量状态可疑下的利润保护；当时仓位收益约 {pnl_text}，系统担心放量衰减或诱多，执行保护性平仓。"
     if "alpha_volume_regime_bad" in reason:

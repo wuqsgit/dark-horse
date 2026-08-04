@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import trader.execution as execution
@@ -49,54 +50,73 @@ class AlphaPositionManagementTest(unittest.TestCase):
             age_h=0.5,
         )
 
-    def test_profitable_suspicious_alpha_volume_regime_partially_closes_20_to_30_percent(self):
-        engine = ExecutionEngine(DummyExchange())
-        engine._latest_alpha_position_context = lambda symbol, hist: {
-            "alpha_score": 83.0,
-            "volume_price_state": "normal_review",
-            "volume_price_action": "normal_review",
-            "volume_price_metrics_json": json.dumps({
-                "volume_regime": "suspicious",
-                "trend_score": 70,
-                "ret_15m": 0.2,
-                "ret_1h": 1.1,
-                "ret_6h": 3.2,
-                "spread_pct": 0.01,
-            }),
-            "volume_price_reasons_json": "[]",
-        }
+    @staticmethod
+    def _trend_weak_candles():
+        return [
+            {"high": 101.0, "low": 100.2, "close": 100.8, "quote_vol": 1000, "taker_buy_quote_vol": 620},
+            {"high": 100.9, "low": 100.1, "close": 100.7, "quote_vol": 760, "taker_buy_quote_vol": 430},
+            {"high": 100.8, "low": 100.0, "close": 100.6, "quote_vol": 720, "taker_buy_quote_vol": 380},
+            {"high": 100.7, "low": 99.9, "close": 100.5, "quote_vol": 680, "taker_buy_quote_vol": 340},
+        ]
 
-        action = engine._build_alpha_position_action(
-            pos={"symbol": "B2USDT", "side": "LONG", "entry_price": 100.0},
-            hist={
-                "strategy_source": "alpha",
-                "alpha_score": 83.0,
-                "alpha_symbol": "ALPHA_162USDT",
-                "alpha_entry_level": "candidate",
-                "stop_pct": 0.10,
-            },
-            pnl_pct=0.5,
-            mark_price=100.5,
-            close_side="SELL",
-            highest_price=101.0,
-            atr=1.0,
-            age_h=0.5,
-        )
+    def test_three_closed_bars_without_new_high_and_fading_volume_reduce_30_percent(self):
+        engine = self._engine_with_regime("normal")
+        with patch.object(
+            execution,
+            "_fetch_closed_futures_15m",
+            return_value=self._trend_weak_candles(),
+        ), patch("shared.db.update_position_management"):
+            action = self._action(engine)
 
         self.assertIsNotNone(action)
         self.assertEqual(action["action"], "partial_close")
-        self.assertIn("alpha_volume_regime_profit_protect", action["reason"])
-        self.assertGreaterEqual(action["close_pct"], 0.20)
-        self.assertLessEqual(action["close_pct"], 0.30)
+        self.assertIn("alpha_trend_weak_profit_protect", action["reason"])
+        self.assertAlmostEqual(action["close_pct"], 0.30)
 
-    def test_same_volume_regime_does_not_reduce_position_twice(self):
-        action = self._action(self._engine_with_regime("suspicious"), protected_regime="suspicious")
+    def test_trend_weak_reduce_has_thirty_minute_cooldown(self):
+        engine = self._engine_with_regime("normal")
+        history = {
+            "strategy_source": "alpha",
+            "alpha_score": 83.0,
+            "alpha_symbol": "ALPHA_162USDT",
+            "alpha_entry_level": "candidate",
+            "stop_pct": 0.10,
+            "alpha_stall_protect_time": datetime.now(timezone.utc).isoformat(),
+        }
+        with patch.object(
+            execution,
+            "_fetch_closed_futures_15m",
+            return_value=self._trend_weak_candles(),
+        ), patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={"symbol": "B2USDT", "side": "LONG", "entry_price": 100.0},
+                hist=history,
+                pnl_pct=0.5,
+                mark_price=100.5,
+                close_side="SELL",
+                highest_price=101.0,
+                atr=1.0,
+                age_h=0.5,
+            )
+
         self.assertIsNone(action)
 
-    def test_worse_volume_regime_can_reduce_position_again(self):
-        action = self._action(self._engine_with_regime("extreme"), protected_regime="suspicious")
-        self.assertIsNotNone(action)
-        self.assertEqual(action["action"], "partial_close")
+    def test_volume_regime_alone_does_not_reduce_without_closed_bar_confirmation(self):
+        engine = self._engine_with_regime("extreme")
+        candles = [
+            {"high": 100.0, "low": 99.0, "close": 99.8, "quote_vol": 500},
+            {"high": 100.5, "low": 99.5, "close": 100.2, "quote_vol": 600},
+            {"high": 101.0, "low": 100.0, "close": 100.8, "quote_vol": 700},
+            {"high": 101.5, "low": 100.5, "close": 101.2, "quote_vol": 800},
+        ]
+        with patch.object(
+            execution,
+            "_fetch_closed_futures_15m",
+            return_value=candles,
+        ), patch("shared.db.update_position_management"):
+            action = self._action(engine)
+
+        self.assertIsNone(action)
 
     def _soft_loss_engine(self):
         engine = ExecutionEngine(DummyExchange())
@@ -188,12 +208,42 @@ class AlphaPositionManagementTest(unittest.TestCase):
             "trigger_low": 98.0,
         }
         with patch.object(execution, "_latest_alpha_soft_exit_confirmation", return_value=pending, create=True), \
-             patch.object(execution, "_fetch_closed_futures_15m", return_value=self._closed_candles(next_close=97.8), create=True):
-            action = self._soft_loss_action(engine, pnl_pct=-2.2, mark_price=97.8)
+             patch.object(execution, "_fetch_closed_futures_15m", return_value=self._closed_candles(next_close=98.2), create=True):
+            action = self._soft_loss_action(engine, pnl_pct=-2.2, mark_price=98.2)
 
         self.assertIsNone(action)
 
-    def test_alpha_clear_structural_breakdown_holds_above_margin_hard_stop(self):
+    def test_probe_exits_after_one_hour_without_progress_when_hourly_trend_is_weak(self):
+        engine = self._soft_loss_engine()
+        history = {
+            "position_id": "AKEUSDT-LONG-PROBE",
+            "strategy_source": "alpha",
+            "alpha_score": 82.0,
+            "alpha_symbol": "ALPHA_285USDT",
+            "alpha_entry_level": "probe",
+            "stop_pct": 0.10,
+        }
+        with patch.object(
+            execution,
+            "_fetch_closed_futures_15m",
+            return_value=self._closed_candles(),
+        ), patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={"symbol": "AKEUSDT", "side": "LONG", "entry_price": 100.0},
+                hist=history,
+                pnl_pct=0.5,
+                mark_price=100.5,
+                close_side="SELL",
+                highest_price=101.0,
+                atr=2.0,
+                age_h=1.1,
+            )
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "close")
+        self.assertIn("alpha_probe_no_progress_exit", action["reason"])
+
+    def test_alpha_clear_structural_breakdown_exits_above_margin_hard_stop(self):
         engine = self._soft_loss_engine()
         engine._latest_alpha_position_context = lambda symbol, hist: {
             "alpha_score": 60.0,
@@ -209,13 +259,22 @@ class AlphaPositionManagementTest(unittest.TestCase):
             }),
             "volume_price_reasons_json": "[]",
         }
-        action = self._soft_loss_action(engine, pnl_pct=-6.0, mark_price=94.0)
+        candles = [
+            {"high": 102.0, "low": 100.0, "close": 101.0, "quote_vol": 1000},
+            {"high": 101.0, "low": 99.0, "close": 100.0, "quote_vol": 900},
+            {"high": 100.0, "low": 98.0, "close": 99.0, "quote_vol": 800},
+            {"high": 99.0, "low": 96.0, "close": 97.5, "quote_vol": 1000},
+        ]
+        with patch.object(
+            execution,
+            "_fetch_closed_futures_15m",
+            return_value=candles,
+        ), patch("shared.db.update_position_management"):
+            action = self._soft_loss_action(engine, pnl_pct=-6.0, mark_price=94.0)
 
-        self.assertIsNone(action)
-        self.assertTrue(any(
-            "alpha soft hold" in str(item.get("filter_reason", ""))
-            for item in engine.recorded_decisions
-        ))
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "close")
+        self.assertIn("alpha_trend_structure_exit", action["reason"])
 
     def test_alpha_small_loss_cancels_exit_when_next_15m_candle_recovers(self):
         engine = self._soft_loss_engine()
@@ -243,6 +302,135 @@ class AlphaPositionManagementTest(unittest.TestCase):
 
         self.assertIsNotNone(action)
         self.assertIn("margin_hard_stop", action["reason"])
+
+    def test_margin_roi_stage1_protects_even_when_price_move_is_below_one_r(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "COAIUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "mark_price": 103.34,
+                    "quantity": 1.0,
+                    "leverage": 3,
+                    "unrealized_pnl": 3.34,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "alpha_score": 84.0,
+                    "alpha_entry_level": "candidate",
+                    "stop_pct": 0.10,
+                },
+                pnl_pct=10.02,
+                mark_price=103.34,
+                close_side="SELL",
+                highest_price=103.34,
+                atr=2.0,
+                age_h=0.5,
+            )
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "partial_close")
+        self.assertIn("alpha_profit_lock_stage1", action["reason"])
+        self.assertAlmostEqual(action["close_pct"], 0.25)
+
+    def test_former_ten_percent_winner_exits_at_profit_floor_not_hard_stop(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "COAIUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "quantity": 1.0,
+                    "leverage": 3,
+                    "unrealized_pnl": 0.33,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "alpha_score": 84.0,
+                    "stop_pct": 0.10,
+                    "max_floating_roi": 10.0,
+                },
+                pnl_pct=1.0,
+                mark_price=100.33,
+                close_side="SELL",
+                highest_price=103.34,
+                atr=2.0,
+                age_h=1.0,
+            )
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "close")
+        self.assertIn("alpha_profit_lock_exit", action["reason"])
+        self.assertNotIn("margin_hard_stop", action["reason"])
+
+    def test_realized_partial_profit_limits_loss_on_remaining_position(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "XANUSDT",
+                    "side": "LONG",
+                    "entry_price": 1.0,
+                    "quantity": 100.0,
+                    "leverage": 3,
+                    "unrealized_pnl": -4.0,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "alpha_score": 82.0,
+                    "stop_pct": 0.10,
+                    "initial_quantity": 100.0,
+                    "protected_profit": 10.0,
+                },
+                pnl_pct=-5.0,
+                mark_price=0.9833,
+                close_side="SELL",
+                highest_price=1.01,
+                atr=0.02,
+                age_h=2.0,
+            )
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "close")
+        self.assertIn("alpha_trade_profit_budget_exit", action["reason"])
+
+    def test_closed_candle_trend_weakness_requires_no_new_high_and_fading_flow(self):
+        candles = [
+            {"high": 110.0, "low": 104.0, "close": 108.0, "quote_vol": 1000.0, "taker_buy_quote_vol": 650.0},
+            {"high": 109.0, "low": 105.0, "close": 107.0, "quote_vol": 900.0, "taker_buy_quote_vol": 500.0},
+            {"high": 108.5, "low": 104.5, "close": 106.0, "quote_vol": 850.0, "taker_buy_quote_vol": 430.0},
+            {"high": 108.0, "low": 103.5, "close": 105.0, "quote_vol": 820.0, "taker_buy_quote_vol": 400.0},
+        ]
+
+        detected, details = execution._alpha_trend_weak_detected(
+            "LONG",
+            candles,
+            lookback=3,
+        )
+
+        self.assertTrue(detected)
+        self.assertTrue(details["order_flow_faded"])
+
+    def test_impossible_legacy_stop_falls_back_to_initial_stop(self):
+        state = execution._position_r_state(
+            "LONG",
+            0.001,
+            0.00101,
+            {
+                "strategy_source": "alpha",
+                "stop_pct": 0.10,
+                "initial_stop_loss": 0.0009,
+                "current_stop_loss": 88.0,
+            },
+            atr=0.00002,
+            highest_price=0.00101,
+        )
+
+        self.assertAlmostEqual(state["current_stop_loss"], 0.0009)
+        self.assertFalse(state["stop_triggered"])
 
 
 if __name__ == "__main__":

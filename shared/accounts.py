@@ -8,7 +8,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 from shared.db import get_conn, init_db
-from trader.config import EXCHANGE_CONFIG, TRADING_CONFIG
+from trader.config import TRADING_CONFIG
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +53,6 @@ def ensure_default_account() -> int:
         row = conn.execute("SELECT id FROM trading_accounts ORDER BY id LIMIT 1").fetchone()
         if row:
             return int(row["id"])
-        cfg = EXCHANGE_CONFIG
         cursor = conn.execute(
             """INSERT INTO trading_accounts
                (name, environment, api_key_encrypted, api_secret_encrypted,
@@ -61,9 +60,9 @@ def ensure_default_account() -> int:
                 normal_trading_enabled, alpha_trading_enabled, auto_trading_enabled, enabled)
                VALUES ('默认账户', ?, ?, ?, ?, datetime('now'), ?, 1, 1, 1, 1)""",
             (
-                "testnet" if cfg.get("testnet") else "prod",
-                encrypt_secret(cfg.get("api_key") or ""),
-                encrypt_secret(cfg.get("api_secret") or ""),
+                "testnet",
+                "",
+                "",
                 float(TRADING_CONFIG.get("total_capital", 5000)),
                 int(TRADING_CONFIG.get("max_positions", 5)),
             ),
@@ -97,6 +96,18 @@ def list_accounts(include_secrets: bool = False, enabled_only: bool = False) -> 
 
 def get_account(account_id: int, include_secrets: bool = False) -> dict | None:
     return next((a for a in list_accounts(include_secrets=include_secrets) if int(a["id"]) == int(account_id)), None)
+
+
+def get_default_account(include_secrets: bool = False) -> dict:
+    """Return the database-backed default account; credentials never come from env."""
+    accounts = list_accounts(include_secrets=include_secrets)
+    account = next(
+        (row for row in accounts if bool(row.get("is_default"))),
+        accounts[0] if accounts else None,
+    )
+    if not account:
+        raise RuntimeError("默认交易账户不存在")
+    return account
 
 
 def account_open_position_count(account_id: int) -> int:
@@ -196,9 +207,21 @@ def save_account(payload: dict, account_id: int | None = None) -> dict:
     return get_account(int(account_id))
 
 
-def account_exchange_config(account: dict) -> dict:
-    return {
+def account_exchange_config(account: dict, require_credentials: bool = False) -> dict:
+    config = {
         "api_key": account.get("api_key") or "",
         "api_secret": account.get("api_secret") or "",
         "testnet": account.get("environment") == "testnet",
     }
+    if require_credentials:
+        missing = []
+        if not config["api_key"]:
+            missing.append("AK")
+        if not config["api_secret"]:
+            missing.append("SK")
+        if missing:
+            name = account.get("name") or f"ID {account.get('id')}"
+            raise ValueError(
+                f"交易账户“{name}”未在 trading_accounts 配置 " + "/".join(missing)
+            )
+    return config

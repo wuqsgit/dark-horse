@@ -13,6 +13,8 @@ node_modules/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak*
+*.db.init.lock
 *.sqlite
 *.sqlite3
 logs/

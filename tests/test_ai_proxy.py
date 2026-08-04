@@ -9,7 +9,7 @@ from api.ai_proxy import AIServiceProxy
 class AIServiceProxyTest(unittest.IsolatedAsyncioTestCase):
     async def test_forwards_status_and_decisions(self):
         def handler(request):
-            if request.url.path == "/v1/status":
+            if request.url.path == "/v1/entry-quality/status":
                 return httpx.Response(200, json={"status": "collecting"})
             return httpx.Response(200, json={"decisions": [{"symbol": "B2USDT"}]})
 
@@ -34,6 +34,20 @@ class AIServiceProxyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "error")
         self.assertIn("offline", result["error"])
+
+    async def test_blank_timeout_error_is_still_explained(self):
+        def handler(request):
+            raise httpx.ReadTimeout("", request=request)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ai")
+        proxy = AIServiceProxy(client=client)
+        try:
+            result = await proxy.status()
+        finally:
+            await client.aclose()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], "ReadTimeout")
 
 
 if __name__ == "__main__":

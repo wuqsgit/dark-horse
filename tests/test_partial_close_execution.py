@@ -114,6 +114,31 @@ class PartialCloseExecutionTest(unittest.TestCase):
         record.assert_not_called()
         self.assertEqual(results, [])
 
+    def test_successful_alpha_partial_close_adds_realized_profit_to_protection_budget(self):
+        exchange = PartialCloseExchange()
+        engine = ExecutionEngine(exchange)
+        engine._record_decision = lambda *args, **kwargs: None
+        results = []
+        history = {"strategy_source": "alpha", "protected_profit": 5.0}
+
+        with patch("shared.db.get_position_history", return_value=history), \
+             patch("shared.db.record_trade"), \
+             patch("shared.db.update_position_management") as update:
+            succeeded = engine._execute_partial_close(
+                {
+                    "action": "partial_close",
+                    "symbol": "B2USDT",
+                    "side": "SELL",
+                    "strategy_source": "alpha",
+                    "close_pct": 0.25,
+                    "reason": "alpha_profit_lock_stage1 peak_roi=10.0%",
+                },
+                results,
+            )
+
+        self.assertTrue(succeeded)
+        self.assertAlmostEqual(update.call_args.kwargs["protected_profit"], 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,10 @@
 ﻿"""AlphaDog API Server 鈥?FastAPI (SQLite)"""
 import asyncio
+import hmac
 import logging
 import os, sys, json, time
-from fastapi import FastAPI, Depends, Response
+from datetime import datetime, timezone
+from fastapi import FastAPI, Depends, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from api.ai_proxy import AIServiceProxy
 from ai_service.config import AI_DB_PATH, MAIN_DB_PATH
@@ -36,6 +38,16 @@ from shared.policy_loop import (
     clear_legacy_backtest_data,
 )
 
+
+def _roll_max_layers():
+    try:
+        from trader.config import TRADING_CONFIG
+
+        return max(1, int((TRADING_CONFIG.get("roll_trading") or {}).get("max_layers") or 1))
+    except Exception:
+        return 1
+
+
 def plain_reason(reason):
     text = str(reason or "")
     if not text:
@@ -66,6 +78,17 @@ def plain_reason(reason):
         ("orderbook_depth_weak", "盘口深度变弱"),
         ("time_stop", "持仓太久但收益不大"),
         ("momentum_reversal", "短线动量反向"),
+        ("alpha_profit_lock_stage1", "达到第一档浮盈保护，减仓锁定利润"),
+        ("alpha_profit_lock_stage2", "达到第二档浮盈保护，继续减仓锁定利润"),
+        ("alpha_profit_lock_exit", "浮盈回撤到利润保护线，退出剩余仓位"),
+        ("alpha_peak_giveback_exit", "主升段利润回吐达到上限，退出剩余仓位"),
+        ("alpha_trade_profit_budget_exit", "剩余仓位回撤触及整笔交易利润预算"),
+        ("alpha_trend_weak_profit_protect", "连续三根15分钟K线没有新高且量能转弱，减仓30%"),
+        ("alpha_trend_weak_exit", "趋势转弱后跌到利润保护线，退出剩余仓位"),
+        ("alpha_trend_structure_exit", "跌破近期结构低点且一小时趋势转弱，退出剩余仓位"),
+        ("alpha_probe_no_progress_exit", "试仓一小时没有进展且趋势转弱，退出仓位"),
+        ("alpha_spike_stall_profit_protect", "冲高后停滞，保护性减仓"),
+        ("alpha_spike_stall_exit", "冲高停滞并跌到保护线，退出剩余仓位"),
         ("TP1", "达到第一档止盈"),
         ("TP2", "达到第二档止盈"),
         ("trailing_stop", "触发移动止盈"),
@@ -146,9 +169,21 @@ def compute_market_section(row):
     return "风险"
 
 app = FastAPI(title="AlphaDog API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+_cors_origins = [
+    item.strip()
+    for item in os.getenv("DARK_HORSE_CORS_ORIGINS", "").split(",")
+    if item.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=bool(_cors_origins),
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", "X-Dark-Horse-Token"],
+)
 _ai_proxy = AIServiceProxy()
 logger = logging.getLogger("api")
+_admin_token = os.getenv("DARK_HORSE_API_TOKEN", "").strip()
 
 
 @app.get("/api/ai/status")
@@ -398,7 +433,35 @@ async def startup():
 
 
 async def get_user():
+    return "viewer"
+
+
+async def require_admin(
+    x_dark_horse_token: str | None = Header(
+        default=None,
+        alias="X-Dark-Horse-Token",
+    ),
+):
+    if not _admin_token:
+        raise HTTPException(
+            status_code=503,
+            detail="admin token is not configured",
+        )
+    if not x_dark_horse_token or not hmac.compare_digest(
+        x_dark_horse_token,
+        _admin_token,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="valid admin token required",
+            headers={"WWW-Authenticate": "DarkHorseToken"},
+        )
     return "admin"
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    return {"admin_token_configured": bool(_admin_token)}
 
 
 @app.get("/api/market-data/health")
@@ -981,7 +1044,7 @@ async def get_exit_review_summary(limit: int = 100, user=Depends(get_user)):
 
 
 @app.post("/api/policy/outcomes/label")
-async def label_policy_outcomes_now(user=Depends(get_user)):
+async def label_policy_outcomes_now(user=Depends(require_admin)):
     try:
         count = label_decision_outcomes(limit=5000)
         return {"status": "ok", "updated": count}
@@ -1015,7 +1078,7 @@ async def get_policy_versions(user=Depends(get_user)):
 
 
 @app.post("/api/policy/legacy/clear")
-async def clear_legacy_backtest(vacuum: bool = False, user=Depends(get_user)):
+async def clear_legacy_backtest(vacuum: bool = False, user=Depends(require_admin)):
     try:
         return {"status": "ok", **clear_legacy_backtest_data(vacuum=vacuum)}
     except Exception as e:
@@ -1035,7 +1098,7 @@ async def get_factor_weights(user=Depends(get_user)):
 
 
 @app.post("/api/backtest/factor_weights")
-async def save_factor_weights(body: dict, user=Depends(get_user)):
+async def save_factor_weights(body: dict, user=Depends(require_admin)):
     """Save factor weight config, including custom factors."""
     import json
     try:
@@ -1079,7 +1142,7 @@ async def get_strategy_learning(user=Depends(get_user)):
 
 
 @app.post("/api/strategy/learning/{candidate_id}/status")
-async def update_strategy_learning_status(candidate_id: int, body: dict, user=Depends(get_user)):
+async def update_strategy_learning_status(candidate_id: int, body: dict, user=Depends(require_admin)):
     from shared.strategy_learning import update_candidate_status
 
     try:
@@ -1130,11 +1193,19 @@ def _position_strategy_source(conn, symbol):
 
 def _flatten_positions_by_source(strategy_source, reason):
     from datetime import datetime, timezone
+    from shared.accounts import account_exchange_config, get_default_account
+    from shared.db import get_conn, reset_account_context, set_account_context
     from trader.exchange import BinanceFutures
     from trader.execution import ExecutionEngine
-    from shared.db import get_conn
 
-    ex = BinanceFutures()
+    account = get_default_account(include_secrets=True)
+    config = account_exchange_config(account, require_credentials=True)
+    token = set_account_context(account["id"])
+    ex = BinanceFutures(
+        config=config,
+        account_id=account["id"],
+        account_name=account["name"],
+    )
     conn = get_conn()
     try:
         engine = ExecutionEngine(ex)
@@ -1165,6 +1236,7 @@ def _flatten_positions_by_source(strategy_source, reason):
     finally:
         conn.close()
         ex.close()
+        reset_account_context(token)
 
 
 @app.get("/api/trading/controls")
@@ -1173,7 +1245,7 @@ async def get_trading_controls(user=Depends(get_user)):
 
 
 @app.post("/api/trading/controls")
-async def update_trading_controls(body: dict, user=Depends(get_user)):
+async def update_trading_controls(body: dict, user=Depends(require_admin)):
     key_map = {
         "normal": "normal_trading_enabled",
         "normal_trading_enabled": "normal_trading_enabled",
@@ -1331,24 +1403,28 @@ async def get_trading_status(user=Depends(get_user)):
     import time
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from shared.db import fetch_position_trade_groups, get_conn, rebuild_position_trades_from_income
+    from shared.accounts import account_exchange_config, get_default_account
+    from shared.db import (
+        fetch_position_trade_groups,
+        get_conn,
+        rebuild_position_trades_from_income,
+        reset_account_context,
+        set_account_context,
+    )
 
     # Check cache.
     if _trading_status_cache["data"] and time.time() - _trading_status_cache["time"] < _CACHE_TTL:
         return _trading_status_cache["data"]
 
-    # Return an explicit unavailable state when Binance keys are missing.
-    import os
-    from trader.config import EXCHANGE_CONFIG
-    missing_binance_vars = []
-    if not EXCHANGE_CONFIG.get("api_key"):
-        missing_binance_vars.append("TESTNET_API_KEY" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_KEY")
-    if not EXCHANGE_CONFIG.get("api_secret"):
-        missing_binance_vars.append("TESTNET_API_SECRET" if EXCHANGE_CONFIG.get("testnet") else "BINANCE_API_SECRET")
-    if missing_binance_vars:
+    account = get_default_account(include_secrets=True)
+    try:
+        exchange_config = account_exchange_config(account, require_credentials=True)
+    except ValueError as exc:
         return {
-            "error": "missing " + ", ".join(missing_binance_vars),
+            "error": str(exc),
             "data_source": "binance_live",
+            "account_id": account["id"],
+            "account_name": account["name"],
             "balance": 0,
             "positions": [],
             "recent_trades": [],
@@ -1360,9 +1436,15 @@ async def get_trading_status(user=Depends(get_user)):
 
     from trader.exchange import BinanceFutures
     from trader.config import TRADING_CONFIG
-    INITIAL_CAPITAL = TRADING_CONFIG.get("total_capital", 5000)
+    INITIAL_CAPITAL = float(account.get("initial_capital") or TRADING_CONFIG.get("total_capital", 5000))
     controls = _safe_trading_runtime_controls()
-    ex = BinanceFutures()
+    account_token = set_account_context(account["id"])
+    ex = BinanceFutures(
+        config=exchange_config,
+        account_id=account["id"],
+        account_name=account["name"],
+    )
+    conn = None
     try:
         margin_data = ex.get_margin_balance()
         balance = margin_data["totalWalletBalance"]
@@ -1495,12 +1577,18 @@ async def get_trading_status(user=Depends(get_user)):
                     "alpha_score": None,
                     "alpha_suggested_position_pct": None,
                     "roll_layer": 0,
+                    "roll_max_layers": _roll_max_layers(),
                     "roll_status": "state_incomplete",
                     "roll_price": None,
                     "protected_stop": None,
                     "last_roll_time": None,
                     "protected_profit": 0,
                     "max_floating_pnl": 0,
+                    "max_floating_roi": 0,
+                    "alpha_profit_lock_stage": 0,
+                    "alpha_locked_roi": 0,
+                    "alpha_stall_protect_price": None,
+                    "alpha_stall_protect_time": None,
                     "roll_enabled": False,
                     "roll_block_reason": None,
                     "alpha_current_score": None,
@@ -1533,10 +1621,10 @@ async def get_trading_status(user=Depends(get_user)):
             roll_block_reason = r["roll_block_reason"] if "roll_block_reason" in r.keys() else None
             if not initial_quantity or not initial_stop or not atr_value:
                 roll_status = "state_incomplete"
-            elif roll_layer >= 1:
-                roll_status = "rolled_protected" if protected_stop else "protection_missing"
             elif roll_block_reason:
                 roll_status = roll_block_reason
+            elif roll_layer >= 1:
+                roll_status = "rolled_protected" if protected_stop else "protection_missing"
             elif not bool(r["tp1_hit"] if "tp1_hit" in r.keys() else 0):
                 roll_status = "waiting_tp1"
             else:
@@ -1568,12 +1656,18 @@ async def get_trading_status(user=Depends(get_user)):
                 "alpha_score": float(r["alpha_score"] or 0) if "alpha_score" in r.keys() else None,
                 "alpha_suggested_position_pct": float(r["alpha_suggested_position_pct"] or 0) if "alpha_suggested_position_pct" in r.keys() else None,
                 "roll_layer": roll_layer,
+                "roll_max_layers": _roll_max_layers(),
                 "roll_status": roll_status,
                 "roll_price": float(r["roll_price"] or 0) if "roll_price" in r.keys() else None,
                 "protected_stop": protected_stop or None,
                 "last_roll_time": r["last_roll_time"] if "last_roll_time" in r.keys() else None,
                 "protected_profit": float(r["protected_profit"] or 0) if "protected_profit" in r.keys() else 0,
                 "max_floating_pnl": float(r["max_floating_pnl"] or 0) if "max_floating_pnl" in r.keys() else 0,
+                "max_floating_roi": float(r["max_floating_roi"] or 0) if "max_floating_roi" in r.keys() else 0,
+                "alpha_profit_lock_stage": int(r["alpha_profit_lock_stage"] or 0) if "alpha_profit_lock_stage" in r.keys() else 0,
+                "alpha_locked_roi": float(r["alpha_locked_roi"] or 0) if "alpha_locked_roi" in r.keys() else 0,
+                "alpha_stall_protect_price": float(r["alpha_stall_protect_price"] or 0) if "alpha_stall_protect_price" in r.keys() else None,
+                "alpha_stall_protect_time": r["alpha_stall_protect_time"] if "alpha_stall_protect_time" in r.keys() else None,
                 "roll_enabled": bool(r["roll_enabled"]) if "roll_enabled" in r.keys() else False,
                 "roll_block_reason": roll_block_reason,
                 "alpha_current_score": float(alpha_context.get("alpha_score") or 0) if alpha_context else None,
@@ -1739,7 +1833,10 @@ async def get_trading_status(user=Depends(get_user)):
             "trading_controls": _safe_trading_runtime_controls(),
         }
     finally:
+        if conn is not None:
+            conn.close()
         ex.close()
+        reset_account_context(account_token)
 
 
 def _live_holding_fields(entry_time):
@@ -1788,9 +1885,13 @@ def _live_position_management_fields(state: dict | None) -> dict:
             "alpha_entry_level": None, "alpha_score": None,
             "alpha_suggested_position_pct": None,
             "roll_layer": 0, "roll_status": "state_incomplete",
+            "roll_max_layers": _roll_max_layers(),
             "roll_price": None, "protected_stop": None,
             "last_roll_time": None, "protected_profit": 0,
-            "max_floating_pnl": 0, "roll_enabled": False,
+            "max_floating_pnl": 0, "max_floating_roi": 0,
+            "alpha_profit_lock_stage": 0, "alpha_locked_roi": 0,
+            "alpha_stall_protect_price": None, "alpha_stall_protect_time": None,
+            "roll_enabled": False,
             "roll_block_reason": "state_incomplete",
             "alpha_current_score": None,
             "alpha_volume_price_state": None,
@@ -1841,12 +1942,18 @@ def _live_position_management_fields(state: dict | None) -> dict:
         "alpha_score": number("alpha_score"),
         "alpha_suggested_position_pct": number("alpha_suggested_position_pct"),
         "roll_layer": roll_layer,
+        "roll_max_layers": _roll_max_layers(),
         "roll_status": roll_status,
         "roll_price": number("roll_price"),
         "protected_stop": number("protected_stop"),
         "last_roll_time": state.get("last_roll_time"),
         "protected_profit": number("protected_profit", 0),
         "max_floating_pnl": number("max_floating_pnl", 0),
+        "max_floating_roi": number("max_floating_roi", 0),
+        "alpha_profit_lock_stage": int(state.get("alpha_profit_lock_stage") or 0),
+        "alpha_locked_roi": number("alpha_locked_roi", 0),
+        "alpha_stall_protect_price": number("alpha_stall_protect_price"),
+        "alpha_stall_protect_time": state.get("alpha_stall_protect_time"),
         "roll_enabled": bool(state.get("roll_enabled")),
         "roll_block_reason": roll_block_reason,
         "alpha_current_score": None,
@@ -1914,15 +2021,22 @@ def _account_decision_panel(conn, account_id: int) -> dict:
 
 def _account_status_payload(account: dict) -> dict:
     from shared.accounts import account_exchange_config
-    from shared.db import fetch_position_trade_groups, get_conn
+    from shared.db import (
+        fetch_position_trade_groups,
+        get_conn,
+        reset_account_context,
+        set_account_context,
+    )
     from trader.exchange import BinanceFutures
 
-    ex = BinanceFutures(
-        config=account_exchange_config(account),
-        account_id=account["id"],
-        account_name=account["name"],
-    )
+    account_token = set_account_context(account["id"])
+    ex = None
     try:
+        ex = BinanceFutures(
+            config=account_exchange_config(account, require_credentials=True),
+            account_id=account["id"],
+            account_name=account["name"],
+        )
         margin = ex.get_margin_balance()
         positions = ex.get_positions()
         wallet = float(margin.get("totalWalletBalance") or 0)
@@ -2090,7 +2204,9 @@ def _account_status_payload(account: dict) -> dict:
             "max_positions": int(account.get("max_positions") or 5),
         }
     finally:
-        ex.close()
+        if ex is not None:
+            ex.close()
+        reset_account_context(account_token)
 
 
 async def _build_all_trading_account_status() -> dict:
@@ -2186,7 +2302,7 @@ async def get_trading_accounts(user=Depends(get_user)):
 
 
 @app.post("/api/trading/accounts")
-async def create_trading_account(body: dict, user=Depends(get_user)):
+async def create_trading_account(body: dict, user=Depends(require_admin)):
     from shared.accounts import save_account
     try:
         account = save_account(body)
@@ -2197,7 +2313,7 @@ async def create_trading_account(body: dict, user=Depends(get_user)):
 
 
 @app.patch("/api/trading/accounts/{account_id}")
-async def update_trading_account(account_id: int, body: dict, user=Depends(get_user)):
+async def update_trading_account(account_id: int, body: dict, user=Depends(require_admin)):
     from shared.accounts import save_account
     try:
         account = save_account(body, account_id=account_id)
@@ -2208,7 +2324,7 @@ async def update_trading_account(account_id: int, body: dict, user=Depends(get_u
 
 
 @app.delete("/api/trading/accounts/{account_id}")
-async def delete_trading_account(account_id: int, user=Depends(get_user)):
+async def delete_trading_account(account_id: int, user=Depends(require_admin)):
     from shared.accounts import delete_account
     try:
         delete_account(account_id)
@@ -2219,7 +2335,7 @@ async def delete_trading_account(account_id: int, user=Depends(get_user)):
 
 
 @app.post("/api/trading/accounts/{account_id}/test")
-async def test_trading_account(account_id: int, user=Depends(get_user)):
+async def test_trading_account(account_id: int, user=Depends(require_admin)):
     from shared.accounts import get_account
     account = get_account(account_id, include_secrets=True)
     if not account:
@@ -2229,7 +2345,7 @@ async def test_trading_account(account_id: int, user=Depends(get_user)):
 
 
 @app.post("/api/trading/accounts/{account_id}/capital-adjustments")
-async def add_account_capital_adjustment(account_id: int, body: dict, user=Depends(get_user)):
+async def add_account_capital_adjustment(account_id: int, body: dict, user=Depends(require_admin)):
     from shared.db import get_conn
     adjustment_type = str(body.get("adjustment_type") or "correction")
     if adjustment_type not in {"deposit", "withdraw", "transfer_in", "transfer_out", "correction"}:
@@ -2257,8 +2373,17 @@ async def get_all_trading_account_status(response: Response, user=Depends(get_us
 
 @app.get("/api/trading/stats")
 async def get_trading_stats(user=Depends(get_user)):
-    from shared.db import fetch_position_trade_groups, get_conn, rebuild_position_trades_from_income
+    from shared.accounts import account_exchange_config, get_default_account
+    from shared.db import (
+        fetch_position_trade_groups,
+        get_conn,
+        reset_account_context,
+        set_account_context,
+    )
+    account = get_default_account(include_secrets=True)
+    account_token = set_account_context(account["id"])
     conn = get_conn()
+    ex = None
     try:
         grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
         total_closed = grouped_stats["total_closed"]
@@ -2273,10 +2398,13 @@ async def get_trading_stats(user=Depends(get_user)):
         # 褰撳墠鎸佷粨鏁?        import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from trader.exchange import BinanceFutures
-        ex = BinanceFutures()
+        ex = BinanceFutures(
+            config=account_exchange_config(account, require_credentials=True),
+            account_id=account["id"],
+            account_name=account["name"],
+        )
         pos = ex.get_positions()
         current_pos = len(pos)
-        ex.close()
         
         reason_stats = grouped_stats["reason_stats"]
         total_opens = grouped_stats["total_trades"]
@@ -2298,7 +2426,10 @@ async def get_trading_stats(user=Depends(get_user)):
     except Exception as e:
         return {"error": str(e), "total_pnl": 0, "current_positions": 0, "total_opens": 0}
     finally:
-        pass
+        conn.close()
+        if ex is not None:
+            ex.close()
+        reset_account_context(account_token)
 
 
 @app.get("/api/trading/positions_history")
@@ -2412,3 +2543,203 @@ async def get_strategy_decisions(
         conn.close()
 
 
+def _alpha_strategy_json_row(row, *json_fields):
+    result = dict(row)
+    for field in json_fields:
+        raw = result.pop(field, None)
+        target = field.removesuffix("_json")
+        try:
+            result[target] = json.loads(raw or ("[]" if "reason" in field else "{}"))
+        except (TypeError, ValueError):
+            result[target] = [] if "reason" in field else {}
+    return result
+
+
+@app.get("/api/alpha-strategy/status")
+async def get_alpha_strategy_status(
+    market_env: str | None = None,
+    recent_limit: int = 30,
+    user=Depends(get_user),
+):
+    """Operational view of the Alpha V2 worker, models, states and delivery."""
+    from alpha_engine.strategy.repository import AlphaStrategyRepository
+    from shared.db import get_conn
+
+    env = str(market_env or "").lower() or None
+    if env not in {None, "testnet", "mainnet"}:
+        return {"error": f"unsupported market_env: {market_env}"}
+    limit = max(1, min(int(recent_limit), 200))
+    repository = AlphaStrategyRepository()
+    status = repository.strategy_status(env)
+    conn = get_conn()
+    try:
+        where = "WHERE market_env=?" if env else ""
+        params = (env,) if env else ()
+        state_rows = conn.execute(
+            f"""SELECT * FROM alpha_signal_states
+                {where}
+                ORDER BY datetime(updated_at) DESC, futures_symbol
+                LIMIT ?""",
+            (*params, limit),
+        ).fetchall()
+        event_rows = conn.execute(
+            f"""SELECT * FROM alpha_signal_events
+                {where}
+                ORDER BY datetime(event_time) DESC, event_id DESC
+                LIMIT ?""",
+            (*params, limit),
+        ).fetchall()
+        consumption_rows = conn.execute(
+            """SELECT c.*, e.market_env, e.strategy_mode, e.futures_symbol,
+                      e.alpha_symbol, e.from_state, e.to_state
+               FROM alpha_signal_consumptions c
+               JOIN alpha_signal_events e ON e.event_id=c.event_id
+               ORDER BY datetime(c.updated_at) DESC, c.event_id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        latest_snapshot = conn.execute(
+            f"""SELECT MAX(candle_close_time) AS candle_close_time,
+                       COUNT(*) AS snapshot_count,
+                       SUM(CASE WHEN data_quality_status='ready' THEN 1 ELSE 0 END)
+                           AS ready_count
+                FROM alpha_feature_snapshots
+                {where}""",
+            params,
+        ).fetchone()
+    finally:
+        conn.close()
+    status.update(
+        {
+            "market_env": env or "all",
+            "snapshot_summary": dict(latest_snapshot or {}),
+            "recent_states": [
+                _alpha_strategy_json_row(
+                    row,
+                    "model_versions_json",
+                    "reason_codes_json",
+                    "metrics_json",
+                )
+                for row in state_rows
+            ],
+            "recent_events": [
+                _alpha_strategy_json_row(
+                    row,
+                    "reason_codes_json",
+                    "ai_decision_json",
+                )
+                for row in event_rows
+            ],
+            "recent_consumptions": [dict(row) for row in consumption_rows],
+            "ai": await _ai_proxy.alpha_strategy_status(),
+        }
+    )
+    alerts = []
+    now = datetime.now(timezone.utc)
+    for runtime in status["runtime"]:
+        for field, minutes, code in (
+            ("heartbeat_at", 3, "worker_heartbeat_stale"),
+            ("last_candle_close_time", 20, "closed_candle_stale"),
+        ):
+            value = runtime.get(field)
+            if not value:
+                continue
+            try:
+                observed = datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                )
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                age_minutes = (
+                    now - observed.astimezone(timezone.utc)
+                ).total_seconds() / 60
+                if age_minutes > minutes:
+                    alerts.append(
+                        {
+                            "severity": "error",
+                            "code": code,
+                            "market_env": runtime["market_env"],
+                            "age_minutes": round(age_minutes, 1),
+                        }
+                    )
+            except (TypeError, ValueError):
+                pass
+        metrics = runtime.get("metrics") or {}
+        processed = max(1, int(runtime.get("processed_count") or 0))
+        ai_failure_rate = float(metrics.get("ai_failure_count") or 0) / processed
+        if ai_failure_rate > 0.10:
+            alerts.append(
+                {
+                    "severity": "error",
+                    "code": "ai_failure_rate_high",
+                    "market_env": runtime["market_env"],
+                    "rate": round(ai_failure_rate, 4),
+                }
+            )
+    ai_status = status["ai"]
+    quality = ai_status.get("feature_quality") or {}
+    if quality.get("samples", 0) >= 30 and quality.get("ready_rate", 1) < 0.80:
+        alerts.append(
+            {
+                "severity": "warning",
+                "code": "feature_readiness_low",
+                "rate": quality.get("ready_rate"),
+            }
+        )
+    for model in ai_status.get("models") or []:
+        if (model.get("drift") or {}).get("status") == "drift":
+            alerts.append(
+                {
+                    "severity": "warning",
+                    "code": "model_input_drift",
+                    "version": model.get("version"),
+                    "target": model.get("target"),
+                    "details": model.get("drift"),
+                }
+            )
+    status["alerts"] = alerts
+    return status
+
+
+@app.get("/api/alpha-strategy/snapshots")
+async def get_alpha_strategy_snapshots(
+    market_env: str | None = None,
+    symbol: str | None = None,
+    limit: int = 50,
+    user=Depends(get_user),
+):
+    from shared.db import get_conn
+
+    where = []
+    params = []
+    if market_env:
+        env = str(market_env).lower()
+        if env not in {"testnet", "mainnet"}:
+            return {"error": f"unsupported market_env: {market_env}", "snapshots": []}
+        where.append("market_env=?")
+        params.append(env)
+    if symbol:
+        where.append("futures_symbol=?")
+        params.append(str(symbol).upper())
+    clause = "WHERE " + " AND ".join(where) if where else ""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            f"""SELECT * FROM alpha_feature_snapshots
+                {clause}
+                ORDER BY datetime(candle_close_time) DESC, snapshot_id DESC
+                LIMIT ?""",
+            (*params, max(1, min(int(limit), 500))),
+        ).fetchall()
+        return {
+            "snapshots": [
+                _alpha_strategy_json_row(
+                    row,
+                    "data_quality_json",
+                    "features_json",
+                )
+                for row in rows
+            ]
+        }
+    finally:
+        conn.close()

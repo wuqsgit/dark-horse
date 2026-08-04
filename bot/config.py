@@ -1,16 +1,8 @@
 """
 AlphaDog Crypto Bot - 配置文件
 """
-import os
-
-# === 交易所配置 ===
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-TESTNET_API_KEY = os.getenv("TESTNET_API_KEY", "")
-TESTNET_API_SECRET = os.getenv("TESTNET_API_SECRET", "")
-
 # === 模式配置 ===
-TEST_MODE = True  # True = 测试网, False = 实盘
+TEST_MODE = True  # 旧版 bot 的下单安全开关；交易环境以账户表为准
 SYMBOL = "BTCUSDT"  # 交易对
 INTERVAL = "1m"  # K线周期
 

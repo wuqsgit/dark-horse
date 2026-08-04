@@ -42,6 +42,13 @@ class DataRetentionTest(unittest.TestCase):
                (symbol, side, pnl, created_at) VALUES ('BTCUSDT', 'LONG', 1, ?)""",
             (iso_z(now - timedelta(days=10)),),
         )
+        conn.execute(
+            """INSERT INTO futures_candles_1h
+               (time, symbol, open, high, low, close, volume, quote_vol,
+                trades, source_env, is_closed)
+               VALUES (?, 'BTCUSDT', 1, 1, 1, 1, 1, 1, 1, 'mainnet', 1)""",
+            (iso_z(now - timedelta(days=6)),),
+        )
         conn.commit()
         conn.close()
 
@@ -52,12 +59,17 @@ class DataRetentionTest(unittest.TestCase):
             candle_times = [row[0] for row in conn.execute("SELECT time FROM candles_1h")]
             trade_count = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
             decision_count = conn.execute("SELECT COUNT(*) FROM strategy_decisions").fetchone()[0]
+            futures_count = conn.execute(
+                "SELECT COUNT(*) FROM futures_candles_1h"
+            ).fetchone()[0]
         finally:
             conn.close()
         self.assertEqual(candle_times, [iso_z(now - timedelta(days=4))])
         self.assertEqual(decision_count, 0)
         self.assertEqual(trade_count, 1)
+        self.assertEqual(futures_count, 1)
         self.assertEqual(deleted["candles_1h"], 1)
+        self.assertEqual(deleted["futures_candles_1h"], 0)
         self.assertEqual(deleted["strategy_decisions"], 1)
 
 

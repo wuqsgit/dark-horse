@@ -10,6 +10,7 @@ class RollDecision:
     current_r: float = 0.0
     cycle_peak_price: float = 0.0
     pullback_armed: bool = False
+    trigger_mode: str = ""
 
 
 def _number(value: Any) -> float:
@@ -49,42 +50,59 @@ def evaluate_roll(
     current_r = favorable_move / risk
     cycle_peak = _number(state.get("roll_cycle_peak_price"))
     pullback_armed = bool(state.get("roll_pullback_armed"))
+    layer_triggers = config.get("layer_trigger_r") or []
+    try:
+        trigger_r = _number(layer_triggers[roll_layer])
+    except (IndexError, TypeError):
+        trigger_r = 0.0
+    if trigger_r <= 0:
+        trigger_r = (_number(config.get("trigger_r")) or 1.5) + roll_layer
+    trigger_label = f"{trigger_r:g}".replace(".", "_")
+
+    trigger_mode = ""
     if roll_layer == 0:
-        trigger_r = _number(config.get("trigger_r")) or 1.5
         if current_r < trigger_r:
-            return RollDecision(False, "waiting_1_5r", current_r)
+            return RollDecision(False, f"waiting_{trigger_label}r", current_r)
+        trigger_mode = "sustained_profit"
     else:
         atr = _number(state.get("atr_value"))
         anchor = _number(state.get("roll_price")) or entry
         cycle_peak = cycle_peak or anchor
         cycle_peak = max(cycle_peak, mark) if side == "LONG" else min(cycle_peak, mark)
-        pullback_atr = (
-            (cycle_peak - mark) / atr
-            if side == "LONG"
-            else (mark - cycle_peak) / atr
-        )
-        min_pullback_atr = _number(config.get("repeat_pullback_atr")) or 0.75
-        pullback_armed = pullback_armed or pullback_atr >= min_pullback_atr
-        if not pullback_armed:
-            return RollDecision(
-                False, "waiting_healthy_pullback", current_r, cycle_peak, False,
+        if current_r >= trigger_r:
+            trigger_mode = "sustained_profit"
+        else:
+            pullback_atr = (
+                (cycle_peak - mark) / atr
+                if side == "LONG"
+                else (mark - cycle_peak) / atr
             )
+            min_pullback_atr = _number(config.get("repeat_pullback_atr")) or 0.75
+            pullback_armed = pullback_armed or pullback_atr >= min_pullback_atr
+            if not pullback_armed:
+                return RollDecision(
+                    False, f"waiting_{trigger_label}r_or_healthy_pullback",
+                    current_r, cycle_peak, False,
+                )
 
-        repeat_min_r = _number(config.get("repeat_min_r")) or 1.0
-        if current_r < repeat_min_r:
-            return RollDecision(
-                False, "repeat_profit_buffer_too_low", current_r, cycle_peak, True,
+            repeat_min_r = _number(config.get("repeat_min_r")) or 1.0
+            if current_r < repeat_min_r:
+                return RollDecision(
+                    False, "repeat_profit_buffer_too_low",
+                    current_r, cycle_peak, True,
+                )
+            recovery_gap_atr = (
+                (cycle_peak - mark) / atr
+                if side == "LONG"
+                else (mark - cycle_peak) / atr
             )
-        recovery_gap_atr = (
-            (cycle_peak - mark) / atr
-            if side == "LONG"
-            else (mark - cycle_peak) / atr
-        )
-        recover_to_peak_atr = _number(config.get("repeat_recover_to_peak_atr")) or 0.25
-        if recovery_gap_atr > recover_to_peak_atr:
-            return RollDecision(
-                False, "waiting_pullback_recovery", current_r, cycle_peak, True,
-            )
+            recover_to_peak_atr = _number(config.get("repeat_recover_to_peak_atr")) or 0.25
+            if recovery_gap_atr > recover_to_peak_atr:
+                return RollDecision(
+                    False, "waiting_pullback_recovery",
+                    current_r, cycle_peak, True,
+                )
+            trigger_mode = "pullback_recovery"
 
     ema20 = _number(technical.get("ema20"))
     slope = _number(technical.get("ema20_slope"))
@@ -105,7 +123,9 @@ def evaluate_roll(
             False, "alpha_not_synced", current_r, cycle_peak, pullback_armed,
         )
 
-    return RollDecision(True, "ready", current_r, cycle_peak, pullback_armed)
+    return RollDecision(
+        True, "ready", current_r, cycle_peak, pullback_armed, trigger_mode,
+    )
 
 
 def calculate_roll_quantity(

@@ -3,12 +3,11 @@ import hashlib
 import hmac
 import logging
 import time
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Optional
 import urllib.parse
 
 import httpx
-
-from trader.config import EXCHANGE_CONFIG
 
 
 logger = logging.getLogger("exchange")
@@ -16,17 +15,23 @@ logger = logging.getLogger("exchange")
 
 class BinanceFutures:
     def __init__(self, config=None, account_id=None, account_name=None):
-        import warnings
-        import urllib3
+        if config is None:
+            # A no-argument client always represents the database default
+            # account.  Credentials must never silently fall back to process
+            # environment variables.
+            from shared.accounts import account_exchange_config, get_default_account
 
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        urllib3.disable_warnings()
-        cfg = config or EXCHANGE_CONFIG
+            account = get_default_account(include_secrets=True)
+            cfg = account_exchange_config(account)
+            account_id = account_id if account_id is not None else account["id"]
+            account_name = account_name or account["name"]
+        else:
+            cfg = dict(config)
         self.account_id = account_id
         self.account_name = account_name
         self.testnet = bool(cfg.get("testnet"))
-        self.api_key = cfg["api_key"]
-        self.api_secret = cfg["api_secret"]
+        self.api_key = cfg.get("api_key") or ""
+        self.api_secret = cfg.get("api_secret") or ""
         base = "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
         self.base_rest = base
         self.client = self._new_client()
@@ -39,7 +44,7 @@ class BinanceFutures:
 
     def _new_client(self):
         timeout = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=5.0)
-        return httpx.Client(timeout=timeout, verify=False, headers={"X-MBX-APIKEY": self.api_key})
+        return httpx.Client(timeout=timeout, headers={"X-MBX-APIKEY": self.api_key})
 
     def _reset_client(self):
         try:
@@ -237,7 +242,6 @@ class BinanceFutures:
             resp = httpx.get(
                 f"{self.base_rest}/fapi/v1/exchangeInfo",
                 headers={"X-MBX-APIKEY": self.api_key},
-                verify=False,
                 timeout=5,
             )
             resp.raise_for_status()
@@ -251,7 +255,6 @@ class BinanceFutures:
             resp = httpx.get(
                 f"{self.base_rest}/fapi/v1/exchangeInfo?symbol={symbol}",
                 headers={"X-MBX-APIKEY": self.api_key},
-                verify=False,
                 timeout=5,
             )
             resp.raise_for_status()
@@ -274,16 +277,15 @@ class BinanceFutures:
                             ),
                             "tick_size": float(price_filter.get("tickSize") or 0),
                         }
-                    break
-        except Exception:
-            pass
-        return {
-            "step_size": 0.001,
-            "min_qty": 0.001,
-            "max_qty": 99999,
-            "min_notional": 0.0,
-            "tick_size": 0.0,
-        }
+                    raise RuntimeError(
+                        f"Binance exchangeInfo missing LOT_SIZE for {symbol}"
+                    )
+            raise RuntimeError(f"Binance exchangeInfo did not return {symbol}")
+        except Exception as exc:
+            logger.warning("Unable to load Binance symbol rules for %s: %s", symbol, exc)
+            raise RuntimeError(
+                f"cannot safely size {symbol} without Binance symbol rules"
+            ) from exc
 
     def set_leverage(self, symbol: str, leverage: int = 10):
         params = {"symbol": symbol, "leverage": leverage}
@@ -298,7 +300,25 @@ class BinanceFutures:
             return round(adjusted, precision)
         return round(quantity, 3)
 
-    def place_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False) -> dict:
+    def adjust_trigger_price(self, symbol: str, side: str, price: float) -> float:
+        """Align a conditional trigger to tickSize without moving it toward the market."""
+        info = self.get_symbol_info(symbol)
+        tick = Decimal(str(info.get("tick_size") or 0))
+        value = Decimal(str(price))
+        if tick <= 0:
+            return float(value)
+        rounding = ROUND_DOWN if side.upper() == "SELL" else ROUND_UP
+        units = (value / tick).to_integral_value(rounding=rounding)
+        return float(units * tick)
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> dict:
         qty = self.adjust_quantity(symbol, quantity)
         params = {
             "symbol": symbol,
@@ -309,20 +329,64 @@ class BinanceFutures:
         if reduce_only:
             params["reduceOnly"] = True
             params["newOrderRespType"] = "RESULT"
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
         return self._request("POST", "/fapi/v1/order", signed=True, params=params)
 
-    def close_position_market(self, symbol: str, side: str, quantity: float) -> dict:
-        return self.place_market_order(symbol, side, quantity, reduce_only=True)
+    def close_position_market(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        client_order_id: str | None = None,
+    ) -> dict:
+        return self.place_market_order(
+            symbol,
+            side,
+            quantity,
+            reduce_only=True,
+            client_order_id=client_order_id,
+        )
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        params = {"symbol": symbol} if symbol else {}
+        return self._request(
+            "GET",
+            "/fapi/v1/openOrders",
+            signed=True,
+            params=params,
+        )
+
+    def get_order_by_client_id(
+        self,
+        symbol: str,
+        client_order_id: str,
+    ) -> dict | None:
+        try:
+            return self._request(
+                "GET",
+                "/fapi/v1/order",
+                signed=True,
+                params={
+                    "symbol": symbol,
+                    "origClientOrderId": str(client_order_id)[:36],
+                },
+            )
+        except Exception as exc:
+            if "-2013" in str(exc):
+                return None
+            raise
 
     def place_stop_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
         qty = self.adjust_quantity(symbol, quantity)
+        trigger_price = self.adjust_trigger_price(symbol, side, stop_price)
         params = {
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": side.upper(),
             "type": "STOP_MARKET",
             "quantity": qty,
-            "triggerPrice": round(float(stop_price), 6),
+            "triggerPrice": trigger_price,
             "reduceOnly": True,
             "workingType": "MARK_PRICE",
         }

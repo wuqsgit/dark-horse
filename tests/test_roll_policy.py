@@ -12,6 +12,7 @@ from trader.execution import _position_r_state
 CONFIG = {
     "max_layers": 3,
     "trigger_r": 1.5,
+    "layer_trigger_r": [1.5, 2.5, 3.5],
     "add_initial_qty_pct": 0.25,
     "layer_add_initial_qty_pct": [0.25, 0.20, 0.15],
     "max_total_qty_multiple": 1.1,
@@ -116,6 +117,41 @@ class RollPolicyTest(unittest.TestCase):
         self.assertTrue(decision.pullback_armed)
         self.assertEqual(decision.status, "waiting_pullback_recovery")
 
+    def test_second_roll_can_follow_sustained_profit_without_pullback(self):
+        decision = evaluate_roll(
+            {"side": "LONG", "entry_price": 100, "mark_price": 113},
+            complete_state(
+                roll_layer=1,
+                roll_price=108,
+                roll_cycle_peak_price=113,
+                roll_pullback_armed=0,
+            ),
+            {"ema20": 108, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config=CONFIG,
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.trigger_mode, "sustained_profit")
+
+    def test_third_short_roll_can_follow_sustained_profit(self):
+        decision = evaluate_roll(
+            {"side": "SHORT", "entry_price": 100, "mark_price": 82},
+            complete_state(
+                initial_stop_loss=105,
+                roll_layer=2,
+                roll_price=88,
+                roll_cycle_peak_price=82,
+            ),
+            {"ema20": 86, "ema20_slope": -1.0},
+            alpha_sync=True,
+            config=CONFIG,
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertAlmostEqual(decision.current_r, 3.6)
+        self.assertEqual(decision.trigger_mode, "sustained_profit")
+
     def test_repeat_roll_enters_after_pullback_recovers_near_peak(self):
         decision = evaluate_roll(
             {"side": "LONG", "entry_price": 100, "mark_price": 111.6},
@@ -132,6 +168,7 @@ class RollPolicyTest(unittest.TestCase):
 
         self.assertTrue(decision.eligible)
         self.assertEqual(decision.status, "ready")
+        self.assertEqual(decision.trigger_mode, "pullback_recovery")
 
     def test_repeat_roll_stops_at_configured_layer_limit(self):
         decision = evaluate_roll(

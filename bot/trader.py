@@ -6,25 +6,35 @@ import time
 import hmac
 import hashlib
 import requests
+import sys
+from pathlib import Path
 from urllib.parse import urlencode
 from typing import Dict, Optional, List
-from config import (
-    BINANCE_API_KEY, BINANCE_API_SECRET,
-    TESTNET_API_KEY, TESTNET_API_SECRET,
-    TEST_MODE, SYMBOL
-)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from shared.accounts import account_exchange_config, get_account, get_default_account
+from bot.config import SYMBOL
 
 
 class BinanceTrader:
-    def __init__(self):
-        if TEST_MODE:
+    def __init__(self, account_id=None):
+        account = (
+            get_account(account_id, include_secrets=True)
+            if account_id is not None
+            else get_default_account(include_secrets=True)
+        )
+        if not account:
+            raise ValueError(f"交易账户 ID {account_id} 不存在")
+        exchange = account_exchange_config(account, require_credentials=True)
+        if exchange["testnet"]:
             self.base_url = "https://testnet.binance.vision/api"
-            self.api_key = TESTNET_API_KEY
-            self.secret = TESTNET_API_SECRET
+            self.api_key = exchange["api_key"]
+            self.secret = exchange["api_secret"]
         else:
             self.base_url = "https://api.binance.com/api"
-            self.api_key = BINANCE_API_KEY
-            self.secret = BINANCE_API_SECRET
+            self.api_key = exchange["api_key"]
+            self.secret = exchange["api_secret"]
         
         self.symbol = SYMBOL
         self.session = requests.Session()

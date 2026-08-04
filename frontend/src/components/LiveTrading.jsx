@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { fetchTradingAccountsStatus } from '../api/tradingAccountsStatus';
+import { adminFetch } from '../api/adminFetch';
 import TradingAccountManager from './TradingAccountManager';
 import { findSelectedAccount, normalizeSelectedAccount } from './liveTradingAccountSelection';
 
@@ -235,7 +236,7 @@ export default function LiveTrading() {
       if (!targets.length) throw new Error('请先选择具体账户');
       const key = mode === 'alpha' ? 'alpha_trading_enabled' : 'normal_trading_enabled';
       const results = await Promise.all(targets.map(async (account) => {
-        const res = await fetch(`/api/trading/accounts/${account.id}`, {
+        const res = await adminFetch(`/api/trading/accounts/${account.id}`, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...account, [key]: enabled }),
         });
@@ -395,8 +396,14 @@ export default function LiveTrading() {
                     <div>当前R：{p.r_multiple != null ? `${fmt(p.r_multiple, 2)}R` : '-'} · 保护止损：{p.protected_stop || p.current_stop_loss ? `$${fmt(p.protected_stop || p.current_stop_loss, 4)}` : '-'}</div>
                     <div>移动止损：{p.trailing_enabled ? '已启用' : '未启用'} · {p.trailing_stop_price ? `$${fmt(p.trailing_stop_price, 4)}` : '-'}</div>
                     <div>上次系统动作：{p.last_system_action || p.last_exit_plain || p.last_exit_reason || '暂无'}</div>
-                    <div>滚仓：{p.roll_layer || 0}/1 · 状态 {p.roll_status || 'state_incomplete'} · 成交价 {p.roll_price ? `$${fmt(p.roll_price, 4)}` : '-'}</div>
+                    <div>滚仓：{p.roll_layer || 0}/{p.roll_max_layers || 3} · 状态 {p.roll_status || 'state_incomplete'} · 成交价 {p.roll_price ? `$${fmt(p.roll_price, 4)}` : '-'}</div>
                     <div>最高浮盈：${fmt(p.max_floating_pnl || 0)} · {p.roll_enabled ? '允许滚仓观察' : '暂不滚仓'}</div>
+                    {p.strategy_source === 'alpha' && (
+                      <>
+                        <div>Alpha利润保护：第 {p.alpha_profit_lock_stage || 0} 档 · 历史最高 {fmt(p.max_floating_roi || 0, 2)}% · 当前锁定 {fmt(p.alpha_locked_roi || 0, 2)}%</div>
+                        <div>已落袋保护金：${fmt(p.protected_profit || 0)} · 趋势转弱减仓：{p.alpha_stall_protect_price ? `已触发（触发价 $${fmt(p.alpha_stall_protect_price, 4)}）` : '未触发'}</div>
+                      </>
+                    )}
                     {p.roll_block_reason && <div>滚仓阻断：{p.roll_block_reason}</div>}
                   </div>
                 </div>

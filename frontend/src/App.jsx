@@ -6,6 +6,7 @@ import LiveTrading from './components/LiveTrading';
 import MarketDataHealth from './components/MarketDataHealth';
 import TradingEnvironmentStatus from './components/TradingEnvironmentStatus';
 import AIQualityStatus from './components/AIQualityStatus';
+import AlphaStrategyMonitor from './components/AlphaStrategyMonitor';
 import './styles.css';
 
 export default function App() {
@@ -24,6 +25,7 @@ export default function App() {
         <nav className="nav">
           <button className={currentPage === 'scan' ? 'active' : ''} onClick={() => setCurrentPage('scan')}>扫描</button>
           <button className={currentPage === 'alpha' ? 'active' : ''} onClick={() => setCurrentPage('alpha')}>Alpha 扫描</button>
+          <button className={currentPage === 'alphaStrategy' ? 'active' : ''} onClick={() => setCurrentPage('alphaStrategy')}>Alpha 策略</button>
           <button className={currentPage === 'backtest' ? 'active' : ''} onClick={() => setCurrentPage('backtest')}>回测</button>
           <button className={currentPage === 'trading' ? 'active' : ''} onClick={() => setCurrentPage('trading')}>实盘</button>
         </nav>
@@ -35,6 +37,7 @@ export default function App() {
       <main className="main">
         {currentPage === 'scan' && <ScanTable />}
         {currentPage === 'alpha' && <AlphaScan />}
+        {currentPage === 'alphaStrategy' && <AlphaStrategyMonitor />}
         {currentPage === 'backtest' && <BacktestPanel API={{ get: (url) => fetch(`/api${url}`).then((r) => r.json()) }} />}
         {currentPage === 'trading' && <LiveTrading API="/api" />}
       </main>

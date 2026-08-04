@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 import sys, os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,6 +25,14 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger("engine")
+
+
+def next_hourly_run(now, minute=10):
+    """Return the next UTC hourly slot without ever scheduling in the past."""
+    candidate = now.replace(minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(hours=1)
+    return candidate
 
 
 def rows_to_df(rows, cols):
@@ -161,6 +169,13 @@ async def run_data_retention():
 def register_retention_job(scheduler):
     scheduler.add_job(
         run_data_retention,
+        trigger="date",
+        run_date=datetime.now(tz=timezone.utc) + timedelta(minutes=2),
+        id="startup_data_retention",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_data_retention,
         trigger="cron",
         hour=3,
         minute=30,
@@ -172,17 +187,48 @@ def register_retention_job(scheduler):
 
 async def main():
     logger.info("AlphaDog Engine starting...")
-    init_db()  # 纭繚鎵€鏈夎〃瀛樺湪
+    init_db()
 
     sched = AsyncIOScheduler()
-    sched.add_job(run_scoring, "interval", minutes=5, id="scoring",
-                  replace_existing=True, next_run_time=datetime.now(tz=timezone.utc))
-    sched.add_job(run_signal_labeling, "interval", minutes=5, id="signal_labeling",
-                  replace_existing=True, next_run_time=datetime.now(tz=timezone.utc))
-    sched.add_job(run_policy_guard, "interval", minutes=15, id="policy_guard",
-                  replace_existing=True, next_run_time=datetime.now(tz=timezone.utc).replace(second=20))
-    sched.add_job(run_policy_autotune, "interval", hours=1, id="policy_autotune",
-                  replace_existing=True, next_run_time=datetime.now(tz=timezone.utc).replace(minute=10, second=0))
+    startup_time = datetime.now(tz=timezone.utc)
+    common_job_options = {
+        "replace_existing": True,
+        "max_instances": 1,
+        "coalesce": True,
+        "misfire_grace_time": 120,
+    }
+    sched.add_job(
+        run_scoring,
+        "interval",
+        minutes=5,
+        id="scoring",
+        next_run_time=startup_time,
+        **common_job_options,
+    )
+    sched.add_job(
+        run_signal_labeling,
+        "interval",
+        minutes=5,
+        id="signal_labeling",
+        next_run_time=startup_time + timedelta(seconds=15),
+        **common_job_options,
+    )
+    sched.add_job(
+        run_policy_guard,
+        "interval",
+        minutes=15,
+        id="policy_guard",
+        next_run_time=startup_time + timedelta(seconds=30),
+        **common_job_options,
+    )
+    sched.add_job(
+        run_policy_autotune,
+        "interval",
+        hours=1,
+        id="policy_autotune",
+        next_run_time=next_hourly_run(startup_time),
+        **common_job_options,
+    )
     register_retention_job(sched)
     logger.info("Legacy backtest scheduler removed; policy loop is the only review/autotune path")
     sched.start()
