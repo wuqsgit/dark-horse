@@ -39,7 +39,7 @@ async def collect_binance(bc):
             try:
                 import httpx
                 resp = await httpx.AsyncClient(timeout=10).get(
-                    "https://fapi.binance.com/fapi/v1/ticker/24hr"
+                    f"{bc.futures_base_url}/fapi/v1/ticker/24hr"
                 )
                 if resp.status_code == 200:
                     data = resp.json()

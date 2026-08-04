@@ -19,18 +19,61 @@ from pipeline.candle_health import refresh_universe_readiness, retry_async
 logger = logging.getLogger("binance")
 KLINE_LIMITS = {"1h": 72}
 DEFAULT_KLINE_LIMIT = 48
+DEFAULT_SPOT_DATA_URL = "https://api.binance.com"
+DEFAULT_FUTURES_DATA_URL = "https://fapi.binance.com"
+VALID_FUTURES_DATA_ENVS = {"mainnet", "testnet"}
 
 
 class BinanceHTTPCollector:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        spot_base_url=None,
+        futures_base_url=None,
+        futures_source_env=None,
+    ):
+        self.spot_base_url = str(
+            spot_base_url
+            or os.getenv("BINANCE_SPOT_DATA_URL")
+            or DEFAULT_SPOT_DATA_URL
+        ).rstrip("/")
+        self.futures_base_url = str(
+            futures_base_url
+            or os.getenv("BINANCE_FUTURES_DATA_URL")
+            or DEFAULT_FUTURES_DATA_URL
+        ).rstrip("/")
+        self.futures_source_env = str(
+            futures_source_env
+            or os.getenv("BINANCE_FUTURES_DATA_ENV")
+            or "mainnet"
+        ).strip().lower()
+        if self.futures_source_env not in VALID_FUTURES_DATA_ENVS:
+            raise ValueError(
+                "BINANCE_FUTURES_DATA_ENV must be mainnet or testnet"
+            )
         self.client = httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        logger.info(
+            "Market data endpoints: spot=%s futures=%s source_env=%s",
+            self.spot_base_url,
+            self.futures_base_url,
+            self.futures_source_env,
+        )
 
     @staticmethod
-    def kline_request(market, symbol, interval):
+    def kline_request(
+        market,
+        symbol,
+        interval,
+        *,
+        spot_base_url=None,
+        futures_base_url=None,
+    ):
         if market == "spot":
-            url = "https://api.binance.com/api/v3/klines"
+            base_url = (spot_base_url or DEFAULT_SPOT_DATA_URL).rstrip("/")
+            url = f"{base_url}/api/v3/klines"
         elif market == "futures":
-            url = "https://fapi.binance.com/fapi/v1/klines"
+            base_url = (futures_base_url or DEFAULT_FUTURES_DATA_URL).rstrip("/")
+            url = f"{base_url}/fapi/v1/klines"
         else:
             raise ValueError(f"unsupported market: {market}")
         limit = KLINE_LIMITS.get(interval, DEFAULT_KLINE_LIMIT)
@@ -40,10 +83,10 @@ class BinanceHTTPCollector:
         """Get the liquid intersection of Binance spot and USDT perpetuals."""
         try:
             urls = (
-                "https://api.binance.com/api/v3/exchangeInfo",
-                "https://fapi.binance.com/fapi/v1/exchangeInfo",
-                "https://api.binance.com/api/v3/ticker/24hr",
-                "https://fapi.binance.com/fapi/v1/ticker/24hr",
+                f"{self.spot_base_url}/api/v3/exchangeInfo",
+                f"{self.futures_base_url}/fapi/v1/exchangeInfo",
+                f"{self.spot_base_url}/api/v3/ticker/24hr",
+                f"{self.futures_base_url}/fapi/v1/ticker/24hr",
             )
             responses = await asyncio.gather(*(self.client.get(url) for url in urls))
             for response in responses:
@@ -75,8 +118,12 @@ class BinanceHTTPCollector:
             logger.info("Normal dual-market universe: %s selected, %s forced", sum(r["selected"] for r in selected), sum(r["forced_position"] for r in selected))
             return selected
 
-        except Exception as e:
-            logger.error(f"get_normal_universe: {e}")
+        except Exception:
+            logger.exception(
+                "get_normal_universe failed (spot=%s futures=%s)",
+                self.spot_base_url,
+                self.futures_base_url,
+            )
             return []
 
     async def get_top_pairs(self, limit=150):
@@ -100,7 +147,9 @@ class BinanceHTTPCollector:
 
         # Pre-fetch futures data
         try:
-            resp = await self.client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+            resp = await self.client.get(
+                f"{self.futures_base_url}/fapi/v1/premiumIndex"
+            )
             premium_map = {}
             if resp.status_code == 200:
                 for p in resp.json():
@@ -118,7 +167,13 @@ class BinanceHTTPCollector:
                     interval_tables = (("15m", rows_15m, "futures_candles_15m"), ("1h", rows_1h, "futures_candles_1h"), ("6h", rows_6h, "futures_candles_6h"), ("1d", rows_24h, "futures_candles_24h"))
                     for interval, spot_rows, futures_table in interval_tables:
                         for market, target in (("spot", spot_rows), ("futures", futures_rows[futures_table])):
-                            url, params = self.kline_request(market, pair, interval)
+                            url, params = self.kline_request(
+                                market,
+                                pair,
+                                interval,
+                                spot_base_url=self.spot_base_url,
+                                futures_base_url=self.futures_base_url,
+                            )
 
                             async def request(url=url, params=params):
                                 response = await self.client.get(url, params=params)
@@ -126,24 +181,37 @@ class BinanceHTTPCollector:
                                 return response.json()
 
                             for o in await retry_async(request, retries=2):
-                                target.append((
+                                candle = (
                                     datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                                     pair, float(o[1]), float(o[2]), float(o[3]), float(o[4]),
                                     float(o[5]), float(o[7]), int(o[8]),
-                                ))
+                                )
+                                if market == "futures":
+                                    candle = (
+                                        *candle,
+                                        float(o[10] or 0),
+                                        self.futures_source_env,
+                                        int(int(o[6]) <= now_ms),
+                                    )
+                                target.append(candle)
 
                     # Futures data
                     prem = premium_map.get(pair, {})
                     fr = float(prem.get("lastFundingRate", 0) or 0) if prem else 0
                     mark = float(prem.get("markPrice", 0) or 0) if prem else 0
 
-                    oi_url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={pair}"
+                    oi_url = (
+                        f"{self.futures_base_url}/fapi/v1/openInterest"
+                        f"?symbol={pair}"
+                    )
                     oi_resp = await self.client.get(oi_url)
                     oi = 0
                     if oi_resp.status_code == 200:
                         oi = float(oi_resp.json().get("openInterest", 0) or 0)
 
-                    rows_fut.append((now_utc, pair, oi, fr, mark))
+                    rows_fut.append(
+                        (now_utc, pair, oi, fr, mark, self.futures_source_env)
+                    )
                     upsert_symbol(pair)
 
                 except Exception as e:
@@ -172,7 +240,7 @@ class BinanceHTTPCollector:
         purge_old_kline_data(days=RETENTION_DAYS)
         refresh_universe_readiness(
             "normal",
-            futures_source_env="mainnet",
+            futures_source_env=self.futures_source_env,
         )
 
         logger.info(f"Done: {len(rows_1h)} 1h + {len(rows_15m)} 15m + {len(rows_6h)} 6h + {len(rows_24h)} 24h + {len(rows_fut)} futures")
@@ -197,7 +265,10 @@ class BinanceHTTPCollector:
             async with semaphore:
                 try:
                     pair = sym.replace("/", "")
-                    url = f"https://api.binance.com/api/v3/depth?symbol={pair}&limit=100"
+                    url = (
+                        f"{self.spot_base_url}/api/v3/depth"
+                        f"?symbol={pair}&limit=100"
+                    )
                     resp = await self.client.get(url, timeout=10)
                     if resp.status_code != 200:
                         return
