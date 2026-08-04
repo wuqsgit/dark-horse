@@ -182,6 +182,9 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
         if action.get("action") != "open":
             filtered.append(action)
             continue
+        if action.get("skip_entry_quality_gate"):
+            filtered.append(action)
+            continue
         try:
             decision = evaluate(build_candidate(action, scan_rows, account_id))
         except Exception as exc:

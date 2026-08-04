@@ -23,7 +23,9 @@ class DuneCollector:
 
     async def collect_flows(self):
         if not DUNE_API_KEY:
-            logger.warning("No DUNE_API_KEY")
+            logger.info(
+                "On-chain collector disabled: DUNE_API_KEY is not configured"
+            )
             return []
 
         rows = []

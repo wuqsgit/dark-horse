@@ -21,13 +21,11 @@ from shared.db import (
 )
 from trader.exchange import BinanceFutures
 from trader.execution import ExecutionEngine
+from trader.alpha_signal_consumer import AlphaSignalConsumer, LIVE_MODES
 from trader.ai_client import apply_entry_quality_gate, observe_entry_quality_candidates
-from trader.config import EXCHANGE_CONFIG, TRADING_CONFIG
+from trader.config import TRADING_CONFIG
 from trader.risk import get_symbol_threshold, get_category_config
 
-import warnings, urllib3
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-urllib3.disable_warnings()
 logger = logging.getLogger("trader")
 
 
@@ -69,6 +67,11 @@ async def _account_trading_loop(account):
         "normal_trading_enabled": bool(account.get("normal_trading_enabled")),
         "alpha_trading_enabled": bool(account.get("alpha_trading_enabled")),
     }
+    alpha_signal_consumer = AlphaSignalConsumer(
+        ex,
+        config=engine.cfg,
+    )
+    alpha_signal_recovered = False
     last_income_sync = 0  # 上次 income 同步时间
     loop_interval = int(TRADING_CONFIG.get("rebalance_interval_min", 5) * 60)
 
@@ -166,7 +169,36 @@ async def _account_trading_loop(account):
             logger.info(f"评分 Top: {top_symbols[0]['symbol']} ({top_symbols[0]['composite_score']:.1f})")
 
             # 3. 决策
+            recovered = engine.recover_untracked_positions(positions, top_symbols)
+            if recovered:
+                logger.warning("Recovered management state for live positions: %s", ", ".join(recovered))
+            if not alpha_signal_recovered:
+                recovery = alpha_signal_consumer.recover(account, positions)
+                logger.info("Alpha Strategy V2 recovery: %s", recovery)
+                alpha_signal_recovered = True
             actions = engine.decide(top_symbols, positions, run_id=run_id)
+            strategy_v2 = engine.cfg.get("alpha_strategy_v2") or {}
+            strategy_mode = str(strategy_v2.get("mode") or "shadow").lower()
+            if strategy_v2.get("enabled") and strategy_mode in LIVE_MODES:
+                if not strategy_v2.get("legacy_alpha_entry_enabled", False):
+                    actions = [
+                        action
+                        for action in actions
+                        if not (
+                            action.get("action") == "open"
+                            and action.get("strategy_source") == "alpha"
+                        )
+                    ]
+            actions.extend(
+                alpha_signal_consumer.build_actions(
+                    account=account,
+                    positions=positions,
+                    balance=balance,
+                    engine=engine,
+                    run_id=run_id,
+                    planned_actions=actions,
+                )
+            )
             observation = observe_entry_quality_candidates(
                 engine.ai_learning_actions,
                 top_symbols,
@@ -199,7 +231,9 @@ async def _account_trading_loop(account):
                 logger.info(f"操作计划 ({len(actions)} 条):")
                 for a in actions:
                     logger.info(f"  [{a['action']}] {a.get('symbol','?')} reason: {a.get('reason','')}")
+                alpha_signal_consumer.mark_submitted(account["id"], actions)
                 results = engine.execute(actions)
+                alpha_signal_consumer.finalize(account["id"], results)
                 logger.info(f"执行完成: {sum(1 for r in results if r['status']=='ok')} OK / {sum(1 for r in results if r['status']=='error')} ERR")
             else:
                 logger.info("无需操作")
@@ -266,22 +300,27 @@ def fetch_and_store_income(ex, days_back=7):
     now = datetime.now(timezone.utc)
     account_id = int(getattr(ex, "account_id", 1) or 1)
     
-    # 获取最后一次同步的时间戳
+    # Use exchange event time rather than local insert time. Keep a short
+    # overlap so a delayed Binance event cannot fall between sync windows.
     last_sync = conn.execute(
-        "SELECT MAX(created_at) FROM fills WHERE account_id=? AND side='REALIZED_PNL'",
+        """SELECT MAX(income_time)
+           FROM exchange_income_ledger
+           WHERE account_id=?""",
         (account_id,),
     ).fetchone()[0]
     
     # 默认查最近 7 天
     start_ts = int((now - timedelta(days=days_back)).timestamp() * 1000)
-    if not last_sync:
-        start_ts = int((now - timedelta(minutes=10)).timestamp() * 1000)
     if last_sync:
-        # 转换为毫秒时间戳
         try:
             last_dt = datetime.fromisoformat(str(last_sync).replace('Z', '+00:00'))
-            start_ts = max(start_ts, int(last_dt.timestamp() * 1000))
-        except:
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            start_ts = max(
+                start_ts,
+                int((last_dt - timedelta(minutes=5)).timestamp() * 1000),
+            )
+        except (TypeError, ValueError):
             pass
     
     params = {"limit": 1000, "startTime": start_ts}
@@ -369,16 +408,42 @@ def fetch_and_store_income(ex, days_back=7):
         except Exception as e:
             logger.warning(f"position trade rebuild error: {e}")
 
-        total_income_pnl = sum(float(i["income"]) for i in real_pnl)
+        reconcile_start = datetime.fromtimestamp(
+            start_ts / 1000,
+            tz=timezone.utc,
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        total_income_pnl = conn.execute(
+            """SELECT COALESCE(SUM(income), 0)
+               FROM exchange_income_ledger
+               WHERE account_id=? AND income_type='REALIZED_PNL'
+                 AND julianday(income_time) >= julianday(?)""",
+            (account_id, reconcile_start),
+        ).fetchone()[0] or 0
         local_pnl = conn.execute(
-            "SELECT SUM(pnl) FROM trades WHERE account_id=? AND source IN ('system','income_auto')",
-            (account_id,),
+            """SELECT COALESCE(SUM(realized_pnl), 0)
+               FROM position_trades
+               WHERE account_id=? AND source='exchange_income'
+                 AND julianday(exit_time) >= julianday(?)""",
+            (account_id, reconcile_start),
         ).fetchone()[0] or 0
         diff = abs(total_income_pnl - local_pnl)
         if diff > 1.0:
-            logger.warning(f"⚠️ 对账差异: trades表=${local_pnl:.2f} vs incomeAPI=${total_income_pnl:.2f} 差${diff:.2f}")
+            logger.warning(
+                "Reconciliation difference since %s: position_trades=$%.2f "
+                "vs income_ledger=$%.2f diff=$%.2f",
+                reconcile_start,
+                local_pnl,
+                total_income_pnl,
+                diff,
+            )
         else:
-            logger.info(f"✅ 对账一致: trades表=${local_pnl:.2f} ≈ incomeAPI=${total_income_pnl:.2f}")
+            logger.info(
+                "Reconciliation matched since %s: position_trades=$%.2f "
+                "income_ledger=$%.2f",
+                reconcile_start,
+                local_pnl,
+                total_income_pnl,
+            )
 
     except Exception as e:
         logger.warning(f"Income sync error: {e}")
@@ -530,4 +595,8 @@ def _log_category_ranking(top_symbols, positions, pending_symbols):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    # httpx INFO logs include signed Binance query strings. Keep request URLs
+    # out of operational logs while preserving warnings and failures.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     asyncio.run(trading_loop())

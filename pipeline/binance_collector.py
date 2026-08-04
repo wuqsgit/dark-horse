@@ -15,6 +15,7 @@ from shared.db import (
 
 logger = logging.getLogger("binance")
 MIN_VOLUME_USD = 50_000
+ONE_HOUR_HISTORY_LIMIT = 72
 
 
 class BinanceCollector:
@@ -70,8 +71,13 @@ class BinanceCollector:
         for sym in symbols:
             pair = sym.replace("/", "")
             try:
-                # 1h klines (last 48)
-                ohlcv = await self.exchange.fetch_ohlcv(sym, "1h", since=now_ms - 48 * 3600 * 1000, limit=48)
+                # Keep enough 1h history to warm EMA50 immediately after a cold start.
+                ohlcv = await self.exchange.fetch_ohlcv(
+                    sym,
+                    "1h",
+                    since=now_ms - ONE_HOUR_HISTORY_LIMIT * 3600 * 1000,
+                    limit=ONE_HOUR_HISTORY_LIMIT,
+                )
                 for o in ohlcv:
                     rows_1h.append((
                         datetime.fromtimestamp(o[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

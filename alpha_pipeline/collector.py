@@ -13,12 +13,19 @@ from shared.db import (
     purge_old_kline_data,
     upsert_alpha_symbols,
     replace_market_universe,
+    fetch_market_universe,
     fetch_tracked_alpha_positions,
     futures_candles_current,
+    get_conn,
     RETENTION_DAYS,
 )
 from shared.market_universe import build_alpha_universe
 from pipeline.candle_health import refresh_universe_readiness, retry_async
+from alpha_engine.strategy.market_data import (
+    futures_rest_base,
+    is_closed_kline,
+    resolve_market_env,
+)
 
 logger = logging.getLogger("alpha_pipeline")
 
@@ -49,7 +56,9 @@ def _utc(ms):
 
 
 class AlphaCollector:
-    def __init__(self):
+    def __init__(self, market_env=None):
+        self.market_env = resolve_market_env(market_env)
+        self.futures_base = futures_rest_base(self.market_env)
         self.client = httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"})
 
     async def close(self):
@@ -75,8 +84,8 @@ class AlphaCollector:
     async def get_futures_symbols(self):
         try:
             info_resp, ticker_resp = await asyncio.gather(
-                self.client.get("https://fapi.binance.com/fapi/v1/exchangeInfo"),
-                self.client.get("https://fapi.binance.com/fapi/v1/ticker/24hr"),
+                self.client.get(self.futures_base + "/fapi/v1/exchangeInfo"),
+                self.client.get(self.futures_base + "/fapi/v1/ticker/24hr"),
             )
             info_resp.raise_for_status()
             ticker_resp.raise_for_status()
@@ -93,6 +102,19 @@ class AlphaCollector:
         except Exception as exc:
             logger.warning("futures exchangeInfo failed: %s", exc)
             return set()
+
+    @staticmethod
+    def normalize_kline_row(symbol, row, *, market_env, now_ms=None):
+        """Convert a Binance-style kline to the extended candle schema."""
+        return (
+            _utc(row[0]),
+            symbol,
+            _f(row[1]), _f(row[2]), _f(row[3]), _f(row[4]),
+            _f(row[5]), _f(row[7]), _i(row[8]),
+            _f(row[10]) if len(row) > 10 else None,
+            resolve_market_env(market_env),
+            1 if is_closed_kline(row, now_ms=now_ms) else 0,
+        )
 
     async def refresh_universe(self, limit=200):
         tokens, exchange_symbols, futures_symbols = await asyncio.gather(
@@ -197,10 +219,10 @@ class AlphaCollector:
         semaphore = asyncio.Semaphore(4)
 
         interval_map = {
-            "alpha_candles_15m": ("15m", 48),
-            "alpha_candles_1h": ("1h", 48),
-            "alpha_candles_6h": ("6h", 48),
-            "alpha_candles_24h": ("1d", 48),
+            "alpha_candles_15m": ("15m", 192),
+            "alpha_candles_1h": ("1h", 120),
+            "alpha_candles_6h": ("6h", 60),
+            "alpha_candles_24h": ("1d", 60),
         }
 
         async def fetch_one(item):
@@ -212,19 +234,20 @@ class AlphaCollector:
                             return await self._get_data(KLINES, {"symbol": symbol, "interval": interval, "limit": limit})
                         data = await retry_async(request, retries=2)
                         for o in data or []:
-                            rows_by_table[table].append((
-                                _utc(o[0]),
-                                symbol,
-                                _f(o[1]), _f(o[2]), _f(o[3]), _f(o[4]),
-                                _f(o[5]), _f(o[7]), _i(o[8]),
-                            ))
+                            rows_by_table[table].append(
+                                self.normalize_kline_row(
+                                    symbol,
+                                    o,
+                                    market_env="mainnet",
+                                )
+                            )
 
                     try:
                         depth = await self._get_data(FULL_DEPTH, {"symbol": symbol, "limit": 20})
                         bids = depth.get("bids") or []
                         asks = depth.get("asks") or []
-                        bid_depth = sum(_f(q) for _, q in bids[:20])
-                        ask_depth = sum(_f(q) for _, q in asks[:20])
+                        bid_depth = sum(_f(price) * _f(qty) for price, qty in bids[:20])
+                        ask_depth = sum(_f(price) * _f(qty) for price, qty in asks[:20])
                         top_bid = _f(bids[0][0]) if bids else 0
                         top_ask = _f(asks[0][0]) if asks else 0
                         spread_pct = ((top_ask - top_bid) / top_bid * 100) if top_bid > 0 and top_ask > 0 else 0
@@ -261,7 +284,10 @@ class AlphaCollector:
             len(depth_rows),
         )
         await self.collect_mapped_futures_data(selected)
-        refresh_universe_readiness("alpha")
+        refresh_universe_readiness(
+            "alpha",
+            futures_source_env=self.market_env,
+        )
 
     @staticmethod
     def futures_table_for_interval(interval):
@@ -271,12 +297,20 @@ class AlphaCollector:
             raise ValueError(f"unsupported futures interval: {interval}")
         return table
 
-    async def collect_mapped_futures_data(self, selected):
-        futures_symbols = sorted({
+    async def collect_mapped_futures_data(
+        self,
+        selected,
+        *,
+        include_candles=True,
+    ):
+        mapped_futures_symbols = {
             item.get("futures_symbol")
             for item in selected
             if item.get("futures_symbol")
-        })
+        }
+        # BTC is a required market-context feature even when it is not part of
+        # the selected Alpha universe.
+        futures_symbols = sorted(mapped_futures_symbols | {"BTCUSDT"})
         if not futures_symbols:
             return
 
@@ -291,14 +325,19 @@ class AlphaCollector:
         semaphore = asyncio.Semaphore(4)
 
         interval_map = {
-            "futures_candles_15m": ("15m", 48),
-            "futures_candles_1h": ("1h", 48),
-            "futures_candles_6h": ("6h", 48),
-            "futures_candles_24h": ("1d", 48),
+            # Refresh at the bar interval, before the looser readiness age
+            # expires. This headroom prevents a long full collection from
+            # crossing the readiness boundary after a symbol was skipped.
+            "futures_candles_15m": ("15m", 192, 15),
+            "futures_candles_1h": ("1h", 120, 60),
+            "futures_candles_6h": ("6h", 60, 360),
+            "futures_candles_24h": ("1d", 60, 1440),
         }
 
         try:
-            premium_resp = await self.client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+            premium_resp = await self.client.get(
+                self.futures_base + "/fapi/v1/premiumIndex"
+            )
             premium_resp.raise_for_status()
             premium_map = {p.get("symbol"): p for p in premium_resp.json()}
         except Exception as exc:
@@ -308,23 +347,34 @@ class AlphaCollector:
         async def fetch_one(symbol):
             async with semaphore:
                 try:
-                    if futures_candles_current(symbol):
-                        return
-                    for table, (interval, limit) in interval_map.items():
-                        async def request():
-                            response = await self.client.get(
-                                "https://fapi.binance.com/fapi/v1/klines",
-                                params={"symbol": symbol, "interval": interval, "limit": limit},
-                            )
-                            response.raise_for_status()
-                            return response.json()
-                        for o in await retry_async(request, retries=2):
-                            rows_by_table[table].append((
-                                _utc(o[0]),
+                    if include_candles:
+                        for table, (
+                            interval,
+                            limit,
+                            max_age_minutes,
+                        ) in interval_map.items():
+                            if futures_candles_current(
                                 symbol,
-                                _f(o[1]), _f(o[2]), _f(o[3]), _f(o[4]),
-                                _f(o[5]), _f(o[7]), _i(o[8]),
-                            ))
+                                max_age_minutes=max_age_minutes,
+                                source_env=self.market_env,
+                                table=table,
+                            ):
+                                continue
+                            async def request():
+                                response = await self.client.get(
+                                    self.futures_base + "/fapi/v1/klines",
+                                    params={"symbol": symbol, "interval": interval, "limit": limit},
+                                )
+                                response.raise_for_status()
+                                return response.json()
+                            for o in await retry_async(request, retries=2):
+                                rows_by_table[table].append(
+                                    self.normalize_kline_row(
+                                        symbol,
+                                        o,
+                                        market_env=self.market_env,
+                                    )
+                                )
 
                     prem = premium_map.get(symbol) or {}
                     funding = _f(prem.get("lastFundingRate"))
@@ -332,14 +382,23 @@ class AlphaCollector:
                     oi = 0.0
                     try:
                         oi_resp = await self.client.get(
-                            "https://fapi.binance.com/fapi/v1/openInterest",
+                            self.futures_base + "/fapi/v1/openInterest",
                             params={"symbol": symbol},
                         )
                         if oi_resp.status_code == 200:
                             oi = _f(oi_resp.json().get("openInterest"))
                     except Exception as exc:
                         logger.debug("mapped futures openInterest failed %s: %s", symbol, exc)
-                    rows_fut.append((now_utc, symbol, oi, funding, mark_price))
+                    rows_fut.append(
+                        (
+                            now_utc,
+                            symbol,
+                            oi,
+                            funding,
+                            mark_price,
+                            self.market_env,
+                        )
+                    )
                 except Exception as exc:
                     logger.warning("mapped futures fetch failed %s: %s", symbol, exc)
 
@@ -359,6 +418,215 @@ class AlphaCollector:
             len(rows_by_table["futures_candles_15m"]),
             len(rows_fut),
         )
+
+    @staticmethod
+    def _selected_market_rows():
+        return [
+            dict(row)
+            for row in fetch_market_universe(
+                "alpha",
+                selected_only=True,
+            )
+        ]
+
+    @staticmethod
+    def _watched_alpha_symbols() -> set[str]:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                """SELECT alpha_symbol FROM alpha_signal_states
+                   WHERE alpha_symbol IS NOT NULL
+                     AND state NOT IN ('IDLE','FAILED','EXPIRED','COOLDOWN')"""
+            ).fetchall()
+            return {
+                str(row["alpha_symbol"]).upper()
+                for row in rows
+                if row["alpha_symbol"]
+            }
+        finally:
+            conn.close()
+
+    async def collect_strategy_depth(self) -> int:
+        """Refresh watched-state orderbooks every minute."""
+        selected = self._selected_market_rows()
+        watched = self._watched_alpha_symbols()
+        targets = [
+            row for row in selected
+            if str(row.get("source_symbol") or "").upper() in watched
+        ]
+        if not targets:
+            return 0
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        depth_rows = []
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch_one(item):
+            symbol = item["source_symbol"]
+            async with semaphore:
+                try:
+                    depth = await self._get_data(
+                        FULL_DEPTH,
+                        {"symbol": symbol, "limit": 20},
+                    )
+                    bids = depth.get("bids") or []
+                    asks = depth.get("asks") or []
+                    bid_depth = sum(
+                        _f(price) * _f(qty)
+                        for price, qty in bids[:20]
+                    )
+                    ask_depth = sum(
+                        _f(price) * _f(qty)
+                        for price, qty in asks[:20]
+                    )
+                    top_bid = _f(bids[0][0]) if bids else 0
+                    top_ask = _f(asks[0][0]) if asks else 0
+                    spread_pct = (
+                        (top_ask - top_bid) / top_bid * 100
+                        if top_bid > 0 and top_ask > 0
+                        else 0
+                    )
+                    depth_rows.append(
+                        (
+                            now_utc,
+                            symbol,
+                            bid_depth,
+                            ask_depth,
+                            bid_depth / ask_depth if ask_depth > 0 else 0,
+                            max(0.0, spread_pct),
+                            _f(bids[0][1]) if bids else 0,
+                            _f(asks[0][1]) if asks else 0,
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "watched alpha depth failed %s: %s",
+                        symbol,
+                        exc,
+                    )
+
+        await asyncio.gather(*(fetch_one(item) for item in targets))
+        if depth_rows:
+            insert_alpha_orderbook_snapshot(depth_rows)
+        return len(depth_rows)
+
+    async def collect_closed_15m(self, *, force=False) -> dict:
+        """Check for new closed 15m Alpha/Futures bars near each boundary."""
+        now = datetime.now(timezone.utc)
+        if not force and now.minute % 15 > 2:
+            return {"alpha": 0, "futures": 0, "skipped": True}
+        selected = self._selected_market_rows()
+        if not selected:
+            return {"alpha": 0, "futures": 0, "skipped": False}
+        alpha_rows = []
+        futures_rows = []
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch_one(item):
+            alpha_symbol = item["source_symbol"]
+            futures_symbol = item["futures_symbol"]
+            async with semaphore:
+                try:
+                    alpha_data, futures_response = await asyncio.gather(
+                        self._get_data(
+                            KLINES,
+                            {
+                                "symbol": alpha_symbol,
+                                "interval": "15m",
+                                "limit": 8,
+                            },
+                        ),
+                        self.client.get(
+                            self.futures_base + "/fapi/v1/klines",
+                            params={
+                                "symbol": futures_symbol,
+                                "interval": "15m",
+                                "limit": 8,
+                            },
+                        ),
+                    )
+                    futures_response.raise_for_status()
+                    alpha_rows.extend(
+                        self.normalize_kline_row(
+                            alpha_symbol,
+                            row,
+                            market_env="mainnet",
+                        )
+                        for row in alpha_data or []
+                    )
+                    futures_rows.extend(
+                        self.normalize_kline_row(
+                            futures_symbol,
+                            row,
+                            market_env=self.market_env,
+                        )
+                        for row in futures_response.json()
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "closed 15m refresh failed %s/%s: %s",
+                        alpha_symbol,
+                        futures_symbol,
+                        exc,
+                    )
+
+        for index in range(0, len(selected), 10):
+            await asyncio.gather(
+                *(fetch_one(item) for item in selected[index:index + 10])
+            )
+            await asyncio.sleep(0.2)
+        selected_futures = {
+            str(item.get("futures_symbol") or "").upper()
+            for item in selected
+        }
+        if "BTCUSDT" not in selected_futures:
+            try:
+                btc_response = await self.client.get(
+                    self.futures_base + "/fapi/v1/klines",
+                    params={"symbol": "BTCUSDT", "interval": "15m", "limit": 8},
+                )
+                btc_response.raise_for_status()
+                futures_rows.extend(
+                    self.normalize_kline_row(
+                        "BTCUSDT",
+                        row,
+                        market_env=self.market_env,
+                    )
+                    for row in btc_response.json()
+                )
+            except Exception as exc:
+                logger.warning("closed 15m BTC context refresh failed: %s", exc)
+        if alpha_rows:
+            insert_alpha_candles("alpha_candles_15m", alpha_rows)
+        if futures_rows:
+            insert_futures_candles("futures_candles_15m", futures_rows)
+        refresh_universe_readiness(
+            "alpha",
+            futures_source_env=self.market_env,
+        )
+        return {
+            "alpha": len(alpha_rows),
+            "futures": len(futures_rows),
+            "skipped": False,
+        }
+
+    async def collect_strategy_fast_data(self) -> dict:
+        """One-minute strategy feed: watched depth plus closed-bar checks."""
+        depth_count, candles = await asyncio.gather(
+            self.collect_strategy_depth(),
+            self.collect_closed_15m(),
+        )
+        return {"depth": depth_count, **candles}
+
+    async def collect_derivatives(self) -> int:
+        """Refresh OI, funding and mark price without waiting for candle fetch."""
+        selected = self._selected_market_rows()
+        if not selected:
+            return 0
+        await self.collect_mapped_futures_data(
+            selected,
+            include_candles=False,
+        )
+        return len(selected)
 
     async def collect_all(self, universe_limit=200, market_top_n=80):
         universe = await self.refresh_universe(limit=universe_limit)

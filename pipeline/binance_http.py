@@ -17,6 +17,8 @@ from shared.market_universe import build_normal_universe
 from pipeline.candle_health import refresh_universe_readiness, retry_async
 
 logger = logging.getLogger("binance")
+KLINE_LIMITS = {"1h": 72}
+DEFAULT_KLINE_LIMIT = 48
 
 
 class BinanceHTTPCollector:
@@ -31,7 +33,8 @@ class BinanceHTTPCollector:
             url = "https://fapi.binance.com/fapi/v1/klines"
         else:
             raise ValueError(f"unsupported market: {market}")
-        return url, {"symbol": symbol, "interval": interval, "limit": 48}
+        limit = KLINE_LIMITS.get(interval, DEFAULT_KLINE_LIMIT)
+        return url, {"symbol": symbol, "interval": interval, "limit": limit}
 
     async def get_normal_universe(self, limit=150):
         """Get the liquid intersection of Binance spot and USDT perpetuals."""
@@ -167,7 +170,10 @@ class BinanceHTTPCollector:
             insert_futures(rows_fut)
 
         purge_old_kline_data(days=RETENTION_DAYS)
-        refresh_universe_readiness("normal")
+        refresh_universe_readiness(
+            "normal",
+            futures_source_env="mainnet",
+        )
 
         logger.info(f"Done: {len(rows_1h)} 1h + {len(rows_15m)} 15m + {len(rows_6h)} 6h + {len(rows_24h)} 24h + {len(rows_fut)} futures")
 

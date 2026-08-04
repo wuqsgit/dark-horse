@@ -4,8 +4,55 @@
 import logging
 from typing import Dict, Tuple
 from trader.config import PORTFOLIO_RISK, TRADING_CONFIG
+from trader.symbol_risk import get_symbol_risk
 
 logger = logging.getLogger("portfolio_risk")
+
+
+def symbol_risk_category(symbol: str) -> str:
+    return str((get_symbol_risk(symbol) or {}).get("class") or "narrative")
+
+
+def check_category_position_limit(
+    positions: list,
+    new_symbol: str,
+    planned_actions: list | None = None,
+) -> Tuple[bool, str]:
+    """Allow at most one live/planned position in each symbol risk class."""
+    limit = max(1, int(PORTFOLIO_RISK.get("max_positions_per_category", 1)))
+    new_symbol_u = str(new_symbol or "").upper()
+    new_category = symbol_risk_category(new_symbol_u)
+    actions = planned_actions or []
+    closing_symbols = {
+        str(action.get("symbol") or "").upper()
+        for action in actions
+        if action.get("action") == "close"
+    }
+    occupied = []
+
+    for position in positions or []:
+        symbol = str(position.get("symbol") or "").upper()
+        if not symbol or symbol in closing_symbols:
+            continue
+        if symbol_risk_category(symbol) == new_category:
+            occupied.append(symbol)
+
+    for action in actions:
+        if action.get("action") != "open":
+            continue
+        symbol = str(action.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        if symbol_risk_category(symbol) == new_category:
+            occupied.append(symbol)
+
+    if len(occupied) >= limit:
+        blocker = ",".join(dict.fromkeys(occupied))
+        return (
+            False,
+            f"category_position_limit class={new_category} occupied={blocker} limit={limit}",
+        )
+    return True, "OK"
 
 
 def check_portfolio_risk(

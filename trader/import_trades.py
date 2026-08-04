@@ -5,13 +5,16 @@ sys.exit(1)
 
 import sys, os, time, json, urllib.request, ssl, hashlib, hmac, urllib.parse
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from shared.accounts import account_exchange_config, get_default_account
 from shared.db import get_conn
 from datetime import datetime, timezone
 from collections import defaultdict
 
-API_KEY = os.environ["BINANCE_API_KEY"]
-API_SECRET = os.environ["BINANCE_API_SECRET"]
-BASE = "https://testnet.binancefuture.com"
+ACCOUNT = get_default_account(include_secrets=True)
+EXCHANGE = account_exchange_config(ACCOUNT, require_credentials=True)
+API_KEY = EXCHANGE["api_key"]
+API_SECRET = EXCHANGE["api_secret"]
+BASE = "https://testnet.binancefuture.com" if EXCHANGE["testnet"] else "https://fapi.binance.com"
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE

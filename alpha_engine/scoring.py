@@ -9,14 +9,17 @@ from alpha_engine.profiles import (
 )
 from alpha_engine.volume_regime import clamp, compute_trend_continuation
 from alpha_engine.volume_price import evaluate_alpha_volume_price
+from alpha_engine.strategy.market_data import (
+    oi_change_at_horizon,
+    resolve_market_env,
+)
 from shared.market_phase import detect_market_phase
 from shared.db import (
     fetch_active_alpha_symbols,
     fetch_alpha_candles,
     fetch_alpha_orderbook_depth,
     fetch_futures,
-    fetch_klines_1h,
-    fetch_klines_15m,
+    fetch_futures_candles,
     insert_alpha_scan_scores,
 )
 
@@ -72,8 +75,9 @@ def _technical_from_price_rows(price_rows, trend_score=50):
 
 
 class AlphaScoringEngine:
-    def __init__(self):
+    def __init__(self, market_env=None):
         self.scan_id = "alpha-" + uuid.uuid4().hex[:12]
+        self.market_env = resolve_market_env(market_env)
 
     def _series(self, rows):
         return sorted(rows, key=lambda r: r["time"])
@@ -100,10 +104,12 @@ class AlphaScoringEngine:
 
         def oi_change(hours_back):
             if not frows or oi_now <= 0:
-                return 0.0
-            idx = max(0, len(frows) - hours_back - 1)
-            old = float(frows[idx]["open_interest"] or 0)
-            return (oi_now - old) / old if old > 0 else 0.0
+                return None
+            return oi_change_at_horizon(
+                frows,
+                hours=hours_back,
+                as_of=latest["time"],
+            )
 
         oi_4h = oi_change(4)
         oi_24h = oi_change(24)
@@ -114,21 +120,23 @@ class AlphaScoringEngine:
             score += 15
         if vol_growth >= 2.0:
             score += 10
-        if oi_4h >= 0.03:
+        if oi_4h is not None and oi_4h >= 0.03:
             score += 15
-        if oi_24h >= 0.06:
+        if oi_24h is not None and oi_24h >= 0.06:
             score += 10
         if abs(funding) > 0.0012:
             score -= 15
-        if vol_growth < 1.0 and oi_4h <= 0:
+        if vol_growth < 1.0 and oi_4h is not None and oi_4h <= 0:
             score -= 20
         return {
             "available": bool(c1h or frows),
             "futures_volume_growth_6h": round(vol_growth, 4),
             "futures_quote_vol_6h": round(quote_vol_6h, 2),
             "futures_quote_vol_prev_6h": round(quote_vol_prev_6h, 2),
-            "oi_change_4h": round(oi_4h, 6),
-            "oi_change_24h": round(oi_24h, 6),
+            "oi_change_4h": round(oi_4h, 6) if oi_4h is not None else 0.0,
+            "oi_change_24h": round(oi_24h, 6) if oi_24h is not None else 0.0,
+            "oi_change_4h_available": oi_4h is not None,
+            "oi_change_24h_available": oi_24h is not None,
             "funding_rate": round(funding, 8),
             "mark_price": mark_price,
             "sync_score": round(clamp(score), 2),
@@ -298,9 +306,37 @@ class AlphaScoringEngine:
         candles_15m = fetch_alpha_candles("alpha_candles_15m", alpha_symbols, hours=18)
         candles_24h = fetch_alpha_candles("alpha_candles_24h", alpha_symbols, days=40)
         futures_symbols = sorted({r["futures_symbol"] for r in symbols if r["futures_symbol"]})
-        futures_1h = fetch_klines_1h(futures_symbols, hours=96) if futures_symbols else []
-        futures_15m = fetch_klines_15m(futures_symbols, hours=18) if futures_symbols else []
-        futures_rows = fetch_futures(futures_symbols, hours=72) if futures_symbols else []
+        futures_1h = (
+            fetch_futures_candles(
+                "futures_candles_1h",
+                futures_symbols,
+                hours=96,
+                source_env=self.market_env,
+                closed_only=True,
+            )
+            if futures_symbols
+            else []
+        )
+        futures_15m = (
+            fetch_futures_candles(
+                "futures_candles_15m",
+                futures_symbols,
+                hours=18,
+                source_env=self.market_env,
+                closed_only=True,
+            )
+            if futures_symbols
+            else []
+        )
+        futures_rows = (
+            fetch_futures(
+                futures_symbols,
+                hours=72,
+                source_env=self.market_env,
+            )
+            if futures_symbols
+            else []
+        )
         by_1h = {}
         by_15m = {}
         by_24h = {}

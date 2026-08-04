@@ -17,22 +17,13 @@ bot/
 
 ### 1. 配置 API
 
-```bash
-# 设置测试网 API (推荐先用测试网)
-export TESTNET_API_KEY="your_key"
-export TESTNET_API_SECRET="your_secret"
-
-# 或实盘 API
-export BINANCE_API_KEY="your_key"
-export BINANCE_API_SECRET="your_secret"
-```
+Binance AK/SK 请在系统“实盘 → 账户管理”中配置。程序会从 `trading_accounts` 表读取并解密，不再读取 AK/SK 环境变量。
 
 获取测试网API: https://testnet.binance.vision/
 
 ### 2. 修改配置
 
-编辑 `config.py`:
-- `TEST_MODE = True` # 测试网
+账户的测试网/实盘环境也在“账户管理”中选择。
 - `SYMBOL = "BTCUSDT"` # 交易对
 - 设置风控参数
 

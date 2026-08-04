@@ -1,7 +1,7 @@
 """交易数据模型"""
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -16,7 +16,11 @@ class Position:
     take_profit: float
     atr_value: float
     unrealized_pnl: float
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 @dataclass

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { adminFetch } from '../api/adminFetch';
 
 import {
   EMPTY_ACCOUNT_FORM,
@@ -38,7 +39,7 @@ export default function TradingAccountManager({ accounts, onChanged }) {
     setMessage('');
     try {
       const request = buildAccountSaveRequest(mode, form);
-      const res = await fetch(request.url, { method: request.method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request.body) });
+      const res = await adminFetch(request.url, { method: request.method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request.body) });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       setMessage('账户配置已保存，交易进程会自动重新加载。');
@@ -53,7 +54,7 @@ export default function TradingAccountManager({ accounts, onChanged }) {
     setSaving(true);
     setMessage('');
     try {
-      const res = await fetch(`/api/trading/accounts/${account.id}`, { method: 'DELETE' });
+      const res = await adminFetch(`/api/trading/accounts/${account.id}`, { method: 'DELETE' });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       setMessage('账户已删除，交易进程会自动重新加载。');
@@ -64,7 +65,7 @@ export default function TradingAccountManager({ accounts, onChanged }) {
 
   const test = async (id) => {
     setMessage('正在测试 Binance 连接...');
-    const res = await fetch(`/api/trading/accounts/${id}/test`, { method: 'POST' });
+    const res = await adminFetch(`/api/trading/accounts/${id}/test`, { method: 'POST' });
     const data = await res.json();
     setMessage(data.error ? `连接失败：${data.error}` : `连接成功，账户权益 ${Number(data.equity || 0).toFixed(2)} USDT`);
   };

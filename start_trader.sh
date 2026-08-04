@@ -1,6 +1,6 @@
 #!/bin/bash
 # DarkHorse startup script.
-# Export BINANCE_API_KEY and BINANCE_API_SECRET before running this script.
+# Binance AK/SK are loaded from the trading_accounts database table.
 export BINANCE_TESTNET="${BINANCE_TESTNET:-true}"
 
 cd "$(dirname "$0")"

@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 
+MIN_1H_CANDLES = 50
+
+
 @dataclass(frozen=True)
 class CandleState:
     latest_15m: datetime | None
@@ -108,11 +111,11 @@ def assess_dual_market_readiness(now, spot, futures):
         ("spot_15m_age", spot.latest_15m is not None and now - _utc(spot.latest_15m) <= timedelta(minutes=20)),
         ("spot_1h_age", spot.latest_1h is not None and now - _utc(spot.latest_1h) <= timedelta(minutes=75)),
         ("spot_15m_count", spot.count_15m >= 32),
-        ("spot_1h_count", spot.count_1h >= 48),
+        ("spot_1h_count", spot.count_1h >= MIN_1H_CANDLES),
         ("futures_15m_age", futures.latest_15m is not None and now - _utc(futures.latest_15m) <= timedelta(minutes=20)),
         ("futures_1h_age", futures.latest_1h is not None and now - _utc(futures.latest_1h) <= timedelta(minutes=75)),
         ("futures_15m_count", futures.count_15m >= 32),
-        ("futures_1h_count", futures.count_1h >= 48),
+        ("futures_1h_count", futures.count_1h >= MIN_1H_CANDLES),
     ]
     failed = [name for name, passed in checks if not passed]
     return ReadinessResult(not failed, ",".join(failed) or None)

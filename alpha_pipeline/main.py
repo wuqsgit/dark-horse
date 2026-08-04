@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -18,9 +18,21 @@ logger = logging.getLogger("alpha_pipeline")
 ALPHA_UNIVERSE_LIMIT = int(os.getenv("ALPHA_UNIVERSE_LIMIT", "200"))
 ALPHA_MARKET_TOP_N = int(os.getenv("ALPHA_MARKET_TOP_N", "80"))
 ALPHA_COLLECT_INTERVAL_MIN = int(os.getenv("ALPHA_COLLECT_INTERVAL_MIN", "10"))
+ALPHA_DERIVATIVES_INTERVAL_MIN = int(
+    os.getenv("ALPHA_DERIVATIVES_INTERVAL_MIN", "5")
+)
+ALPHA_FAST_INTERVAL_SECONDS = int(
+    os.getenv("ALPHA_FAST_INTERVAL_SECONDS", "60")
+)
 
 
 async def collect_alpha(collector):
+    lock = getattr(collector, "job_lock", None)
+    if lock is not None and lock.locked():
+        logger.info("Alpha full collect skipped: another collector job is active")
+        return
+    if lock is not None:
+        await lock.acquire()
     logger.info("=== Alpha collect ===")
     try:
         purge_old_kline_data(days=RETENTION_DAYS)
@@ -30,12 +42,49 @@ async def collect_alpha(collector):
         )
     except Exception as exc:
         logger.error("Alpha collect failed: %s", exc, exc_info=True)
+    finally:
+        if lock is not None and lock.locked():
+            lock.release()
     logger.info("=== Alpha collect done ===")
+
+
+async def collect_strategy_fast(collector):
+    lock = getattr(collector, "job_lock", None)
+    if lock is not None and lock.locked():
+        return
+    if lock is not None:
+        await lock.acquire()
+    try:
+        result = await collector.collect_strategy_fast_data()
+        if not result.get("skipped") or result.get("depth"):
+            logger.info("Alpha strategy fast feed: %s", result)
+    except Exception as exc:
+        logger.error("Alpha strategy fast feed failed: %s", exc, exc_info=True)
+    finally:
+        if lock is not None and lock.locked():
+            lock.release()
+
+
+async def collect_derivatives(collector):
+    lock = getattr(collector, "job_lock", None)
+    if lock is not None and lock.locked():
+        return
+    if lock is not None:
+        await lock.acquire()
+    try:
+        count = await collector.collect_derivatives()
+        logger.info("Alpha derivatives refreshed: %s symbols", count)
+    except Exception as exc:
+        logger.error("Alpha derivatives refresh failed: %s", exc, exc_info=True)
+    finally:
+        if lock is not None and lock.locked():
+            lock.release()
 
 
 async def run_once():
     init_db()
     collector = AlphaCollector()
+    collector.job_lock = asyncio.Lock()
     try:
         await collect_alpha(collector)
     finally:
@@ -45,6 +94,7 @@ async def run_once():
 async def main():
     init_db()
     collector = AlphaCollector()
+    collector.job_lock = asyncio.Lock()
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         collect_alpha,
@@ -54,6 +104,30 @@ async def main():
         id="alpha_collect",
         replace_existing=True,
         next_run_time=datetime.now(tz=timezone.utc),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        collect_strategy_fast,
+        "interval",
+        seconds=ALPHA_FAST_INTERVAL_SECONDS,
+        args=[collector],
+        id="alpha_strategy_fast",
+        replace_existing=True,
+        next_run_time=datetime.now(tz=timezone.utc) + timedelta(seconds=120),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        collect_derivatives,
+        "interval",
+        minutes=ALPHA_DERIVATIVES_INTERVAL_MIN,
+        args=[collector],
+        id="alpha_derivatives",
+        replace_existing=True,
+        next_run_time=datetime.now(tz=timezone.utc) + timedelta(seconds=60),
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.start()
     logger.info("Alpha pipeline scheduler started")

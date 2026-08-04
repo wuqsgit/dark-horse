@@ -117,6 +117,19 @@ class NormalSoftExitTest(unittest.TestCase):
                 self.assertTrue(_normal_soft_exit_in_cooldown("XPINUSDT", 60))
                 self.assertFalse(_normal_soft_exit_in_cooldown("OTHERUSDT", 60))
 
+    def test_cooldown_reads_successful_partial_close_from_trade_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(db, "DB_PATH", os.path.join(tmp, "test.db")):
+                db.init_db()
+                db.record_trade(
+                    "ETHUSDT", "LONG", 0.25, 3000, 3100, 25, 3.3,
+                    "bluechip_trend_warning ema_ratio=0.99 slope=-0.1 pnl=3.3%",
+                    "A1", 70,
+                )
+
+                self.assertTrue(_normal_soft_exit_in_cooldown("ETHUSDT", 60))
+                self.assertFalse(_normal_soft_exit_in_cooldown("BTCUSDT", 60))
+
 
 if __name__ == "__main__":
     unittest.main()

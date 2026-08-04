@@ -5,7 +5,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 cd "$ROOT_DIR"
 
-source .env 2>/dev/null || true
+if [ -f ".env" ]; then
+  set -a
+  source .env
+  set +a
+fi
 
 RUNTIME_DIR="${DARK_HORSE_RUNTIME_DIR:-/tmp}"
 mkdir -p "$RUNTIME_DIR"
@@ -31,8 +35,32 @@ else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
+if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+  echo "  FAIL Python 3.10+ is required (Python 3.11 recommended): $PYTHON_BIN"
+  exit 1
+fi
+if ! "$PYTHON_BIN" -c 'import fastapi, uvicorn' >/dev/null 2>&1; then
+  echo "  FAIL Python dependencies are missing for $PYTHON_BIN"
+  echo "       Run: $PYTHON_BIN -m pip install -r api/requirements.txt -r ai_service/requirements.txt -r engine/requirements.txt -r pipeline/requirements.txt"
+  exit 1
+fi
+
+SERVICE_HOST="${DARK_HORSE_SERVICE_HOST:-127.0.0.1}"
+FRONTEND_HOST="${DARK_HORSE_FRONTEND_HOST:-127.0.0.1}"
+if [ -z "${DARK_HORSE_API_TOKEN:-}" ]; then
+  API_TOKEN_FILE="${DARK_HORSE_API_TOKEN_FILE:-$RUNTIME_DIR/dark_horse_api_token}"
+  if [ ! -s "$API_TOKEN_FILE" ]; then
+    umask 077
+    "$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(32))' > "$API_TOKEN_FILE"
+  fi
+  DARK_HORSE_API_TOKEN="$(tr -d '\r\n' < "$API_TOKEN_FILE")"
+  export DARK_HORSE_API_TOKEN
+  echo "  Admin token: $API_TOKEN_FILE"
+fi
+
 echo "Dark Horse restarting..."
 echo "  Python: $PYTHON_BIN"
+echo "  Bind: $SERVICE_HOST (frontend: $FRONTEND_HOST)"
 
 process_is_running() {
   local pid="$1"
@@ -190,38 +218,40 @@ stop_service "Trader" "$RUNTIME_DIR/alphadog_trader.pid" "trader.runner"
 stop_service "API" "$RUNTIME_DIR/alphadog_api.pid" "api.main:app" 8000
 stop_service "Frontend" "$RUNTIME_DIR/alphadog_frontend.pid" "vite" 3000
 
-start_service "API" "$RUNTIME_DIR/alphadog_api.pid" "$RUNTIME_DIR/alphadog_api.log" \
-  "$PYTHON_BIN" -m uvicorn api.main:app --host 0.0.0.0 --port 8000
-wait_for_port 8000 "API" "$RUNTIME_DIR/alphadog_api.log" 90
-
 start_service "AI Entry Quality" "$RUNTIME_DIR/alphadog_ai.pid" "$RUNTIME_DIR/alphadog_ai.log" \
-  "$PYTHON_BIN" -m uvicorn ai_service.main:app --host 0.0.0.0 --port 8010
+  "$PYTHON_BIN" -m uvicorn ai_service.main:app --host "$SERVICE_HOST" --port 8010
 wait_for_port 8010 "AI Entry Quality" "$RUNTIME_DIR/alphadog_ai.log" 60
+
+start_service "API" "$RUNTIME_DIR/alphadog_api.pid" "$RUNTIME_DIR/alphadog_api.log" \
+  "$PYTHON_BIN" -m uvicorn api.main:app --host "$SERVICE_HOST" --port 8000
+wait_for_port 8000 "API" "$RUNTIME_DIR/alphadog_api.log" 90
 
 start_service "Pipeline" "$RUNTIME_DIR/alphadog_pipeline.pid" "$RUNTIME_DIR/alphadog_pipeline.log" \
   "$PYTHON_BIN" pipeline/main.py
-sleep 0.5
+sleep 1
 
 start_service "Alpha Pipeline" "$RUNTIME_DIR/alphadog_alpha_pipeline.pid" "$RUNTIME_DIR/alphadog_alpha_pipeline.log" \
   "$PYTHON_BIN" -m alpha_pipeline.main
-sleep 0.5
+sleep 1
 
 start_service "Engine" "$RUNTIME_DIR/alphadog_engine.pid" "$RUNTIME_DIR/alphadog_engine.log" \
   "$PYTHON_BIN" engine/run.py
-sleep 0.5
+sleep 1
 
 start_service "Alpha Engine" "$RUNTIME_DIR/alphadog_alpha_engine.pid" "$RUNTIME_DIR/alphadog_alpha_engine.log" \
   "$PYTHON_BIN" -m alpha_engine.run
-sleep 0.5
+sleep 1
 
 start_service "Trader" "$RUNTIME_DIR/alphadog_trader.pid" "$RUNTIME_DIR/alphadog_trader.log" \
   "$PYTHON_BIN" -m trader.runner
-sleep 0.5
+sleep 1
 
 (
   cd frontend
+  echo "  BUILD Frontend"
+  npm run build >/tmp/alphadog_frontend_build.log 2>&1
   start_service "Frontend" "$RUNTIME_DIR/alphadog_frontend.pid" "$RUNTIME_DIR/alphadog_frontend.log" \
-    npx vite --host 0.0.0.0 --port 3000
+    npx vite preview --host "$FRONTEND_HOST" --port 3000
 )
 wait_for_port 3000 "Frontend" "$RUNTIME_DIR/alphadog_frontend.log" 30
 

@@ -32,6 +32,36 @@ class ExchangeSymbolInfoTest(unittest.TestCase):
         self.assertEqual(info["min_notional"], 5.0)
         self.assertEqual(info["tick_size"], 0.1)
 
+    def test_symbol_info_failure_does_not_use_unsafe_generic_rules(self):
+        exchange = BinanceFutures.__new__(BinanceFutures)
+        exchange.base_rest = "https://example.test"
+        exchange.api_key = "key"
+        with patch(
+            "trader.exchange.httpx.get",
+            side_effect=OSError("exchange info unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot safely size"):
+                exchange.get_symbol_info("NEWCOINUSDT")
+
+    def test_stop_trigger_uses_tick_size_and_rounds_away_from_market(self):
+        exchange = BinanceFutures.__new__(BinanceFutures)
+        exchange.get_symbol_info = lambda symbol: {
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "max_qty": 1000,
+            "min_notional": 5.0,
+            "tick_size": 0.1,
+        }
+        exchange.adjust_quantity = lambda symbol, quantity: quantity
+        requests = []
+        exchange._request = lambda method, path, signed, params: requests.append(params) or {"algoId": 1}
+
+        exchange.place_stop_order("PAXGUSDT", "SELL", 0.266, 3968.09392)
+        exchange.place_stop_order("PAXGUSDT", "BUY", 0.266, 3968.09392)
+
+        self.assertEqual(requests[0]["triggerPrice"], 3968.0)
+        self.assertEqual(requests[1]["triggerPrice"], 3968.1)
+
 
 if __name__ == "__main__":
     unittest.main()

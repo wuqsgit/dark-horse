@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 from alpha_engine.volume_regime import classify_alpha_volume_regime
@@ -8,6 +9,7 @@ from trader.execution import (
     _alpha_discovery_position_factor,
     _alpha_position_factor,
     _evaluate_alpha_breakout_bars,
+    _safe_alpha_futures_breakout_confirmation,
 )
 
 
@@ -149,6 +151,17 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         bars[-1]["close"] = 10.2
         ok, _, _ = _evaluate_alpha_breakout_bars(bars)
         self.assertFalse(ok)
+
+    def test_breakout_lookup_failure_becomes_safe_rejection(self):
+        with patch(
+            "trader.execution._check_alpha_futures_breakout_confirmation",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            ok, reason, info = _safe_alpha_futures_breakout_confirmation("AKEUSDT")
+
+        self.assertFalse(ok)
+        self.assertIn("database unavailable", reason)
+        self.assertEqual(info["error"], "database unavailable")
 
     def test_trend_score_is_not_an_entry_parameter(self):
         raw = _features(alpha_volume=4.2, futures_volume=1.8, oi4=0.01, oi24=0.0, trend=20)

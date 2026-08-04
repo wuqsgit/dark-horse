@@ -118,13 +118,14 @@ dark-horse/
 cp .env.example .env
 ```
 
-填入 Binance Testnet API Key：
+交易账户及 Binance AK/SK 不再写入 `.env`。启动后在“实盘 → 账户管理”中新增或编辑账户，密钥会加密保存到 `trading_accounts` 表。`.env` 只需保留行情环境及稳定的账户加密主密钥：
 
 ```env
 BINANCE_TESTNET=true
-TESTNET_API_KEY=your_testnet_key
-TESTNET_API_SECRET=your_testnet_secret
+ACCOUNT_SECRET_KEY=replace-with-a-long-stable-random-secret
 ```
+
+如果不设置 `ACCOUNT_SECRET_KEY`，系统会使用项目根目录的 `.account_secret.key`；部署和迁移时必须保留该文件，否则数据库中已有的 AK/SK 将无法解密。
 
 ### 2. 启动后端 API
 

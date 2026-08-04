@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.db import get_conn
-from trader.config import TRADING_CONFIG
+from trader.config import PORTFOLIO_RISK, TRADING_CONFIG
 from trader.symbol_risk import get_symbol_risk
 
 logger = logging.getLogger("selection")
@@ -253,38 +253,40 @@ class CandidateSelector:
         max_positions: int = 3,
     ) -> list:
         pos_symbols = {p["symbol"].upper() for p in current_positions}
+        category_limit = max(
+            1, int(PORTFOLIO_RISK.get("max_positions_per_category", 1))
+        )
+        occupied_categories: dict[str, int] = {}
+        for position in current_positions:
+            category = str(
+                (get_symbol_risk(position.get("symbol")) or {}).get("class")
+                or "narrative"
+            )
+            occupied_categories[category] = occupied_categories.get(category, 0) + 1
         available = []
         for raw in scored_symbols:
             row = _as_dict(raw).copy()
             symbol = row.get("symbol", "").upper()
             if not symbol or symbol in pos_symbols or symbol in self.blacklist:
                 continue
-            row["selection_category"] = self._get_category(symbol)
+            row["selection_category"] = str(
+                (get_symbol_risk(symbol) or {}).get("class") or "narrative"
+            )
             row["selection_score"] = self._opportunity_score(row)
             available.append(row)
 
         available.sort(key=lambda x: x["selection_score"], reverse=True)
 
         selected = []
-        category_counts: dict[str, int] = {}
+        category_counts = dict(occupied_categories)
         for row in available:
             category = row["selection_category"]
-            limit = self.CATEGORY_LIMITS.get(category, self.CATEGORY_LIMITS[DEFAULT_CATEGORY])
-            if category_counts.get(category, 0) >= limit:
+            if category_counts.get(category, 0) >= category_limit:
                 continue
             selected.append(row)
             category_counts[category] = category_counts.get(category, 0) + 1
             if len(selected) >= max_positions:
                 break
-
-        if len(selected) < max_positions:
-            selected_symbols = {r["symbol"] for r in selected}
-            for row in available:
-                if row["symbol"] in selected_symbols:
-                    continue
-                selected.append(row)
-                if len(selected) >= max_positions:
-                    break
 
         logger.info(
             "[Selection] %s candidates: %s",

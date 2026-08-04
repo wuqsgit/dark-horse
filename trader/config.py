@@ -20,13 +20,7 @@ def _load_local_env():
 
 _load_local_env()
 
-_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
-
-EXCHANGE_CONFIG = {
-    "api_key": os.getenv("TESTNET_API_KEY" if _TESTNET else "BINANCE_API_KEY", ""),
-    "api_secret": os.getenv("TESTNET_API_SECRET" if _TESTNET else "BINANCE_API_SECRET", ""),
-    "testnet": _TESTNET,
-}
+_DEFAULT_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
 
 TRADING_CONFIG = {
     # ── 资金管理 ──
@@ -270,16 +264,89 @@ TRADING_CONFIG = {
         "position_soft_exit_profit_pct": 2.0,
         "position_profit_protect_close_pct": 0.25,
         "position_hard_stop_pct": 0.10,  # 当前仓位保证金亏损 10% 强制平仓
+        "trend_management": {
+            "enabled": True,
+            # Only fully closed 15m bars can trigger these rules.
+            "weak_lookback_candles": 3,
+            "weak_close_pct": 0.30,
+            "weak_cooldown_minutes": 30,
+            "structure_lookback_candles": 3,
+        },
+        "profit_lock": {
+            "enabled": True,
+            # All thresholds below are margin ROI percentages. They are kept
+            # separate from the unlevered price-return/R-multiple model.
+            "arm_peak_roi": 6.0,
+            "arm_lock_roi": 0.5,
+            "stage1_peak_roi": 10.0,
+            "stage1_close_pct": 0.25,
+            "stage1_lock_roi": 2.0,
+            "stage2_peak_roi": 15.0,
+            "stage2_close_pct": 0.20,
+            "stage2_lock_roi": 6.0,
+            "runner_peak_roi": 25.0,
+            "runner_lock_ratio": 0.50,
+            "runner_giveback_ratio": 0.35,
+            # A profitable partial exit creates a trade-level budget. The
+            # remaining position may give back at most this share of it.
+            "realized_profit_giveback_ratio": 0.35,
+            "realized_profit_min_usdt": 0.50,
+            "realized_profit_min_margin_ratio": 0.01,
+            # Spike-and-stall protection uses only fully closed 15m candles.
+            "stall_peak_roi": 8.0,
+            "stall_close_pct": 0.30,
+            "stall_lock_ratio": 0.40,
+            "stall_lookback_candles": 3,
+            "stall_rearm_atr": 1.0,
+            "stall_max_trend_score": 60,
+        },
         "post_close_cooldown_minutes": 45,
         "loss_cooldown_minutes": 120,
         "stop_cooldown_minutes": 180,
         "blocked_profiles": ["high_risk_watch"],
         "allowed_entry_levels": ["probe", "candidate"],
     },
+    "alpha_strategy_v2": {
+        "enabled": os.getenv("ALPHA_STRATEGY_V2_ENABLED", "false").lower()
+        in ("1", "true", "yes", "on"),
+        "mode": os.getenv("ALPHA_STRATEGY_V2_MODE", "shadow").strip().lower(),
+        "market_env": os.getenv(
+            "ALPHA_FUTURES_MARKET_ENV",
+            "testnet" if _DEFAULT_TESTNET else "mainnet",
+        ).strip().lower(),
+        "worker_interval_seconds": 60,
+        "closed_bar_delay_seconds": 5,
+        "feature_schema_version": 3,
+        "setup_watch_threshold": 0.55,
+        "setup_arm_threshold": 0.62,
+        "trigger_followthrough_threshold": 0.65,
+        "trigger_fakeout_max": 0.35,
+        "acceptance_followthrough_threshold": 0.70,
+        "acceptance_fakeout_max": 0.25,
+        "watch_ttl_hours": 12,
+        "armed_ttl_hours": 4,
+        "acceptance_ttl_bars": 2,
+        "wait_retest_ttl_hours": 4,
+        "probe_stage_cap": 0.30,
+        "confirmed_stage_cap": 0.70,
+        "retest_stage_cap": 1.00,
+        "mainnet_canary_factor": 0.25,
+        "max_alpha_positions": 2,
+        "signal_ttl_minutes": 90,
+        "legacy_alpha_entry_enabled": os.getenv(
+            "ALPHA_LEGACY_ENTRY_ENABLED",
+            "true",
+        ).lower() in ("1", "true", "yes", "on"),
+        "ai_timeout_ms": 300,
+        "ai_failure_mode": "hold_state",
+    },
     "roll_trading": {
         "enabled": True,
         "max_layers": 3,
         "trigger_r": 1.5,
+        # Every profitable position can pyramid as R expands. A healthy
+        # pullback/recovery remains an alternative trigger for later layers.
+        "layer_trigger_r": [1.5, 2.5, 3.5],
         "add_initial_qty_pct": 0.25,
         "layer_add_initial_qty_pct": [0.25, 0.20, 0.15],
         "max_total_qty_multiple": 1.10,
@@ -305,6 +372,7 @@ HARD_FILTERS = {
 PORTFOLIO_RISK = {
     "max_total_exposure_pct": 0.80,     # 总仓位不超过80%资金
     "max_single_exposure_pct": 0.30,    # 单币不超过30%资金
+    "max_positions_per_category": 1,    # 每个风险类别最多持有1个币
     "max_category_exposure_pct": 0.50,   # 同类(蓝/基本面/叙事/Meme)不超过50%
     "max_daily_loss_pct": 0.15,        # 日亏损超过15%停止开仓
     "max_consecutive_losses": 3,        # 连续3笔亏损停止开仓
