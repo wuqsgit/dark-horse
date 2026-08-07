@@ -60,13 +60,13 @@ class AIServiceAPITest(unittest.TestCase):
     def test_alpha_strategy_v2_collects_shadow_sample_through_api(self):
         payload = {
             "request_id": "AKEUSDT:2026-07-28T04:00:00Z:setup:v3",
-            "market_env": "testnet",
+            "market_env": "mainnet",
             "alpha_symbol": "AKEALPHAUSDT",
             "futures_symbol": "AKEUSDT",
             "stage": "setup",
             "setup_type": "accumulation",
             "candle_close_time": "2026-07-28T04:00:00Z",
-            "feature_schema_version": 3,
+            "feature_schema_version": 4,
             "feature_quality": {"status": "ready", "coverage": 0.9},
             "features": {"range_2h_pct": 1.9, "absorption_score": 78},
         }
@@ -79,7 +79,7 @@ class AIServiceAPITest(unittest.TestCase):
 
         self.assertEqual(evaluation.status_code, 200)
         self.assertEqual(evaluation.json()["status"], "collecting")
-        self.assertEqual(status.json()["feature_schema_version"], 3)
+        self.assertEqual(status.json()["feature_schema_version"], 4)
         self.assertEqual(status.json()["samples"]["total"], 1)
 
 

@@ -34,6 +34,7 @@ class BinanceFutures:
         self.api_secret = cfg.get("api_secret") or ""
         base = "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
         self.base_rest = base
+        self.market_data_rest = "https://fapi.binance.com"
         self.client = self._new_client()
         self.time_offset_ms = 0
         self._last_time_sync = 0.0
@@ -122,6 +123,35 @@ class BinanceFutures:
             resp = send_request()
         if resp.status_code != 200:
             raise Exception(f"API error {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    def _market_request(self, path: str, params: dict | None = None):
+        """Read public strategy inputs from mainnet for every account."""
+        resp = None
+        for attempt in range(3):
+            self._ensure_client()
+            try:
+                resp = self.client.get(
+                    self.market_data_rest + path,
+                    params=dict(params or {}),
+                )
+                break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt >= 2:
+                    raise
+                logger.warning(
+                    "Binance mainnet market-data retry %s/2 for %s after %s",
+                    attempt + 1,
+                    path,
+                    type(exc).__name__,
+                )
+                self._reset_client()
+                time.sleep(0.25 * (attempt + 1))
+        if resp is None:
+            raise RuntimeError(
+                f"Binance market-data request produced no response: {path}"
+            )
+        resp.raise_for_status()
         return resp.json()
 
     def get_balance(self, include_upnl: bool = False) -> float:
@@ -414,11 +444,17 @@ class BinanceFutures:
         return {"orderId": "testnet_tp_skip", "msg": "testnet skip take-profit order"}
 
     def get_mark_price(self, symbol: str) -> float:
-        data = self._request("GET", f"/fapi/v1/premiumIndex?symbol={symbol}")
+        data = self._market_request(
+            "/fapi/v1/premiumIndex",
+            {"symbol": symbol},
+        )
         return float(data["markPrice"])
 
     def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:
-        return self._request("GET", f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
+        return self._market_request(
+            "/fapi/v1/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit},
+        )
 
     def get_atr(self, symbol: str, period: int = 14) -> float:
         klines = self.get_klines(symbol, "4h", period + 10)
@@ -436,7 +472,10 @@ class BinanceFutures:
         return sum(tr_values[-period:]) / period
 
     def get_depth(self, symbol: str, limit: int = 20) -> dict:
-        return self._request("GET", f"/fapi/v1/depth?symbol={symbol}&limit={limit}")
+        return self._market_request(
+            "/fapi/v1/depth",
+            {"symbol": symbol, "limit": limit},
+        )
 
     def close(self):
         self.client.close()

@@ -66,7 +66,10 @@ def build_strategy_worker():
         ai_evaluate=ai_client.evaluate,
         machine=machine,
         mode=cfg.get("mode", "shadow"),
-        market_env=cfg.get("market_env", "testnet"),
+        market_env=cfg.get("market_env", "mainnet"),
+        testnet_live_rule_fallback=bool(
+            cfg.get("testnet_live_rule_fallback", False)
+        ),
     )
 
 

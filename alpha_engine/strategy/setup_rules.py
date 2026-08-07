@@ -39,7 +39,12 @@ def detect_setup(features: Mapping) -> SetupEvaluation:
     ret_15m = _num(features, "ret_15m")
     volume_15m = _num(features, "quote_volume_ratio_15m")
 
-    scores = {"accumulation": 0.0, "continuation": 0.0, "reclaim": 0.0}
+    scores = {
+        "accumulation": 0.0,
+        "continuation": 0.0,
+        "reclaim": 0.0,
+        "sentiment_reversal": 0.0,
+    }
     reasons = {name: [] for name in scores}
 
     def award(name: str, condition: bool, points: float, reason: str):
@@ -128,7 +133,45 @@ def detect_setup(features: Mapping) -> SetupEvaluation:
         "reclaim_closed_strong",
     )
 
-    setup_type = max(scores, key=scores.get)
+    sentiment_conditions = {
+        "sentiment_fresh": (
+            _num(features, "square_sentiment_available", 0) >= 1
+            and _num(features, "square_sentiment_age_minutes", 999) <= 15
+        ),
+        "bearish_extreme": _num(features, "square_bearish_ratio", 0) >= 0.80,
+        "sample_count": _num(features, "square_effective_post_count", 0) >= 20,
+        "author_diversity": _num(features, "square_unique_authors", 0) >= 15,
+        "author_concentration": (
+            _num(features, "square_top3_author_share", 1) <= 0.35
+        ),
+        "bearish_shift": _num(features, "square_bearish_shift_24h", 0) >= 0.25,
+        "no_substantive_risk": (
+            _num(features, "square_substantive_risk_count", 1) <= 0
+        ),
+        "alpha_score": _num(features, "alpha_discovery_score", 0) >= 80,
+        "spot_volume": _num(features, "spot_volume_ratio_15m", 0) >= 1.5,
+        "futures_volume": (
+            _num(features, "futures_volume_ratio_15m", 0) >= 1.5
+        ),
+        "volume_sync": _num(features, "volume_sync_score", 0) >= 0.65,
+        "spread": _num(features, "spread_pct_current", 99) < 0.35,
+    }
+    if all(sentiment_conditions.values()):
+        scores["sentiment_reversal"] = 100.0
+        reasons["sentiment_reversal"].extend(
+            (
+                "square_extreme_bearishness",
+                "square_sample_quality_confirmed",
+                "alpha_dual_market_volume_confirmed",
+                "no_substantive_project_risk",
+            )
+        )
+
+    setup_type = (
+        "sentiment_reversal"
+        if scores["sentiment_reversal"] >= 100
+        else max(scores, key=scores.get)
+    )
     score = min(100.0, scores[setup_type])
     detected = score >= 60
     return SetupEvaluation(

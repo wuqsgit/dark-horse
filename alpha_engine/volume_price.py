@@ -1,6 +1,8 @@
 """Simple long-only Alpha volume-price entry signal."""
 from __future__ import annotations
 
+from alpha_engine.square_sentiment import evaluate_square_reversal
+
 
 def _num(value, default=0.0):
     try:
@@ -46,7 +48,7 @@ def _state(
     }
 
 
-def evaluate_alpha_volume_price(raw_features, market_price=0):
+def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
     """Evaluate one simple Alpha impulse signal.
 
     Discovery score and symbol eligibility are checked by Trader. This gate only
@@ -118,6 +120,12 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
         "spread_position_factor": round(spread_position_factor, 4),
     }
 
+    square_reversal = evaluate_square_reversal(
+        raw,
+        alpha_score=alpha_score,
+    )
+    metrics["square_reversal"] = square_reversal.get("metrics") or {}
+
     if not raw or not returns or not volume:
         return _state(
             "insufficient_data",
@@ -155,6 +163,19 @@ def evaluate_alpha_volume_price(raw_features, market_price=0):
             "alpha_oi_collapse",
             "observe",
             reasons=[f"OI 24h {oi_change_24h:.2%} <= -5.00% hard limit for alpha long"],
+            metrics=metrics,
+        )
+
+    if square_reversal.get("candidate"):
+        return _state(
+            "alpha_square_sentiment_reversal",
+            "normal_review_probe",
+            allow_long=True,
+            max_position_factor=min(
+                0.5,
+                spread_position_factor,
+            ),
+            reasons=square_reversal.get("reasons"),
             metrics=metrics,
         )
 

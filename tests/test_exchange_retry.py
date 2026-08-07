@@ -12,6 +12,7 @@ class ExchangeRetryTest(unittest.TestCase):
         exchange.api_key = "test"
         exchange.api_secret = "secret"
         exchange.base_rest = "https://example.test"
+        exchange.market_data_rest = "https://fapi.binance.com"
         exchange.time_offset_ms = 0
         exchange._last_time_sync = 1e20
         exchange.client = Mock()
@@ -39,6 +40,21 @@ class ExchangeRetryTest(unittest.TestCase):
             exchange._request("POST", "/fapi/v1/order")
 
         self.assertEqual(exchange.client.request.call_count, 1)
+
+    def test_public_strategy_market_data_always_uses_mainnet(self):
+        exchange = self._exchange()
+        response = Mock(status_code=200)
+        response.json.return_value = {"markPrice": "123.45"}
+        response.raise_for_status.return_value = None
+        exchange.client.get.return_value = response
+
+        price = exchange.get_mark_price("BTCUSDT")
+
+        self.assertEqual(price, 123.45)
+        exchange.client.get.assert_called_once_with(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": "BTCUSDT"},
+        )
 
 
 if __name__ == "__main__":

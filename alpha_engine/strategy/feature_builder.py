@@ -15,7 +15,7 @@ from alpha_engine.strategy.market_data import (
 )
 
 
-FEATURE_SCHEMA_VERSION = 3
+FEATURE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -275,6 +275,8 @@ def build_alpha_feature_snapshot(
     orderbook_snapshots: Iterable[Mapping] | None = None,
     market_context: Mapping[str, Any] | None = None,
     listing_time: datetime | str | None = None,
+    square_sentiment: Mapping[str, Any] | None = None,
+    alpha_discovery_score: float | None = None,
 ) -> AlphaFeatureSnapshot:
     cutoff = _parse_time(cutoff_time)
     if cutoff is None:
@@ -535,6 +537,9 @@ def build_alpha_feature_snapshot(
         else None
     )
     context = dict(market_context or {})
+    square = dict(square_sentiment or {})
+    square_bearish_ratio = _number(square.get("bearish_ratio"))
+    square_baseline = _number(square.get("baseline_bearish_ratio_24h"))
     liquidation_pressure = _number(context.get("liquidation_pressure"))
     if liquidation_pressure is None:
         # Binance does not expose a stable public historical liquidation feed
@@ -662,6 +667,26 @@ def build_alpha_feature_snapshot(
         "listing_age_hours": listing_age_hours,
         "market_phase_code": _number(context.get("market_phase_code")),
         "setup_type_code": _number(context.get("setup_type_code")),
+        "alpha_discovery_score": _number(alpha_discovery_score),
+        "square_sentiment_available": 1.0 if square else 0.0,
+        "square_bearish_ratio": square_bearish_ratio,
+        "square_effective_post_count": _number(
+            square.get("effective_post_count")
+        ),
+        "square_unique_authors": _number(square.get("unique_authors")),
+        "square_top3_author_share": _number(
+            square.get("top3_author_share")
+        ),
+        "square_bearish_shift_24h": (
+            square_bearish_ratio - square_baseline
+            if square_bearish_ratio is not None
+            and square_baseline is not None
+            else None
+        ),
+        "square_substantive_risk_count": _number(
+            square.get("substantive_risk_count")
+        ),
+        "square_sentiment_age_minutes": _number(square.get("age_minutes")),
         **candle,
     }
     range_24h = features["range_24h_pct"]

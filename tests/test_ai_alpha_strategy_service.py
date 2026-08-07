@@ -9,13 +9,13 @@ from ai_service.storage import AIStore
 def _payload():
     return {
         "request_id": "AKEUSDT:2026-07-28T04:00:00Z:setup:v3",
-        "market_env": "testnet",
+        "market_env": "mainnet",
         "alpha_symbol": "AKEALPHAUSDT",
         "futures_symbol": "AKEUSDT",
         "stage": "setup",
         "setup_type": "accumulation",
         "candle_close_time": "2026-07-28T04:00:00Z",
-        "feature_schema_version": 3,
+        "feature_schema_version": 4,
         "feature_quality": {"status": "ready", "coverage": 0.9},
         "features": {
             "range_2h_pct": 1.9,
@@ -100,7 +100,14 @@ class AIAlphaStrategyServiceTest(unittest.TestCase):
         self.assertEqual(created, 1)
         self.assertEqual(len(trigger_samples), 2)
         trigger = next(row for row in trigger_samples if row["stage"] == "trigger")
-        self.assertEqual(trigger["model_key"], "alpha_trigger_v1_testnet")
+        self.assertEqual(trigger["model_key"], "alpha_trigger_v1_mainnet")
+
+    def test_testnet_market_environment_is_rejected(self):
+        payload = _payload()
+        payload["market_env"] = "testnet"
+
+        with self.assertRaisesRegex(ValueError, "must be mainnet"):
+            AlphaStrategyService(self.store).evaluate(payload)
 
     def test_status_reports_live_when_live_model_is_available(self):
         service = AlphaStrategyService(

@@ -174,7 +174,7 @@ class AlphaStrategyRepository:
                         transition.expected_r,
                         json.dumps(dict(transition.model_versions), ensure_ascii=False),
                         json.dumps(list(transition.reasons), ensure_ascii=False),
-                        json.dumps({}, ensure_ascii=False),
+                        json.dumps(dict(transition.metrics), ensure_ascii=False),
                         market_env,
                         symbol,
                         transition.previous_version,
@@ -222,7 +222,7 @@ class AlphaStrategyRepository:
                             transition.expected_r,
                             json.dumps(dict(transition.model_versions), ensure_ascii=False),
                             json.dumps(list(transition.reasons), ensure_ascii=False),
-                            json.dumps({}, ensure_ascii=False),
+                            json.dumps(dict(transition.metrics), ensure_ascii=False),
                         ),
                     )
                 except sqlite3.IntegrityError:
@@ -263,6 +263,7 @@ class AlphaStrategyRepository:
                             "p_fakeout": transition.fakeout_probability,
                             "expected_r": transition.expected_r,
                             "model_versions": dict(transition.model_versions),
+                            "metrics": dict(transition.metrics),
                         },
                         ensure_ascii=False,
                     ),

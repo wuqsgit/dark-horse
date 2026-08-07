@@ -30,6 +30,7 @@ class TriggerEvaluation:
 def evaluate_trigger(
     features: Mapping,
     state: StateRecord | None = None,
+    setup_type: str | None = None,
 ) -> TriggerEvaluation:
     ret_15m = _num(features, "ret_15m", 0.0)
     ret_1h = _num(features, "ret_1h", 0.0)
@@ -66,6 +67,17 @@ def evaluate_trigger(
         and (price_efficiency is None or price_efficiency >= 60)
     )
     normal_ignition = ignition and not overheated and ret_15m <= 8
+    sentiment_reversal = bool(
+        str(setup_type or "").lower() == "sentiment_reversal"
+        and ret_15m >= 0
+        and volume_ratio >= 1.5
+        and close_location >= 0.55
+        and upper_wick <= 0.45
+    )
+    if sentiment_reversal:
+        ignition = True
+        normal_ignition = not overheated
+        reasons.append("square_reversal_price_stabilized")
     if normal_ignition:
         reasons.append("normal_ignition_confirmed")
     elif ignition and overheated:

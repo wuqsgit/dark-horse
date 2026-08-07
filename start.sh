@@ -17,6 +17,7 @@ mkdir -p "$RUNTIME_DIR"
 IS_WINDOWS=0
 NATIVE_ROOT="$ROOT_DIR"
 WINDOWS_STOP_HELPER=""
+WINDOWS_PRESTOP_DONE=0
 if [ -x ".venv/Scripts/python.exe" ]; then
   IS_WINDOWS=1
   PYTHON_BIN="$ROOT_DIR/.venv/Scripts/python.exe"
@@ -24,10 +25,14 @@ if [ -x ".venv/Scripts/python.exe" ]; then
     NATIVE_ROOT="$(cygpath -w "$ROOT_DIR")"
   elif pwd -W >/dev/null 2>&1; then
     NATIVE_ROOT="$(pwd -W)"
+  elif command -v wslpath >/dev/null 2>&1; then
+    NATIVE_ROOT="$(wslpath -w "$ROOT_DIR")"
   fi
   WINDOWS_STOP_HELPER="$ROOT_DIR/scripts/stop_dark_horse_processes.ps1"
   if command -v cygpath >/dev/null 2>&1; then
     WINDOWS_STOP_HELPER="$(cygpath -w "$WINDOWS_STOP_HELPER")"
+  elif command -v wslpath >/dev/null 2>&1; then
+    WINDOWS_STOP_HELPER="$(wslpath -w "$WINDOWS_STOP_HELPER")"
   fi
 elif [ -x ".venv/bin/python" ]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
@@ -118,6 +123,7 @@ stop_matching_processes() {
   local pid
 
   if [ "$IS_WINDOWS" -eq 1 ]; then
+    [ "$WINDOWS_PRESTOP_DONE" -eq 1 ] && return 0
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$WINDOWS_STOP_HELPER" \
       -Root "$NATIVE_ROOT" -Pattern "$pattern" >/dev/null 2>&1 || true
     return 0
@@ -141,6 +147,7 @@ stop_port() {
   local pid
 
   if [ "$IS_WINDOWS" -eq 1 ]; then
+    [ "$WINDOWS_PRESTOP_DONE" -eq 1 ] && return 0
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$WINDOWS_STOP_HELPER" \
       -Root "$NATIVE_ROOT" -Pattern "__dark_horse_no_process_match__" -Ports "$port" \
       >/dev/null 2>&1 || true
@@ -197,7 +204,14 @@ wait_for_port() {
   local attempt
 
   for ((attempt = 0; attempt < timeout_seconds * 2; attempt++)); do
-    if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+    local ready=1
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+      curl.exe --silent --show-error --max-time 1 \
+        --output NUL "http://127.0.0.1:$port/" >/dev/null 2>&1 && ready=0
+    elif (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+      ready=0
+    fi
+    if [ "$ready" -eq 0 ]; then
       echo "  READY $name (port $port)"
       return 0
     fi
@@ -209,8 +223,18 @@ wait_for_port() {
   return 1
 }
 
+if [ "$IS_WINDOWS" -eq 1 ]; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File "$WINDOWS_STOP_HELPER" \
+    -Root "$NATIVE_ROOT" \
+    -Pattern "__dark_horse_all__" \
+    -Ports 3000,8000,8010 >/dev/null 2>&1 || true
+  WINDOWS_PRESTOP_DONE=1
+fi
+
 stop_service "Pipeline" "$RUNTIME_DIR/alphadog_pipeline.pid" "pipeline/main.py"
 stop_service "Alpha Pipeline" "$RUNTIME_DIR/alphadog_alpha_pipeline.pid" "alpha_pipeline.main"
+stop_service "Minute Pipeline" "$RUNTIME_DIR/alphadog_minute_pipeline.pid" "minute_pipeline.main"
 stop_service "Engine" "$RUNTIME_DIR/alphadog_engine.pid" "engine/run.py"
 stop_service "Alpha Engine" "$RUNTIME_DIR/alphadog_alpha_engine.pid" "alpha_engine.run"
 stop_service "AI Entry Quality" "$RUNTIME_DIR/alphadog_ai.pid" "ai_service.main:app" 8010
@@ -232,6 +256,10 @@ sleep 1
 
 start_service "Alpha Pipeline" "$RUNTIME_DIR/alphadog_alpha_pipeline.pid" "$RUNTIME_DIR/alphadog_alpha_pipeline.log" \
   "$PYTHON_BIN" -m alpha_pipeline.main
+sleep 1
+
+start_service "Minute Pipeline" "$RUNTIME_DIR/alphadog_minute_pipeline.pid" "$RUNTIME_DIR/alphadog_minute_pipeline.log" \
+  "$PYTHON_BIN" -m minute_pipeline.main
 sleep 1
 
 start_service "Engine" "$RUNTIME_DIR/alphadog_engine.pid" "$RUNTIME_DIR/alphadog_engine.log" \

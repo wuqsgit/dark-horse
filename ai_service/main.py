@@ -84,7 +84,7 @@ def create_app(
                                 stage=stage,
                                 target=target,
                             )
-                            for env in ("testnet", "mainnet")
+                            for env in ("mainnet",)
                             for stage, target in (
                                 ("setup", "setup_success"),
                                 ("trigger", "followthrough"),

@@ -93,6 +93,31 @@ class AlphaFuturesEnvironmentTest(unittest.TestCase):
             for index in range(count)
         ]
 
+    @staticmethod
+    def _aggregates(market_kind, symbol, interval, latest, count, step, market_env):
+        expected_count = int(step.total_seconds() // 60)
+        return [
+            {
+                "market_kind": market_kind,
+                "source_env": market_env,
+                "symbol": symbol,
+                "interval": interval,
+                "time": (latest - step * index).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.0,
+                "volume": 100.0,
+                "quote_vol": 100.0,
+                "trades": 10,
+                "taker_buy_quote_vol": 50.0,
+                "minute_count": expected_count,
+                "expected_count": expected_count,
+                "is_complete": True,
+            }
+            for index in range(count)
+        ]
+
     def test_candle_freshness_is_interval_and_environment_scoped(self):
         now = datetime.now(timezone.utc).replace(microsecond=0)
         db.insert_futures_candles(
@@ -166,8 +191,54 @@ class AlphaFuturesEnvironmentTest(unittest.TestCase):
         self.assertEqual(len(mainnet), 1)
         self.assertEqual(len(testnet), 1)
 
-    def test_alpha_readiness_uses_requested_futures_environment(self):
+    def test_closed_candle_freshness_ignores_recent_open_candle(self):
         now = datetime.now(timezone.utc).replace(microsecond=0)
+        rows = self._candle_rows(
+            "AKEUSDT",
+            now - timedelta(hours=1),
+            1,
+            timedelta(minutes=15),
+            "mainnet",
+        )
+        open_row = list(
+            self._candle_rows(
+                "AKEUSDT",
+                now,
+                1,
+                timedelta(minutes=15),
+                "mainnet",
+            )[0]
+        )
+        open_row[-1] = 0
+        db.insert_futures_candles(
+            "futures_candles_15m",
+            [*rows, tuple(open_row)],
+        )
+
+        self.assertTrue(
+            db.futures_candles_current(
+                "AKEUSDT",
+                max_age_minutes=20,
+                source_env="mainnet",
+                table="futures_candles_15m",
+            )
+        )
+        self.assertFalse(
+            db.futures_candles_current(
+                "AKEUSDT",
+                max_age_minutes=20,
+                source_env="mainnet",
+                table="futures_candles_15m",
+                closed_only=True,
+            )
+        )
+
+    def test_alpha_readiness_uses_requested_futures_environment(self):
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        latest_15m = now.replace(
+            minute=(now.minute // 15) * 15
+        ) - timedelta(minutes=15)
+        latest_1h = now.replace(minute=0) - timedelta(hours=1)
         db.upsert_market_universe(
             [
                 {
@@ -224,6 +295,35 @@ class AlphaFuturesEnvironmentTest(unittest.TestCase):
                     market_env,
                 ),
             )
+
+        db.upsert_aggregated_candles(
+            self._aggregates(
+                "alpha", "ALPHA_331USDT", "15m",
+                latest_15m, 32, timedelta(minutes=15), "mainnet",
+            )
+            + self._aggregates(
+                "alpha", "ALPHA_331USDT", "1h",
+                latest_1h, 50, timedelta(hours=1), "mainnet",
+            )
+            + self._aggregates(
+                "futures", "AKEUSDT", "15m",
+                latest_15m, 32, timedelta(minutes=15), "mainnet",
+            )
+            + self._aggregates(
+                "futures", "AKEUSDT", "1h",
+                latest_1h, 50, timedelta(hours=1), "mainnet",
+            )
+            + self._aggregates(
+                "futures", "AKEUSDT", "15m",
+                latest_15m - timedelta(hours=2), 32,
+                timedelta(minutes=15), "testnet",
+            )
+            + self._aggregates(
+                "futures", "AKEUSDT", "1h",
+                latest_1h - timedelta(hours=2), 50,
+                timedelta(hours=1), "testnet",
+            )
+        )
 
         mainnet = refresh_universe_readiness(
             "alpha",

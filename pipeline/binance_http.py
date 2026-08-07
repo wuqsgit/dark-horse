@@ -51,12 +51,17 @@ class BinanceHTTPCollector:
             raise ValueError(
                 "BINANCE_FUTURES_DATA_ENV must be mainnet or testnet"
             )
+        self.unified_candles = os.getenv(
+            "UNIFIED_CANDLE_PIPELINE_ENABLED",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.client = httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         logger.info(
-            "Market data endpoints: spot=%s futures=%s source_env=%s",
+            "Market data endpoints: spot=%s futures=%s source_env=%s unified_candles=%s",
             self.spot_base_url,
             self.futures_base_url,
             self.futures_source_env,
+            self.unified_candles,
         )
 
     @staticmethod
@@ -164,7 +169,16 @@ class BinanceHTTPCollector:
             async with semaphore:
                 try:
                     pair = sym.replace("/", "")
-                    interval_tables = (("15m", rows_15m, "futures_candles_15m"), ("1h", rows_1h, "futures_candles_1h"), ("6h", rows_6h, "futures_candles_6h"), ("1d", rows_24h, "futures_candles_24h"))
+                    interval_tables = (
+                        ()
+                        if self.unified_candles
+                        else (
+                            ("15m", rows_15m, "futures_candles_15m"),
+                            ("1h", rows_1h, "futures_candles_1h"),
+                            ("6h", rows_6h, "futures_candles_6h"),
+                            ("1d", rows_24h, "futures_candles_24h"),
+                        )
+                    )
                     for interval, spot_rows, futures_table in interval_tables:
                         for market, target in (("spot", spot_rows), ("futures", futures_rows[futures_table])):
                             url, params = self.kline_request(

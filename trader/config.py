@@ -312,11 +312,11 @@ TRADING_CONFIG = {
         "mode": os.getenv("ALPHA_STRATEGY_V2_MODE", "shadow").strip().lower(),
         "market_env": os.getenv(
             "ALPHA_FUTURES_MARKET_ENV",
-            "testnet" if _DEFAULT_TESTNET else "mainnet",
+            "mainnet",
         ).strip().lower(),
         "worker_interval_seconds": 60,
         "closed_bar_delay_seconds": 5,
-        "feature_schema_version": 3,
+        "feature_schema_version": 4,
         "setup_watch_threshold": 0.55,
         "setup_arm_threshold": 0.62,
         "trigger_followthrough_threshold": 0.65,
@@ -328,6 +328,7 @@ TRADING_CONFIG = {
         "acceptance_ttl_bars": 2,
         "wait_retest_ttl_hours": 4,
         "probe_stage_cap": 0.30,
+        "sentiment_reversal_stage_cap": 0.50,
         "confirmed_stage_cap": 0.70,
         "retest_stage_cap": 1.00,
         "mainnet_canary_factor": 0.25,
@@ -335,10 +336,14 @@ TRADING_CONFIG = {
         "signal_ttl_minutes": 90,
         "legacy_alpha_entry_enabled": os.getenv(
             "ALPHA_LEGACY_ENTRY_ENABLED",
-            "true",
+            "false",
         ).lower() in ("1", "true", "yes", "on"),
         "ai_timeout_ms": 300,
         "ai_failure_mode": "hold_state",
+        "testnet_live_rule_fallback": os.getenv(
+            "ALPHA_V2_TESTNET_RULE_FALLBACK",
+            "true",
+        ).lower() in ("1", "true", "yes", "on"),
     },
     "roll_trading": {
         "enabled": True,

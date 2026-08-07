@@ -131,6 +131,7 @@ class AlphaStrategyStateMachine:
                 reasons=reasons or observation.reasons,
                 model_versions=dict(observation.model_versions),
                 previous_version=previous_version,
+                metrics=dict(observation.metrics),
             )
 
         if current and current.last_candle_close_time:
@@ -191,6 +192,24 @@ class AlphaStrategyStateMachine:
             )
 
         if from_state == AlphaSignalState.IDLE:
+            if (
+                setup_type == "sentiment_reversal"
+                and observation.setup_detected
+                and observation.trigger_detected
+                and not observation.overheated
+                and observation.followthrough_probability
+                >= self.config.trigger_followthrough_threshold
+                and observation.fakeout_probability
+                <= self.config.trigger_fakeout_max
+            ):
+                setup_id = _setup_id(observation)
+                return result(
+                    AlphaSignalState.PROBE_READY,
+                    action=ActionType.PROBE_LONG,
+                    ttl_hours=0.25,
+                    reasons=tuple(observation.reasons)
+                    + ("sentiment_reversal_probe_confirmed",),
+                )
             if (
                 observation.setup_detected
                 and observation.setup_probability >= self.config.setup_watch_threshold

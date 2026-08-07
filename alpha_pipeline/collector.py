@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 import httpx
@@ -59,7 +60,28 @@ class AlphaCollector:
     def __init__(self, market_env=None):
         self.market_env = resolve_market_env(market_env)
         self.futures_base = futures_rest_base(self.market_env)
-        self.client = httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        self.unified_candles = os.getenv(
+            "UNIFIED_CANDLE_PIPELINE_ENABLED",
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.client = self._new_client()
+
+    @staticmethod
+    def _new_client():
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(15, pool=5),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+    async def reset_client(self):
+        previous = self.client
+        self.client = self._new_client()
+        await previous.aclose()
 
     async def close(self):
         await self.client.aclose()
@@ -117,11 +139,16 @@ class AlphaCollector:
         )
 
     async def refresh_universe(self, limit=200):
-        tokens, exchange_symbols, futures_symbols = await asyncio.gather(
+        results = await asyncio.gather(
             self.get_token_list(),
             self.get_exchange_symbols(),
             self.get_futures_symbols(),
+            return_exceptions=True,
         )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise failures[0]
+        tokens, exchange_symbols, futures_symbols = results
         trade_by_symbol = {
             s.get("symbol"): s
             for s in exchange_symbols
@@ -218,12 +245,16 @@ class AlphaCollector:
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         semaphore = asyncio.Semaphore(4)
 
-        interval_map = {
-            "alpha_candles_15m": ("15m", 192),
-            "alpha_candles_1h": ("1h", 120),
-            "alpha_candles_6h": ("6h", 60),
-            "alpha_candles_24h": ("1d", 60),
-        }
+        interval_map = (
+            {}
+            if self.unified_candles
+            else {
+                "alpha_candles_15m": ("15m", 192),
+                "alpha_candles_1h": ("1h", 120),
+                "alpha_candles_6h": ("6h", 60),
+                "alpha_candles_24h": ("1d", 60),
+            }
+        )
 
         async def fetch_one(item):
             symbol = item["source_symbol"]
@@ -283,7 +314,10 @@ class AlphaCollector:
             len(rows_by_table["alpha_candles_15m"]),
             len(depth_rows),
         )
-        await self.collect_mapped_futures_data(selected)
+        await self.collect_mapped_futures_data(
+            selected,
+            include_candles=not self.unified_candles,
+        )
         refresh_universe_readiness(
             "alpha",
             futures_source_env=self.market_env,
@@ -358,6 +392,7 @@ class AlphaCollector:
                                 max_age_minutes=max_age_minutes,
                                 source_env=self.market_env,
                                 table=table,
+                                closed_only=True,
                             ):
                                 continue
                             async def request():
@@ -511,12 +546,33 @@ class AlphaCollector:
 
     async def collect_closed_15m(self, *, force=False) -> dict:
         """Check for new closed 15m Alpha/Futures bars near each boundary."""
+        if self.unified_candles:
+            refresh_universe_readiness(
+                "alpha",
+                futures_source_env=self.market_env,
+            )
+            return {
+                "alpha": 0,
+                "futures": 0,
+                "skipped": True,
+                "source": "unified_1m",
+            }
         now = datetime.now(timezone.utc)
-        if not force and now.minute % 15 > 2:
-            return {"alpha": 0, "futures": 0, "skipped": True}
         selected = self._selected_market_rows()
         if not selected:
             return {"alpha": 0, "futures": 0, "skipped": False}
+        if (
+            not force
+            and now.minute % 15 > 2
+            and futures_candles_current(
+                "BTCUSDT",
+                max_age_minutes=30,
+                source_env=self.market_env,
+                table="futures_candles_15m",
+                closed_only=True,
+            )
+        ):
+            return {"alpha": 0, "futures": 0, "skipped": True}
         alpha_rows = []
         futures_rows = []
         semaphore = asyncio.Semaphore(4)
@@ -629,6 +685,30 @@ class AlphaCollector:
         return len(selected)
 
     async def collect_all(self, universe_limit=200, market_top_n=80):
-        universe = await self.refresh_universe(limit=universe_limit)
+        try:
+            universe = await self.refresh_universe(limit=universe_limit)
+        except Exception as exc:
+            logger.warning(
+                "Alpha universe refresh failed; using persisted universe: %s",
+                exc,
+            )
+            await self.reset_client()
+            universe = [
+                {
+                    "alpha_symbol": row["source_symbol"],
+                    "futures_symbol": row["futures_symbol"],
+                    "volume_24h": row["spot_quote_volume_24h"],
+                    "futures_quote_volume_24h": (
+                        row["futures_quote_volume_24h"]
+                    ),
+                }
+                for row in fetch_market_universe(
+                    "alpha",
+                    selected_only=True,
+                )
+                if row["source_symbol"] and row["futures_symbol"]
+            ]
+            if not universe:
+                raise
         await self.collect_market_data(universe, top_n=market_top_n)
         return universe
