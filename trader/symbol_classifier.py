@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from trader.risk import entry_alpha_for_side, evaluate_short_setup
 
 def _row_dict(row: Any) -> dict:
     if isinstance(row, dict):
@@ -60,11 +61,15 @@ def classify_symbol(row: Any, v3_signals: dict | None = None, side: str | None =
 
     symbol = str(row.get("symbol") or "").upper()
     score = _num(row.get("composite_score"))
-    entry_alpha = _num(row.get("entry_alpha") or raw.get("entry_alpha"))
+    entry_alpha = entry_alpha_for_side(row, side)
     rs = _num(row.get("relative_strength"), 50)
     atr_ratio = _num(tech.get("atr_ratio"))
     ret_6h = _num(tech.get("return_6h"))
-    ret_24h = _num(tech.get("price_change_24h") if tech.get("price_change_24h") is not None else tech.get("return_24h"))
+    ret_24h = _num(
+        tech.get("return_24h")
+        if tech.get("return_24h") is not None
+        else tech.get("price_change_24h")
+    )
     volume_change = _num(tech.get("volume_change_pct"))
     oi_change = _num(fut.get("oi_change_pct") if fut.get("oi_change_pct") is not None else fut.get("oi_change"))
     funding = _num(fut.get("funding_rate"))
@@ -106,7 +111,20 @@ def classify_symbol(row: Any, v3_signals: dict | None = None, side: str | None =
     }
 
     if side == "SHORT" or distributing or is_down:
+        short_setup = evaluate_short_setup(row)
         c = candidates["short_breakdown"]
+        c["score"] = _score_item(
+            c["score"],
+            c["reasons"],
+            32 if side == "SHORT" and short_setup.get("setup") == "breakdown_continuation" else 0,
+            "放量跌破延续",
+        )
+        c["score"] = _score_item(
+            c["score"],
+            c["reasons"],
+            32 if side == "SHORT" and short_setup.get("setup") == "failed_rebound" else 0,
+            "反弹失败",
+        )
         c["score"] = _score_item(c["score"], c["reasons"], 28 if is_down else 0, "趋势偏空")
         c["score"] = _score_item(c["score"], c["reasons"], 22 if distributing else 0, "筹码有出货迹象")
         c["score"] = _score_item(c["score"], c["reasons"], 18 if ret_24h < -0.03 else 0, "24h 跌幅较大")
@@ -151,9 +169,14 @@ def classify_symbol(row: Any, v3_signals: dict | None = None, side: str | None =
     c["score"] = _score_item(c["score"], c["reasons"], 12 if oi_change >= -3 else 0, "OI 未明显恶化")
     c["score"] = _score_item(c["score"], c["reasons"], 10 if score >= 54 and entry_alpha >= 58 else 0, "基础评分达标")
 
-    ranked = sorted(candidates.items(), key=lambda item: item[1]["score"], reverse=True)
+    ranked_pool = (
+        {key: candidates[key] for key in ("short_breakdown", "weak_short")}
+        if side == "SHORT"
+        else candidates
+    )
+    ranked = sorted(ranked_pool.items(), key=lambda item: item[1]["score"], reverse=True)
     profile, best = ranked[0]
-    if best["score"] < 30:
+    if best["score"] < 30 and side != "SHORT":
         profile = "accumulation" if is_low else "breakout"
         best = candidates[profile]
 

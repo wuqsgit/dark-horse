@@ -590,7 +590,7 @@ CREATE TABLE fills (
             fee_asset TEXT DEFAULT 'USDT',
             trade_id TEXT,
             created_at TEXT DEFAULT (datetime('now'))
-        , position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, account_id INTEGER NOT NULL DEFAULT 1);
+        , position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, account_id INTEGER NOT NULL DEFAULT 1, position_side TEXT, exchange_order_id TEXT);
 
 CREATE TABLE futures_candles_15m (
                 time TEXT,

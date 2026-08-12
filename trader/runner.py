@@ -382,6 +382,7 @@ def fetch_and_store_income(ex, days_back=7):
     from shared.db import (
         backfill_income_ledger_from_fills,
         rebuild_position_trades_from_income,
+        upsert_exchange_fill,
         upsert_exchange_income,
     )
     conn = get_conn()
@@ -432,6 +433,32 @@ def fetch_and_store_income(ex, days_back=7):
         funding = [i for i in inc_data if i.get("incomeType") == "FUNDING_FEE"]
         commission = [i for i in inc_data if i.get("incomeType") == "COMMISSION"]
 
+        # Income rows contain money only. Pull user trades as well so closed
+        # positions retain their real direction, quantity and execution prices.
+        trade_count = 0
+        incomplete_symbols = {
+            str(row["symbol"] or "").upper()
+            for row in conn.execute(
+                """SELECT DISTINCT symbol FROM position_trades
+                   WHERE account_id=? AND symbol!='ACCOUNT'
+                     AND (side IS NULL OR quantity IS NULL OR entry_price IS NULL OR exit_price IS NULL)""",
+                (account_id,),
+            ).fetchall()
+            if row["symbol"]
+        }
+        income_symbols = sorted(
+            {str(i.get("symbol") or "").upper() for i in inc_data if i.get("symbol")}
+            | incomplete_symbols
+        )
+        for symbol in income_symbols:
+            try:
+                trade_start = None if symbol in incomplete_symbols else start_ts
+                for trade in ex.fetch_user_trades(symbol, start_time=trade_start, limit=1000):
+                    upsert_exchange_fill(trade)
+                    trade_count += 1
+            except Exception as e:
+                logger.warning("user trade sync error %s: %s", symbol, e)
+
         # 汇总按币种
         by_symbol = defaultdict(float)
         for i in real_pnl:
@@ -439,7 +466,7 @@ def fetch_and_store_income(ex, days_back=7):
             income = float(i.get("income", 0))
             by_symbol[sym] += income
 
-        logger.info(f"Income sync: {len(real_pnl)} PnL, {len(funding)} funding, {len(commission)} commission, ledger={ledger_count}")
+        logger.info(f"Income sync: {len(real_pnl)} PnL, {len(funding)} funding, {len(commission)} commission, ledger={ledger_count}, trades={trade_count}")
         
         # 打印按币种汇总
         for sym, pnl in sorted(by_symbol.items(), key=lambda x: -x[1]):

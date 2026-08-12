@@ -40,12 +40,63 @@ class MultiAccountTradingTest(unittest.TestCase):
             conn.close()
         self.assertEqual([(row["account_id"], row["pnl"]) for row in rows], [(1, 1.25), (2, -0.75)])
 
+    def test_income_rebuild_recovers_position_fields_from_user_trades(self):
+        user_trades = [
+            {"symbol": "LISTAUSDT", "id": 1, "orderId": 101, "side": "BUY", "positionSide": "BOTH", "qty": "8438", "price": "0.0605", "realizedPnl": "0", "commission": "0.2552495", "time": 1786266347177},
+            {"symbol": "LISTAUSDT", "id": 2, "orderId": 102, "side": "SELL", "positionSide": "BOTH", "qty": "2109", "price": "0.0629", "realizedPnl": "5.0616", "commission": "0.06632805", "time": 1786285767915},
+            {"symbol": "LISTAUSDT", "id": 3, "orderId": 103, "side": "BUY", "positionSide": "BOTH", "qty": "2109", "price": "0.0643", "realizedPnl": "0", "commission": "0.06780435", "time": 1786296276780},
+            {"symbol": "LISTAUSDT", "id": 4, "orderId": 104, "side": "SELL", "positionSide": "BOTH", "qty": "8438", "price": "0.0637", "realizedPnl": "18.9874", "commission": "0.2687503", "time": 1786297212488},
+        ]
+        for trade in user_trades:
+            db.upsert_exchange_fill(trade)
+        for trade_id, income, timestamp in ((2, 5.0616, 1786285767915), (4, 18.9874, 1786297212488)):
+            db.upsert_exchange_income({
+                "symbol": "LISTAUSDT", "incomeType": "REALIZED_PNL", "income": income,
+                "asset": "USDT", "time": timestamp, "tradeId": trade_id,
+            })
+
+        db.rebuild_position_trades_from_income()
+
+        conn = db.get_conn()
+        try:
+            row = conn.execute("SELECT * FROM position_trades WHERE symbol='LISTAUSDT'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["side"], "LONG")
+        self.assertAlmostEqual(row["quantity"], 10547)
+        self.assertAlmostEqual(row["entry_price"], (8438 * 0.0605 + 2109 * 0.0643) / 10547)
+        self.assertAlmostEqual(row["exit_price"], (2109 * 0.0629 + 8438 * 0.0637) / 10547)
+        self.assertIsNotNone(row["pnl_pct"])
+
     def test_account_context_restores_previous_account(self):
         self.assertEqual(db.current_account_id(), 1)
         token = db.set_account_context(4)
         self.assertEqual(db.current_account_id(), 4)
         db.reset_account_context(token)
         self.assertEqual(db.current_account_id(), 1)
+
+    def test_single_strategy_decision_uses_current_account(self):
+        token = db.set_account_context(4)
+        try:
+            db.record_strategy_decision(
+                symbol="ETHUSDT",
+                run_id="account-4-diagnostic",
+                decision_stage="safety_filter",
+                decision_result="filtered",
+                filter_reason="test",
+            )
+        finally:
+            db.reset_account_context(token)
+
+        conn = db.get_conn()
+        try:
+            row = conn.execute(
+                "SELECT account_id FROM strategy_decisions WHERE run_id=?",
+                ("account-4-diagnostic",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["account_id"], 4)
 
     def test_delete_account_is_blocked_when_position_exists(self):
         from shared.accounts import delete_account, save_account

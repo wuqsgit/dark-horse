@@ -348,13 +348,16 @@ TRADING_CONFIG = {
     "roll_trading": {
         "enabled": True,
         "max_layers": 3,
+        "short_max_layers": 2,
         "trigger_r": 1.5,
         # Every profitable position can pyramid as R expands. A healthy
         # pullback/recovery remains an alternative trigger for later layers.
         "layer_trigger_r": [1.5, 2.5, 3.5],
         "add_initial_qty_pct": 0.25,
         "layer_add_initial_qty_pct": [0.25, 0.20, 0.15],
+        "short_layer_add_initial_qty_pct": [0.50, 0.35],
         "max_total_qty_multiple": 1.10,
+        "short_max_total_qty_multiple": 1.50,
         "repeat_pullback_atr": 0.75,
         "repeat_recover_to_peak_atr": 0.25,
         "repeat_min_r": 1.0,
@@ -363,6 +366,15 @@ TRADING_CONFIG = {
         "trailing_atr_multiplier": 2.0,
         "min_remaining_margin": 5.0,
         "min_notional_multiplier": 1.5,
+    },
+    "short_trading": {
+        "enabled": True,
+        "min_entry_alpha": 65,
+        "full_position_alpha": 72,
+        "probe_position_factor": 0.50,
+        "negative_funding_reduce_at": -0.001,
+        "negative_funding_block_at": -0.003,
+        "max_short_positions": 2,
     },
 }
 

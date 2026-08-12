@@ -5,6 +5,11 @@ import json
 import os
 from typing import Any
 
+from trader.risk import (
+    entry_alpha_for_side,
+    evaluate_short_setup,
+    is_adverse_funding_rate,
+)
 from trader.symbol_classifier import classify_symbol
 from trader.symbol_risk import get_symbol_risk
 
@@ -58,11 +63,15 @@ def _has(text: str, *terms: str) -> bool:
     return any(term.lower() in text for term in terms)
 
 
-def get_entry_profile(symbol: str, classified_profile: str | None = None) -> dict:
+def get_entry_profile(
+    symbol: str,
+    classified_profile: str | None = None,
+    side: str | None = None,
+) -> dict:
     data = _load_profiles()
     symbol = symbol.upper()
     symbol_cfg = dict(data.get("symbols", {}).get(symbol, {}))
-    if symbol_cfg.get("template_locked"):
+    if symbol_cfg.get("template_locked") and str(side or "").upper() != "SHORT":
         template_key = symbol_cfg.get("template")
     elif data.get("auto_classification", True) and classified_profile:
         template_key = classified_profile
@@ -102,7 +111,7 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     raw = _raw_features(row)
     classification = classify_symbol(row, v3_signals, side)
     symbol = str(row.get("symbol") or "").upper()
-    profile = get_entry_profile(symbol, classification.get("profile"))
+    profile = get_entry_profile(symbol, classification.get("profile"), side=side)
     symbol_risk = get_symbol_risk(symbol)
 
     tech = raw.get("technical") or {}
@@ -112,12 +121,20 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     cooldown = (v3_signals or {}).get("cooldown") or {}
     rr = (v3_signals or {}).get("rr") or {}
 
-    score = _num(row.get("composite_score"))
-    entry_alpha = _num(row.get("entry_alpha") or raw.get("entry_alpha"))
+    entry_alpha = entry_alpha_for_side(row, side)
+    score = (
+        entry_alpha
+        if str(side or "").upper() == "SHORT"
+        else _num(row.get("composite_score"))
+    )
     rs = _num(row.get("relative_strength"), 50)
     atr_ratio = _num(tech.get("atr_ratio"))
     ret_6h = _num(tech.get("return_6h"))
-    ret_24h = _num(tech.get("price_change_24h") if tech.get("price_change_24h") is not None else tech.get("return_24h"))
+    ret_24h = _num(
+        tech.get("return_24h")
+        if tech.get("return_24h") is not None
+        else tech.get("price_change_24h")
+    )
     funding_rate = _num(fut.get("funding_rate"))
     oi_change = _num(fut.get("oi_change_pct") if fut.get("oi_change_pct") is not None else fut.get("oi_change"))
     volume_change = _num(tech.get("volume_change_pct"))
@@ -157,7 +174,8 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     breakout_ok = bool(breakout.get("ok"))
     volume_ok = volume_ratio >= min_vol if min_vol else True
     oi_ok = oi_change >= 0
-    short_structure_ok = downtrend_ok and (is_high or ret_24h < 0)
+    short_setup = evaluate_short_setup(row) if side == "SHORT" else {}
+    short_structure_ok = bool(short_setup.get("eligible"))
     allowed_templates = symbol_risk.get("allowed_templates") or []
     risk_template_ok = not allowed_templates or profile.get("template") in set(allowed_templates)
     template_position_factor = _num(profile.get("position_size_factor"), 1.0)
@@ -194,7 +212,13 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     confirmations.append(_confirmation("开仓信号", entry_alpha >= min_entry_alpha, f"Entry Alpha {entry_alpha:.1f} 已达到 {min_entry_alpha:g}", f"Entry Alpha {entry_alpha:.1f} 未达到 {min_entry_alpha:g}", kind="base"))
 
     if profile.get("template") in ("short_breakdown", "weak_short"):
-        confirmations.append(_confirmation("空头结构", short_structure_ok, "趋势/结构支持做空", "空头结构还不够明确", kind="template"))
+        confirmations.append(_confirmation(
+            "空头结构",
+            short_structure_ok,
+            f"空头形态成立：{short_setup.get('setup')}",
+            "尚未形成放量跌破或反弹失败，或当前已经超跌不宜追空",
+            kind="template",
+        ))
         confirmations.append(_confirmation("盘口卖压", depth_short_ok, f"盘口卖压可接受 depth_ratio={depth_ratio:.2f}", f"盘口卖压不足 depth_ratio={depth_ratio:.2f}", required=False, kind="context"))
         if profile.get("require_weak_rs") is not None:
             confirmations.append(_confirmation("相对弱势", is_weak, f"RS {rs:.1f} 偏弱", f"RS {rs:.1f} 还不够弱", kind="template"))
@@ -219,8 +243,8 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
         confirmations.append(_confirmation(
             "early_probe",
             early_probe_ok,
-            f"early probe ok: distance {distance_to_breakout * 100:.1f}%, vol {volume_ratio:.2f}x, R:R {rr_used:.2f}",
-            f"early probe missing: distance {distance_to_breakout * 100:.1f}%, vol {volume_ratio:.2f}x, R:R {rr_used:.2f}",
+            f"提前试仓条件满足：距突破位 {distance_to_breakout * 100:.1f}%，成交量 {volume_ratio:.2f}x，盈亏比 {rr_used:.2f}",
+            f"提前试仓条件不足：距突破位 {distance_to_breakout * 100:.1f}%，成交量 {volume_ratio:.2f}x，盈亏比 {rr_used:.2f}",
             required=False,
             kind="template",
         ))
@@ -243,7 +267,9 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
 
     max_funding = profile.get("max_funding_rate")
     if max_funding is not None:
-        confirmations.append(_confirmation("资金费率", funding_rate <= _num(max_funding), "资金费率不过热", f"资金费率超过 {float(max_funding) * 100:.3f}%", kind="risk"))
+        funding_limit = 0.003 if str(side or "").upper() == "SHORT" else _num(max_funding)
+        funding_ok = not is_adverse_funding_rate(funding_rate, funding_limit, side)
+        confirmations.append(_confirmation("资金费率", funding_ok, "资金费率对当前方向有利或正常", f"资金费率对当前方向不利，阈值 {float(max_funding) * 100:.3f}%", kind="risk"))
 
     confirmations.append(_confirmation("冷却状态", not cooldown.get("in_cooldown"), "冷却状态正常", cooldown.get("reason") or "冷却中", kind="risk"))
     if oi_change < -3:
@@ -282,15 +308,15 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
         if not probe_blockers:
             status = "probe"
             if early_probe_ok:
-                reason = f"{profile['template_name']} early probe: 20-period breakout not confirmed, but score/volume/OI/R:R meet probe conditions."
+                reason = f"{profile['template_name']}允许提前试仓：20周期突破尚未确认，但评分、成交量、OI和盈亏比已满足试仓条件。"
             else:
-                reason = f"{profile['template_name']} reached probe conditions, but not full entry yet."
+                reason = f"{profile['template_name']}已达到试仓条件，但尚未达到正常仓位入场条件。"
         elif profile.get("allow_observe_only"):
             status = "observe"
-            reason = f"{profile['template_name']} basic conditions are close, but key confirmations are still missing."
+            reason = f"{profile['template_name']}基础条件接近，但仍缺少关键确认，继续观察。"
         else:
             status = "block"
-            reason = f"{profile['template_name']} conditions are insufficient; no entry."
+            reason = f"{profile['template_name']}条件不足，暂不开仓。"
 
     elif profile.get("allow_observe_only") and base_ok:
         status = "observe"
@@ -363,5 +389,6 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
             "distance_to_breakout_pct": distance_to_breakout,
             "early_probe_ok": early_probe_ok,
             "side": side,
+            "short_setup": short_setup,
         },
     }

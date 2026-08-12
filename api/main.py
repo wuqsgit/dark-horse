@@ -102,13 +102,13 @@ def plain_reason(reason):
 
 def explain_scan_row(row):
     try:
-        from trader.risk import meets_safety_filters, determine_side
+        from trader.risk import determine_side, entry_alpha_for_side, meets_safety_filters
 
         row_dict = dict(row)
-        ok, reason = meets_safety_filters(row_dict)
         side = determine_side(row_dict)
+        ok, reason = meets_safety_filters(row_dict, side=side)
         score = float(row_dict.get("composite_score") or 0)
-        entry_alpha = float(row_dict.get("entry_alpha") or 0)
+        entry_alpha = entry_alpha_for_side(row_dict, side)
         hold_alpha = float(row_dict.get("hold_alpha") or 0)
         if ok and side:
             side_text = "多" if side == "LONG" else "空"
@@ -244,9 +244,14 @@ def _cache_ttl_for_path(path: str) -> int:
     return _BACKTEST_CACHE_TTL
 
 
-def compute_v3_signals(symbol, row, tech):
+def compute_v3_signals(symbol, row, tech, side=None):
     try:
-        from engine.breakout_detector import check_breakout_confirmation, compute_rr_detail, compute_breakout_metrics
+        from engine.breakout_detector import (
+            check_breakout_confirmation,
+            compute_breakout_metrics,
+            compute_rr_detail,
+            compute_sr_levels,
+        )
         from trader.cooldown_manager import is_in_cooldown
 
         price = float(row["market_price"] or 0)
@@ -255,6 +260,22 @@ def compute_v3_signals(symbol, row, tech):
         breakout_ok, breakout_reason = check_breakout_confirmation(symbol)
         metrics = compute_breakout_metrics(symbol)
         rr = compute_rr_detail(symbol, price, atr) if price > 0 and atr > 0 else {"rr_used": 0, "rr_atr": 0, "rr_structure": 0, "rr_method": "none"}
+        if side == "SHORT" and price > 0 and atr > 0:
+            sr = compute_sr_levels(symbol)
+            support = float(sr.get("support") or 0)
+            risk = atr * 2
+            reward = price - support if 0 < support < price else 0
+            rr_structure = reward / risk if risk > 0 else 0
+            rr = {
+                "rr_used": round(rr_structure if rr_structure > 0 else 2.0, 2),
+                "rr_atr": 2.0,
+                "rr_structure": round(rr_structure, 2),
+                "rr_method": "structure" if rr_structure > 0 else "atr",
+                "reward_price": round(support if reward > 0 else price - atr * 4, 8),
+                "risk_price": round(price + risk, 8),
+                "support": support,
+                "resistance": float(sr.get("resistance") or 0),
+            }
         in_cooldown, cooldown_reason, remaining = is_in_cooldown(symbol)
 
         return {
@@ -273,10 +294,10 @@ def compute_v3_signals(symbol, row, tech):
             "cooldown": {"in_cooldown": in_cooldown, "reason": cooldown_reason, "remaining_sec": remaining},
             "atr": round(atr, 4),
             "tp_levels": {
-                "tp1": round(price + 2*atr, 4) if price > 0 else 0,
-                "tp2": round(price + 4*atr, 4) if price > 0 else 0,
-                "tp3": round(price + 6*atr, 4) if price > 0 else 0,
-                "stop": round(price - 2*atr, 4) if price > 0 else 0,
+                "tp1": round(price + (-2 if side == "SHORT" else 2)*atr, 4) if price > 0 else 0,
+                "tp2": round(price + (-4 if side == "SHORT" else 4)*atr, 4) if price > 0 else 0,
+                "tp3": round(price + (-6 if side == "SHORT" else 6)*atr, 4) if price > 0 else 0,
+                "stop": round(price + (2 if side == "SHORT" else -2)*atr, 4) if price > 0 else 0,
             } if atr > 0 else None,
         }
     except Exception as e:
@@ -551,7 +572,7 @@ def _build_scan_payload(scan, rows):
                 features = {}
         tech = features.get("technical", {})
         market_phase = features.get("market_phase") or {}
-        v3_signals = compute_v3_signals(r["symbol"], r, tech)
+        v3_signals = compute_v3_signals(r["symbol"], r, tech, plain.get("side"))
         try:
             from trader.entry_profiles import evaluate_profile_entry
             entry_profile_full = evaluate_profile_entry(r, v3_signals, plain.get("side"))
@@ -577,6 +598,7 @@ def _build_scan_payload(scan, rows):
             "price_position": r["price_position"],
             "relative_strength": float(r["relative_strength"] or 50),
             "entry_alpha": float(r["entry_alpha"] or 0),
+            "short_entry_alpha": float(features.get("short_entry_alpha") or 0),
             "hold_alpha": float(r["hold_alpha"] or 0),
             "plain_signal": plain,
             "entry_profile": entry_profile,
@@ -947,6 +969,7 @@ async def get_symbol_detail(symbol: str, user=Depends(get_user)):
         "plain_signal": explain_scan_row(row),
         # V3.0
         "entry_alpha": float(row.get("entry_alpha") or 0),
+        "short_entry_alpha": float(features.get("short_entry_alpha") or 0),
         "hold_alpha": float(row.get("hold_alpha") or 0),
     }
     
@@ -954,7 +977,7 @@ async def get_symbol_detail(symbol: str, user=Depends(get_user)):
     try:
         from trader.entry_profiles import evaluate_profile_entry
         sym = symbol.upper()
-        result["v3_signals"] = compute_v3_signals(sym, row, tech)
+        result["v3_signals"] = compute_v3_signals(sym, row, tech, result["plain_signal"].get("side"))
         result["entry_profile"] = evaluate_profile_entry(row, result["v3_signals"], result["plain_signal"].get("side"))
         result["plain_signal"] = apply_entry_profile_plain_signal(result["plain_signal"], result["entry_profile"])
     except Exception as e:

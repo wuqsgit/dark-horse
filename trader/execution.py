@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from trader.exchange import BinanceFutures
 from trader.risk import (
     calculate_position, determine_side, meets_safety_filters,
-    calc_tp_levels, calc_trailing_stop, evaluate_entry_policy
+    calc_tp_levels, calc_trailing_stop, entry_alpha_for_side,
+    evaluate_entry_policy, evaluate_short_setup, funding_position_factor,
 )
 from trader.entry_profiles import evaluate_profile_entry
 from trader.config import TRADING_CONFIG
@@ -44,7 +45,7 @@ def _features_for_decision(row):
     }
 
 
-def _score_layer_gate(row, entry_profile):
+def _score_layer_gate(row, entry_profile, side=None):
     raw = row.get("raw_features") or row.get("features") or {}
     if isinstance(raw, str) and raw.strip():
         try:
@@ -64,12 +65,13 @@ def _score_layer_gate(row, entry_profile):
     max_risk = float(thresholds.get("max_risk_score") or 100)
     min_exec = float(thresholds.get("min_execution_score") or 0)
     status = entry_profile.get("status")
-    if opportunity < min_opp:
+    is_short = str(side or "").upper() == "SHORT"
+    if not is_short and opportunity < min_opp:
         return False, f"opportunity_score {opportunity:.1f} < {min_opp:.1f}", score_layers
     if risk > max_risk:
         return False, f"risk_score {risk:.1f} > {max_risk:.1f}", score_layers
     required_entry = probe_min_entry if status == "probe" else min_entry
-    if entry < required_entry:
+    if not is_short and entry < required_entry:
         return False, f"entry_score {entry:.1f} < {required_entry:.1f}", score_layers
     if execution < min_exec:
         return False, f"execution_score {execution:.1f} < {min_exec:.1f}", score_layers
@@ -107,10 +109,16 @@ def _alpha_discovery_position_factor(score: float, min_score: float = 78, full_s
     return 0.5 if value < full_score else 1.0
 
 
-def _market_phase_entry_decision(market_phase: dict, current_status: str) -> tuple[bool, str, str]:
+def _market_phase_entry_decision(
+    market_phase: dict,
+    current_status: str,
+    side: str | None = None,
+) -> tuple[bool, str, str]:
     phase = str((market_phase or {}).get("phase") or "")
     confidence = float((market_phase or {}).get("confidence") or 0)
     style = str((market_phase or {}).get("position_style") or "")
+    if phase == "breakdown_risk" and str(side or "").upper() == "SHORT":
+        return True, current_status, "market_phase_breakdown_supports_short"
     if phase == "breakdown_risk":
         return False, "blocked", f"market_phase_{phase}"
     if phase == "uncertain" and (confidence <= 25 or style == "skip"):
@@ -156,9 +164,14 @@ def _alpha_probe_entry_decision(
     return True, "alpha_probe_confirmed"
 
 
-def _compute_entry_v3_signals(symbol, row):
+def _compute_entry_v3_signals(symbol, row, side=None):
     try:
-        from engine.breakout_detector import check_breakout_confirmation, compute_breakout_metrics, compute_rr_detail
+        from engine.breakout_detector import (
+            check_breakout_confirmation,
+            compute_breakout_metrics,
+            compute_rr_detail,
+            compute_sr_levels,
+        )
 
         raw = _raw_features(row)
         tech = raw.get("technical") or {}
@@ -167,6 +180,23 @@ def _compute_entry_v3_signals(symbol, row):
         breakout_ok, breakout_reason = check_breakout_confirmation(symbol)
         metrics = compute_breakout_metrics(symbol)
         rr = compute_rr_detail(symbol, price, atr) if price > 0 and atr > 0 else {"rr_used": 0, "rr_atr": 0, "rr_structure": 0, "rr_method": "none"}
+        if str(side or "").upper() == "SHORT" and price > 0 and atr > 0:
+            sr = compute_sr_levels(symbol)
+            support = float(sr.get("support") or 0)
+            risk = atr * 2
+            structure_reward = price - support if 0 < support < price else 0
+            rr_structure = structure_reward / risk if risk > 0 else 0
+            rr_atr = 2.0
+            rr = {
+                "rr_used": round(rr_structure if rr_structure > 0 else rr_atr, 2),
+                "rr_atr": rr_atr,
+                "rr_structure": round(rr_structure, 2),
+                "rr_method": "structure" if rr_structure > 0 else "atr",
+                "reward_price": round(support if structure_reward > 0 else price - atr * 4, 8),
+                "risk_price": round(price + risk, 8),
+                "support": round(support, 8) if support else 0,
+                "resistance": round(float(sr.get("resistance") or 0), 8),
+            }
         in_cooldown, cooldown_reason, remaining = is_in_cooldown(symbol)
         return {
             "breakout": {
@@ -183,6 +213,7 @@ def _compute_entry_v3_signals(symbol, row):
             "rr_ratio": round(float(rr.get("rr_used") or 0), 2),
             "cooldown": {"in_cooldown": in_cooldown, "reason": cooldown_reason, "remaining_sec": remaining},
             "atr": round(atr, 4),
+            "short_setup": evaluate_short_setup(row) if str(side or "").upper() == "SHORT" else {},
         }
     except Exception as e:
         return {"error": str(e)}
@@ -2719,6 +2750,7 @@ class ExecutionEngine:
                 cfg,
                 roll_layer=next_layer,
                 current_quantity=pos.get("quantity"),
+                side=side,
             )
             if add_qty <= 0:
                 block("roll quantity <= 0")
@@ -2908,7 +2940,7 @@ class ExecutionEngine:
                 if learning_action:
                     self.ai_learning_actions.append(learning_action)
 
-                ok, filter_reason = meets_safety_filters(s)
+                ok, filter_reason = meets_safety_filters(s, side=learning_side)
                 if not ok:
                     self._record_decision(
                         s,
@@ -2946,6 +2978,27 @@ class ExecutionEngine:
                         filter_reason="no_confident_side",
                     )
                     continue
+                if side == "SHORT":
+                    short_cfg = self.cfg.get("short_trading") or {}
+                    short_count = sum(
+                        1 for position in current_positions
+                        if str(position.get("side") or "").upper() == "SHORT"
+                    ) + sum(
+                        1 for action in actions
+                        if action.get("action") == "open"
+                        and str(action.get("position_side") or "").upper() == "SHORT"
+                    )
+                    max_short_positions = int(short_cfg.get("max_short_positions", 2))
+                    if short_count >= max_short_positions:
+                        self._record_decision(
+                            s,
+                            run_id=run_id,
+                            side=side,
+                            decision_stage="portfolio_direction",
+                            decision_result="filtered",
+                            filter_reason=f"max_short_positions {short_count}/{max_short_positions}",
+                        )
+                        continue
 
                 policy_ok, policy_reason, matched_policies = evaluate_entry_policy(s, side)
                 if not policy_ok:
@@ -2962,7 +3015,7 @@ class ExecutionEngine:
                     logger.info(f"  {sym}: {policy_reason}, entry policy filtered")
                     continue
 
-                v3_signals = _compute_entry_v3_signals(sym, s)
+                v3_signals = _compute_entry_v3_signals(sym, s, side)
                 if v3_signals.get("error"):
                     self._record_decision(
                         s,
@@ -2999,6 +3052,7 @@ class ExecutionEngine:
                 phase_ok, phase_status, phase_reason = _market_phase_entry_decision(
                     market_phase,
                     entry_profile.get("status"),
+                    side,
                 )
                 if not phase_ok:
                     self._record_decision(
@@ -3023,7 +3077,7 @@ class ExecutionEngine:
                 elif market_phase:
                     entry_profile = {**entry_profile, "market_phase": market_phase}
 
-                layer_ok, layer_reason, score_layers = _score_layer_gate(s, entry_profile)
+                layer_ok, layer_reason, score_layers = _score_layer_gate(s, entry_profile, side)
                 if not layer_ok:
                     self._record_decision(
                         s,
@@ -3077,12 +3131,19 @@ class ExecutionEngine:
                 sizing_mode = "probe" if entry_profile.get("status") == "probe" else "confirmed"
                 size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
                 size_multiplier *= _market_phase_size_factor(market_phase)
+                directional_alpha = entry_alpha_for_side(s, side)
+                short_cfg = self.cfg.get("short_trading") or {}
+                if side == "SHORT" and directional_alpha < float(short_cfg.get("full_position_alpha", 72)):
+                    size_multiplier *= float(short_cfg.get("probe_position_factor", 0.5))
+                    sizing_mode = "probe"
+                funding = float((_raw_features(s).get("futures") or {}).get("funding_rate") or 0)
+                size_multiplier *= funding_position_factor(funding, side)
                 pos_info = calculate_position(
                     self.ex,
                     sym,
                     price,
                     balance,
-                    score,
+                    directional_alpha if side == "SHORT" else score,
                     category=symbol_risk.get("class"),
                     entry_mode=sizing_mode,
                     size_multiplier=size_multiplier,
@@ -3144,6 +3205,8 @@ class ExecutionEngine:
                     "run_id": run_id,
                     "scan_id": s.get("scan_id"),
                     "entry_mode": entry_profile.get("status"),
+                    "directional_entry_alpha": directional_alpha,
+                    "short_setup": (v3_signals.get("short_setup") or {}).get("setup"),
                     "strategy_source": "normal",
                     "signal_source": entry_profile.get("template"),
                     "category": symbol_risk.get("class"),

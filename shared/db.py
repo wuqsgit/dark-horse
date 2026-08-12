@@ -1366,6 +1366,8 @@ def init_db():
         _ensure_column(conn, table, "alpha_entry_level", "TEXT")
         _ensure_column(conn, table, "alpha_score", "REAL")
         _ensure_column(conn, table, "alpha_suggested_position_pct", "REAL")
+    _ensure_column(conn, "fills", "position_side", "TEXT")
+    _ensure_column(conn, "fills", "exchange_order_id", "TEXT")
     for column, ddl in {
         "client_order_id": "TEXT",
         "exchange_order_id": "TEXT",
@@ -3919,6 +3921,78 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
                 return entry - delta
             return entry + delta
 
+        def fill_metadata_for_group(symbol, trade_ids, first_dt, last_dt):
+            """Resolve a complete flat-to-flat position cycle from user trades."""
+            if not trade_ids or not last_dt:
+                return None
+            normalized_ids = {
+                str(value).split(":")[-1]
+                for value in trade_ids
+                if value is not None and str(value).strip()
+            }
+            fill_rows = conn.execute(
+                """SELECT * FROM fills
+                   WHERE account_id=? AND symbol=?
+                     AND side IN ('BUY', 'SELL')
+                     AND COALESCE(quantity, 0) > 0
+                     AND COALESCE(price, 0) > 0
+                     AND datetime(created_at) <= datetime(?, '+5 minutes')
+                     AND datetime(created_at) >= datetime(?, '-7 days')
+                   ORDER BY datetime(created_at) ASC, id ASC""",
+                (
+                    account_id,
+                    symbol,
+                    _format_db_time(last_dt),
+                    _format_db_time(first_dt or last_dt),
+                ),
+            ).fetchall()
+            cycles = []
+            current = []
+            position = 0.0
+            tolerance = 1e-10
+            for row in fill_rows:
+                qty = float(row["quantity"] or 0)
+                signed_qty = qty if str(row["side"] or "").upper() == "BUY" else -qty
+                if not current:
+                    position = 0.0
+                current.append(row)
+                position += signed_qty
+                if abs(position) <= tolerance:
+                    cycles.append(current)
+                    current = []
+                    position = 0.0
+            if current:
+                cycles.append(current)
+
+            matching = None
+            for cycle in cycles:
+                cycle_ids = {str(row["trade_id"] or "").split(":")[-1] for row in cycle}
+                if cycle_ids & normalized_ids:
+                    matching = cycle
+            if not matching:
+                return None
+
+            first_side = str(matching[0]["side"] or "").upper()
+            side = "LONG" if first_side == "BUY" else "SHORT"
+            entry_side = "BUY" if side == "LONG" else "SELL"
+            exit_side = "SELL" if side == "LONG" else "BUY"
+            entries = [row for row in matching if str(row["side"] or "").upper() == entry_side]
+            exits = [row for row in matching if str(row["side"] or "").upper() == exit_side]
+            entry_qty = sum(float(row["quantity"] or 0) for row in entries)
+            exit_qty = sum(float(row["quantity"] or 0) for row in exits)
+            if entry_qty <= 0 or exit_qty <= 0:
+                return None
+            entry_notional = sum(float(row["quantity"] or 0) * float(row["price"] or 0) for row in entries)
+            exit_notional = sum(float(row["quantity"] or 0) * float(row["price"] or 0) for row in exits)
+            return {
+                "side": side,
+                "quantity": min(entry_qty, exit_qty),
+                "entry_price": entry_notional / entry_qty,
+                "exit_price": exit_notional / exit_qty,
+                "entry_time": entries[0]["created_at"],
+                "exit_time": exits[-1]["created_at"],
+            }
+
         def consolidate_by_local_position_id():
             position_rows = conn.execute(
                 """SELECT
@@ -4316,6 +4390,19 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
             entry_reason = meta["entry_reason"] if meta and "entry_reason" in meta.keys() else None
             exit_reason = meta["exit_reason"] if meta and "exit_reason" in meta.keys() else "REALIZED_PNL"
             entry_time = meta["entry_time"] if meta and "entry_time" in meta.keys() else None
+            fill_meta = fill_metadata_for_group(
+                symbol,
+                g.get("trade_ids") or set(),
+                first_dt,
+                last_dt,
+            )
+            if fill_meta:
+                side = side or fill_meta["side"]
+                entry_price = entry_price or fill_meta["entry_price"]
+                exit_price = exit_price or fill_meta["exit_price"]
+                qty = qty or fill_meta["quantity"]
+                entry_time = entry_time or fill_meta["entry_time"]
+                last_dt = _parse_db_time(fill_meta["exit_time"]) or last_dt
             open_order = latest_open_order_before(symbol, first_dt or last_dt)
             snapshot = latest_position_snapshot_before(symbol, last_dt or first_dt)
             open_dt = row_time(open_order, "created_at")
@@ -4780,6 +4867,61 @@ def is_market_entry_ready(symbol, strategy_source="normal", alpha_symbol=None):
             futures_state,
         )
         return readiness.ready, readiness.error
+    finally:
+        conn.close()
+
+
+def upsert_exchange_fill(item, source="binance_user_trades"):
+    """Persist a Binance user trade, replacing income-only placeholder fills."""
+    account_id = current_account_id()
+    raw_trade_id = str(item.get("id") or item.get("tradeId") or "").strip()
+    if not raw_trade_id:
+        return None
+    trade_id = f"A{account_id}:{raw_trade_id}"
+    raw_time = item.get("time") or item.get("created_at")
+    if isinstance(raw_time, (int, float)):
+        created_at = datetime.fromtimestamp(
+            float(raw_time) / 1000, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        created_at = str(raw_time or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO fills
+               (account_id, symbol, order_id, exchange_order_id, side, position_side, quantity, price,
+                realized_pnl, fee, fee_asset, trade_id, created_at, strategy_source)
+               VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(trade_id) DO UPDATE SET
+                 account_id=excluded.account_id,
+                 symbol=excluded.symbol,
+                 exchange_order_id=excluded.exchange_order_id,
+                 side=excluded.side,
+                 position_side=excluded.position_side,
+                 quantity=excluded.quantity,
+                 price=excluded.price,
+                 realized_pnl=excluded.realized_pnl,
+                 fee=excluded.fee,
+                 fee_asset=excluded.fee_asset,
+                 created_at=excluded.created_at""",
+            (
+                account_id,
+                str(item.get("symbol") or "").upper(),
+                str(item.get("orderId") or "") or None,
+                str(item.get("side") or "").upper(),
+                str(item.get("positionSide") or "BOTH").upper(),
+                float(item.get("qty") or item.get("quantity") or 0),
+                float(item.get("price") or 0),
+                float(item.get("realizedPnl") or item.get("realized_pnl") or 0),
+                -abs(float(item.get("commission") or item.get("fee") or 0)),
+                str(item.get("commissionAsset") or item.get("fee_asset") or "USDT"),
+                trade_id,
+                created_at,
+                source,
+            ),
+        )
+        conn.commit()
+        return trade_id
     finally:
         conn.close()
 
@@ -5265,12 +5407,13 @@ def record_strategy_decision(
     conn = get_conn()
     conn.execute(
         """INSERT OR IGNORE INTO strategy_decisions
-           (decision_id, run_id, time, scan_id, symbol, side, mode,
+           (account_id, decision_id, run_id, time, scan_id, symbol, side, mode,
             decision_stage, decision_result, filter_reason, composite_score,
             grade, market_regime, price, quantity, entry_price,
             risk_params_json, features_json, reason_json)
-           VALUES (?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
+            current_account_id(),
             decision_id,
             run_id,
             time,

@@ -267,6 +267,13 @@ class BinanceFutures:
         except Exception:
             return []
 
+    def fetch_user_trades(self, symbol: str, start_time: int | None = None, limit: int = 1000) -> list:
+        params = {"symbol": symbol.upper(), "limit": limit}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        data = self._request("GET", "/fapi/v1/userTrades", signed=True, params=params)
+        return data if isinstance(data, list) else []
+
     def get_trading_symbols(self) -> set:
         try:
             resp = httpx.get(

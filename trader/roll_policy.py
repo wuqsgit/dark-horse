@@ -39,6 +39,10 @@ def evaluate_roll(
         return RollDecision(False, "waiting_tp1")
 
     side = str(position.get("side") or "").upper()
+    if side == "SHORT":
+        max_layers = int(_number(config.get("short_max_layers")) or max_layers)
+        if roll_layer >= max_layers:
+            return RollDecision(False, "roll_completed")
     entry = _number(position.get("entry_price"))
     mark = _number(position.get("mark_price"))
     stop = _number(state.get("initial_stop_loss"))
@@ -135,18 +139,28 @@ def calculate_roll_quantity(
     config: Mapping[str, Any],
     roll_layer: int = 1,
     current_quantity: float | None = None,
+    side: str | None = None,
 ) -> float:
     step = Decimal(str(exchange_info.get("step_size") or "0"))
     if step <= 0:
         return 0.0
-    layer_pcts = config.get("layer_add_initial_qty_pct") or []
+    is_short = str(side or "").upper() == "SHORT"
+    layer_pcts = (
+        config.get("short_layer_add_initial_qty_pct")
+        if is_short
+        else config.get("layer_add_initial_qty_pct")
+    ) or []
     try:
         layer_pct = layer_pcts[max(0, int(roll_layer) - 1)]
     except (IndexError, TypeError, ValueError):
         layer_pct = config.get("add_initial_qty_pct", 0.25)
     raw = Decimal(str(initial_quantity)) * Decimal(str(layer_pct))
     if current_quantity is not None:
-        max_multiple = Decimal(str(config.get("max_total_qty_multiple", 1.1)))
+        max_multiple = Decimal(str(
+            config.get("short_max_total_qty_multiple", 1.5)
+            if is_short
+            else config.get("max_total_qty_multiple", 1.1)
+        ))
         remaining = (
             Decimal(str(initial_quantity)) * max_multiple
             - Decimal(str(current_quantity))

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from shared.db import insert_training_samples, get_conn
+from shared.directional_scoring import compute_short_entry_alpha
 from shared.market_phase import detect_market_phase
 from engine.structure_metrics import compute_structure_metrics
 from engine.factor_engine import compute_score_layers
@@ -109,6 +110,9 @@ class ScoringEngine:
                 alpha = self._compute_alpha_score(tech, fut_feat, onc_feat, phase)
                 ev = self._estimate_ev(tech, fut_feat)
                 score_layers = compute_score_layers(sym, tech, fut_feat, onc_feat, depth_feat, {})
+                short_entry_alpha = compute_short_entry_alpha(
+                    tech, fut_feat, depth_feat, phase, 50.0
+                )
                 # V4.0: 融合深度因子到 alpha score
                 alpha = self._apply_depth_to_alpha(alpha, depth_feat)
                 raw = {"alpha": alpha, "phase": phase, "ev": ev,
@@ -116,6 +120,7 @@ class ScoringEngine:
                        "futures": {k: round(v,6) if isinstance(v,float) else v for k,v in fut_feat.items() if v is not None},
                        "onchain": {k: round(v,2) if isinstance(v,float) else v for k,v in onc_feat.items() if v is not None},
                        "depth": {k: round(v,4) if isinstance(v,float) else v for k,v in depth_feat.items() if v is not None},
+                       "short_entry_alpha": short_entry_alpha,
                        "market_phase": market_phase,
                        "score_layers": score_layers}
                 results.append({
@@ -132,6 +137,7 @@ class ScoringEngine:
                     "market_price": tech.get("current_price", 0),
                     # V3.0 Entry/Hold Alpha 分离
                     "entry_alpha": round(self._compute_entry_alpha(tech, fut_feat, phase), 1),
+                    "short_entry_alpha": short_entry_alpha,
                     "hold_alpha": round(self._compute_hold_alpha(tech, fut_feat, phase), 1),
                     "raw_features": raw,
                     "scan_id": self.scan_id})
@@ -147,6 +153,16 @@ class ScoringEngine:
                 "score": strength,
                 "basis": "cross_sectional_return_volume_oi",
             }
+            raw = r["raw_features"]
+            short_entry_alpha = compute_short_entry_alpha(
+                raw.get("technical"),
+                raw.get("futures"),
+                raw.get("depth"),
+                raw.get("phase"),
+                strength,
+            )
+            r["short_entry_alpha"] = short_entry_alpha
+            raw["short_entry_alpha"] = short_entry_alpha
 
         hist_perf = self._get_all_historical_performance()
         

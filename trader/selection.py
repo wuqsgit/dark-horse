@@ -14,6 +14,7 @@ from typing import Any
 
 from shared.db import get_conn
 from trader.config import PORTFOLIO_RISK, TRADING_CONFIG
+from trader.risk import determine_side, entry_alpha_for_side, is_adverse_funding_rate
 from trader.symbol_risk import get_symbol_risk
 
 logger = logging.getLogger("selection")
@@ -200,12 +201,16 @@ class CandidateSelector:
         return 0.0
 
     def _opportunity_score(self, row: dict) -> float:
+        return self._directional_opportunity_score(row, "LONG")
+
+    def _directional_opportunity_score(self, row: dict, side: str | None = None) -> float:
         score = float(row.get("composite_score") or 0)
         strength = float(row.get("relative_strength") or 50)
         liquidity = self._liquidity_score(row["symbol"])
         raw = _raw_features(row)
         hist = raw.get("historical_performance") or self._get_historical_performance(row["symbol"])
-        entry_alpha = float(row.get("entry_alpha") or raw.get("entry_alpha") or score)
+        entry_alpha = entry_alpha_for_side(row, side)
+        directional_strength = 100.0 - strength if side == "SHORT" else strength
         symbol_risk = get_symbol_risk(row["symbol"])
         risk_rank_factor = float(symbol_risk.get("max_position_factor") or 0.35)
 
@@ -237,7 +242,7 @@ class CandidateSelector:
         return round(
             score * 0.35
             + entry_alpha * 0.25
-            + strength * 0.20
+            + directional_strength * 0.20
             + liquidity * 0.15
             + min(6.0, risk_rank_factor * 6.0)
             + history_adjust
@@ -272,10 +277,28 @@ class CandidateSelector:
             row["selection_category"] = str(
                 (get_symbol_risk(symbol) or {}).get("class") or "narrative"
             )
-            row["selection_score"] = self._opportunity_score(row)
+            row["candidate_side"] = determine_side(row)
+            row["long_opportunity_score"] = self._opportunity_score(row)
+            row["short_opportunity_score"] = self._directional_opportunity_score(row, "SHORT")
+            row["selection_score"] = (
+                row["short_opportunity_score"]
+                if row["candidate_side"] == "SHORT"
+                else row["long_opportunity_score"]
+            )
             available.append(row)
 
-        available.sort(key=lambda x: x["selection_score"], reverse=True)
+        available.sort(
+            key=lambda x: (
+                x.get("candidate_side") is not None,
+                x["selection_score"],
+            ),
+            reverse=True,
+        )
+        short_candidates = [row for row in available if row.get("candidate_side") == "SHORT"]
+        if short_candidates:
+            best_short = max(short_candidates, key=lambda row: row["selection_score"])
+            available.remove(best_short)
+            available.insert(0, best_short)
 
         selected = []
         category_counts = dict(occupied_categories)
@@ -445,8 +468,11 @@ class BluechipTrendSelector:
         if metrics["price_position_value"] > float(cfg.get("max_price_position_value", 0.95)):
             reasons.append(f"price_position_value {metrics['price_position_value']:.2f} too high")
         funding = _num((raw.get("futures") or {}).get("funding_rate"))
-        if abs(funding) > float(cfg.get("max_funding_rate", 0.001)):
-            reasons.append(f"funding_rate {funding:.5f} too high")
+        max_funding = float(cfg.get("max_funding_rate", 0.001))
+        if is_adverse_funding_rate(funding, max_funding, "LONG"):
+            reasons.append(
+                f"adverse_funding_rate side=LONG rate={funding:.5f} limit={max_funding:.5f}"
+            )
 
         confirmed = (
             metrics["score"] >= float(cfg.get("confirmed_score", 60))

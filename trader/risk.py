@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from shared.directional_scoring import compute_short_entry_alpha
 from trader.config import HARD_FILTERS, TRADING_CONFIG
 
 
@@ -287,6 +288,120 @@ def _feature_number(raw: dict, key: str, fallback: float = 0.0) -> float:
         return fallback
 
 
+def is_adverse_funding_rate(funding_rate: float, max_rate: float, side: str | None) -> bool:
+    """Return whether funding is expensive for the intended position direction."""
+    funding = float(funding_rate or 0)
+    limit = abs(float(max_rate or 0))
+    direction = str(side or "").upper()
+    if direction == "LONG":
+        return funding > limit
+    if direction == "SHORT":
+        return funding < -limit
+    return abs(funding) > limit
+
+
+def funding_position_factor(funding_rate: float, side: str | None) -> float:
+    funding = float(funding_rate or 0)
+    direction = str(side or "").upper()
+    short_cfg = TRADING_CONFIG.get("short_trading") or {}
+    reduce_at = float(short_cfg.get("negative_funding_reduce_at", -0.001))
+    block_at = float(short_cfg.get("negative_funding_block_at", -0.003))
+    if direction == "SHORT" and funding < reduce_at:
+        return float(short_cfg.get("probe_position_factor", 0.5)) if funding >= block_at else 0.0
+    return 1.0
+
+
+def entry_alpha_for_side(score_row, side: str | None) -> float:
+    row = _ensure_dict(score_row)
+    raw = _raw_features(row)
+    if str(side or "").upper() != "SHORT":
+        return float(row.get("entry_alpha") or raw.get("entry_alpha") or 0)
+    stored = row.get("short_entry_alpha")
+    if stored is None:
+        stored = raw.get("short_entry_alpha")
+    if stored is not None:
+        return float(stored or 0)
+    return compute_short_entry_alpha(
+        raw.get("technical"),
+        raw.get("futures"),
+        raw.get("depth"),
+        raw.get("phase"),
+        float(row.get("relative_strength") or 50),
+    )
+
+
+def evaluate_short_setup(score_row) -> dict:
+    """Identify a breakdown continuation or failed-rebound short setup."""
+    row = _ensure_dict(score_row)
+    raw = _raw_features(row)
+    tech = raw.get("technical") or {}
+    depth = raw.get("depth") or {}
+    direction = str(row.get("trend_direction") or tech.get("trend_direction") or "")
+    phase = str(row.get("chip_phase") or tech.get("chip_phase") or "")
+    position = str(row.get("price_position") or tech.get("price_position") or "")
+    ret_1h = float(tech.get("return_1h") or 0)
+    ret_6h = float(tech.get("return_6h") or 0)
+    ret_24h = float(
+        tech.get("return_24h")
+        if tech.get("return_24h") is not None
+        else tech.get("price_change_24h") or 0
+    )
+    volume_change = float(tech.get("volume_change_pct") or 0)
+    rsi = float(tech.get("rsi_14") or 50)
+    ema20 = float(tech.get("ema20") or 0)
+    ema_slope = float(tech.get("ema20_slope") or 0)
+    price = float(row.get("market_price") or row.get("price") or tech.get("current_price") or 0)
+    depth_ratio = float(depth.get("depth_ratio") or 1)
+    is_down = direction == "向下" or (ret_6h < 0 and ret_24h < 0)
+    is_low = "低位" in position or "偏低" in position
+    distribution = phase in {"疑似出货", "筹码松动"}
+
+    breakdown = bool(
+        is_down
+        and ret_6h < 0
+        and ret_24h < 0
+        and (volume_change >= 1.1 or distribution)
+        and depth_ratio <= 1.25
+    )
+    failed_rebound = bool(
+        is_down
+        and ema20 > 0
+        and price > 0
+        and price < ema20
+        and ema_slope < 0
+        and ret_1h <= 0
+        and not is_low
+        and depth_ratio <= 1.20
+    )
+    chase_reasons = []
+    if rsi < 25:
+        chase_reasons.append(f"rsi={rsi:.1f}<25")
+    if ret_6h <= -0.08:
+        chase_reasons.append(f"return_6h={ret_6h:.2%}")
+    if is_low and ret_6h <= -0.04:
+        chase_reasons.append("low_position_after_sharp_drop")
+
+    setup = "failed_rebound" if failed_rebound else "breakdown_continuation" if breakdown else None
+    return {
+        "eligible": bool(setup and not chase_reasons),
+        "setup": setup,
+        "breakdown": breakdown,
+        "failed_rebound": failed_rebound,
+        "anti_chase": bool(chase_reasons),
+        "anti_chase_reasons": chase_reasons,
+        "metrics": {
+            "return_1h": ret_1h,
+            "return_6h": ret_6h,
+            "return_24h": ret_24h,
+            "volume_change_pct": volume_change,
+            "rsi": rsi,
+            "ema20": ema20,
+            "ema20_slope": ema_slope,
+            "depth_ratio": depth_ratio,
+        },
+    }
+
+
 def evaluate_entry_policy(score_row, side: str | None) -> tuple[bool, str | None, list[dict]]:
     row = _ensure_dict(score_row)
     raw = _raw_features(row)
@@ -317,14 +432,14 @@ def evaluate_entry_policy(score_row, side: str | None) -> tuple[bool, str | None
     return True, None, matched
 
 
-def meets_safety_filters(score_row) -> tuple[bool, str]:
+def meets_safety_filters(score_row, side: str | None = None) -> tuple[bool, str]:
     row = _ensure_dict(score_row)
     raw = _raw_features(row)
     tech = raw.get("technical") or {}
     fut = raw.get("futures") or {}
     score = float(row.get("composite_score") or 0)
     symbol = row.get("symbol", "")
-    entry_alpha = float(row.get("entry_alpha") or raw.get("entry_alpha") or 0)
+    entry_alpha = entry_alpha_for_side(row, side)
     threshold = get_symbol_threshold(symbol, TRADING_CONFIG["min_score"])
 
     age = _age_minutes(row.get("time") or row.get("scan_time") or row.get("update_time"))
@@ -333,8 +448,17 @@ def meets_safety_filters(score_row) -> tuple[bool, str]:
         return False, f"stale signal age={age:.1f}m"
     funding = float(fut.get("funding_rate") or 0)
     max_funding = float(HARD_FILTERS.get("max_funding_rate", 1))
-    if abs(funding) > max_funding:
-        return False, f"funding_rate {funding:.5f} > {max_funding:.5f}"
+    funding_limit = (
+        abs(float((TRADING_CONFIG.get("short_trading") or {}).get("negative_funding_block_at", -0.003)))
+        if str(side or "").upper() == "SHORT"
+        else max_funding
+    )
+    if is_adverse_funding_rate(funding, funding_limit, side):
+        direction = str(side or "UNKNOWN").upper()
+        return False, (
+            f"adverse_funding_rate side={direction} rate={funding:.5f} "
+            f"limit={funding_limit:.5f}"
+        )
     # The real entry threshold is now owned by trader.entry_profiles per template.
     # Keep only an extreme floor here so weak rows do not waste live API checks.
     hard_score_floor = float(TRADING_CONFIG.get("hard_score_floor", 45))
@@ -358,6 +482,7 @@ def determine_side(score_row) -> str | None:
     tech = raw.get("technical") or {}
     depth = raw.get("depth") or {}
     entry_alpha = float(row.get("entry_alpha") or 0)
+    short_entry_alpha = entry_alpha_for_side(row, "SHORT")
     ret_6h = float(tech.get("return_6h") or 0)
     ret_24h = float(tech.get("return_24h") or tech.get("price_change_24h") or 0)
     depth_ratio = float(depth.get("depth_ratio") or 1)
@@ -372,16 +497,18 @@ def determine_side(score_row) -> str | None:
     accumulating = any(x in text for x in ("accumulation", "reaccumulation", "吸筹", "蓄力", "筹码改善"))
     distributing = any(x in text for x in ("distribution", "出货", "派发"))
 
-    if distributing and (is_downtrend or is_high) and short_depth_ok:
+    short_setup = evaluate_short_setup(row)
+    short_cfg = TRADING_CONFIG.get("short_trading") or {}
+    if (
+        bool(short_cfg.get("enabled", True))
+        and short_entry_alpha >= float(short_cfg.get("min_entry_alpha", 65))
+        and short_setup.get("eligible")
+    ):
         return "SHORT"
     if accumulating and (is_uptrend or is_low) and not is_downtrend and entry_alpha >= 58 and strength >= 50 and long_depth_ok:
         return "LONG"
     if is_uptrend and not is_high and strength >= 55 and entry_alpha >= 58 and (ret_6h > 0 or ret_24h > 0) and long_depth_ok:
         return "LONG"
-    if is_downtrend and not is_low and strength <= 45 and entry_alpha >= 55 and (ret_6h < 0 or ret_24h < 0) and short_depth_ok:
-        return "SHORT"
     if score >= 75 and is_low and strength >= 60 and entry_alpha >= 62 and not distributing and not is_downtrend and long_depth_ok:
         return "LONG"
-    if score >= 75 and is_high and strength <= 40 and entry_alpha >= 60 and not accumulating and short_depth_ok:
-        return "SHORT"
     return None
