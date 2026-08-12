@@ -15,7 +15,8 @@ from shared.db import (
     fetch_active_symbols, fetch_historical_scores, fetch_price_history, fetch_spot_klines_1h,
     insert_scores,
     label_signal_outcomes,
-    get_conn, init_db, close_conn, cleanup_old_operational_data, RETENTION_DAYS
+    get_conn, init_db, close_conn, cleanup_old_operational_data, RETENTION_DAYS,
+    upsert_service_runtime_status,
 )
 from engine.scoring import ScoringEngine
 from shared.policy_loop import label_decision_outcomes, generate_and_activate_policies, policy_guard
@@ -55,6 +56,12 @@ async def run_scoring():
         symbols = fetch_active_symbols()
         if not symbols:
             logger.warning("No symbols")
+            upsert_service_runtime_status(
+                "engine",
+                status="degraded",
+                error_code="normal_symbols_empty",
+                last_error="普通策略没有可评分币种。",
+            )
             return
         logger.info(f"Scoring {len(symbols)} symbols")
 
@@ -77,6 +84,12 @@ async def run_scoring():
 
         if df_1h.empty:
             logger.warning("No data yet")
+            upsert_service_runtime_status(
+                "engine",
+                status="degraded",
+                error_code="normal_candles_empty",
+                last_error="普通策略缺少 1 小时 K 线。",
+            )
             return
 
         results = engine.score_all(df_1h, df_15m, df_6h, df_24h, df_fut, df_onc)
@@ -118,9 +131,20 @@ async def run_scoring():
             top = sorted(results, key=lambda x: -x["composite_score"])[:5]
             for t in top:
                 logger.info(f"  #{t['composite_score']:.1f} {t['symbol']} ({t['composite_summary']}) - {t['chip_phase']}")
+        upsert_service_runtime_status(
+            "engine",
+            status="ok",
+            details={"symbol_count": len(symbols), "scored_count": len(results)},
+        )
 
     except Exception as e:
         logger.error(f"Scoring error: {e}", exc_info=True)
+        upsert_service_runtime_status(
+            "engine",
+            status="error",
+            error_code="normal_scoring_failed",
+            last_error=f"{type(e).__name__}: {e}",
+        )
 
 
 async def run_signal_labeling():

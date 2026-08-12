@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pipeline.binance_http import BinanceHTTPCollector
 from pipeline.dune_collector import DuneCollector
-from shared.db import init_db, insert_symbol_snapshot
+from shared.db import init_db, insert_symbol_snapshot, upsert_service_runtime_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +27,15 @@ async def collect_binance(bc):
     logger.info("=== Binance ===")
     try:
         universe = await bc.get_normal_universe(limit=TOP_SYMBOLS)
+        if not universe:
+            upsert_service_runtime_status(
+                "pipeline",
+                status="degraded",
+                error_code="normal_universe_empty",
+                last_error="普通行情币种池为空，无法生成扫描数据。",
+                details={"endpoint": bc.futures_base_url},
+            )
+            return
         symbols = [row["source_symbol"] for row in universe]
         if universe:
             await bc.collect_all(universe)
@@ -58,8 +67,19 @@ async def collect_binance(bc):
                         logger.info(f"[symbol-snapshot] Wrote {len(snap_rows)} records for {today}")
             except Exception as snap_e:
                 logger.warning(f"[symbol-snapshot] Failed: {snap_e}")
+        upsert_service_runtime_status(
+            "pipeline",
+            status="ok",
+            details={"universe_count": len(universe), "endpoint": bc.futures_base_url},
+        )
     except Exception as e:
         logger.error(f"Binance: {e}", exc_info=True)
+        upsert_service_runtime_status(
+            "pipeline",
+            status="error",
+            error_code="normal_market_collection_failed",
+            last_error=f"{type(e).__name__}: {e}",
+        )
     logger.info("=== Binance done ===")
 
 
@@ -76,6 +96,11 @@ async def main():
     logger.info("Pipeline starting...")
     from shared.db import init_db
     init_db()
+    upsert_service_runtime_status(
+        "pipeline",
+        status="starting",
+        details={"message": "普通行情采集服务已启动，正在执行首轮采集。"},
+    )
     bc = BinanceHTTPCollector()
     dc = DuneCollector()
 

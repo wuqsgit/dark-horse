@@ -241,6 +241,20 @@ CREATE TABLE alpha_strategy_runtime (
             updated_at TEXT NOT NULL
         );
 
+CREATE TABLE service_runtime_status (
+            service_name TEXT NOT NULL,
+            account_id INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'starting',
+            heartbeat_at TEXT NOT NULL,
+            last_success_at TEXT,
+            last_error_at TEXT,
+            error_code TEXT,
+            last_error TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (service_name, account_id)
+        );
+
 CREATE TABLE alpha_symbols (
             alpha_symbol TEXT PRIMARY KEY,
             base_asset TEXT,
@@ -1420,6 +1434,8 @@ CREATE UNIQUE INDEX idx_signal_outcomes_decision ON signal_outcomes(decision_id)
 CREATE INDEX idx_signal_outcomes_run ON signal_outcomes(run_id);
 
 CREATE INDEX idx_signal_outcomes_run_complete ON signal_outcomes(run_id, is_complete);
+
+CREATE INDEX idx_service_runtime_health ON service_runtime_status(status, heartbeat_at DESC);
 
 CREATE INDEX idx_signal_outcomes_run_side ON signal_outcomes(run_id, best_side);
 

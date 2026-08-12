@@ -66,7 +66,7 @@ _local = threading.local()
 _account_context = ContextVar("darkhorse_account_id", default=1)
 _init_lock = threading.RLock()
 _initialized_databases = set()
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 class _AutoClosingConnection:
@@ -1155,6 +1155,21 @@ def init_db():
             metrics_json TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS service_runtime_status (
+            service_name TEXT NOT NULL,
+            account_id INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'starting',
+            heartbeat_at TEXT NOT NULL,
+            last_success_at TEXT,
+            last_error_at TEXT,
+            error_code TEXT,
+            last_error TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (service_name, account_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_service_runtime_health
+            ON service_runtime_status(status, heartbeat_at DESC);
         CREATE TABLE IF NOT EXISTS position_roll_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             position_id TEXT,
@@ -1404,6 +1419,79 @@ def init_db():
     conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
     conn.commit()
     conn.close()
+
+
+def upsert_service_runtime_status(
+    service_name,
+    *,
+    status="ok",
+    account_id=0,
+    error_code=None,
+    last_error=None,
+    details=None,
+    heartbeat_at=None,
+):
+    """Persist a service heartbeat without exposing credentials or payload secrets."""
+    now = heartbeat_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    normalized_status = str(status or "unknown").strip().lower()
+    normalized_error = str(last_error).strip()[:2000] if last_error else None
+    success_at = now if normalized_status in {"ok", "idle"} else None
+    error_at = now if normalized_error else None
+    payload = json.dumps(details or {}, ensure_ascii=False, default=str, separators=(",", ":"))
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO service_runtime_status
+               (service_name, account_id, status, heartbeat_at, last_success_at,
+                last_error_at, error_code, last_error, detail_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(service_name, account_id) DO UPDATE SET
+                 status=excluded.status,
+                 heartbeat_at=excluded.heartbeat_at,
+                 last_success_at=COALESCE(excluded.last_success_at, service_runtime_status.last_success_at),
+                 last_error_at=COALESCE(excluded.last_error_at, service_runtime_status.last_error_at),
+                 error_code=excluded.error_code,
+                 last_error=excluded.last_error,
+                 detail_json=excluded.detail_json,
+                 updated_at=excluded.updated_at""",
+            (
+                str(service_name).strip(), int(account_id or 0), normalized_status,
+                now, success_at, error_at, error_code, normalized_error, payload, now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_service_runtime_status(service_name=None, account_id=None):
+    clauses = []
+    params = []
+    if service_name is not None:
+        clauses.append("service_name = ?")
+        params.append(str(service_name))
+    if account_id is not None:
+        clauses.append("account_id = ?")
+        params.append(int(account_id))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            f"""SELECT * FROM service_runtime_status {where}
+                ORDER BY service_name, account_id""",
+            params,
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["details"] = json.loads(item.pop("detail_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["details"] = {}
+            result.append(item)
+        return result
+    finally:
+        conn.close()
 
 
 def _ensure_column(conn, table, column, ddl):

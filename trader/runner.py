@@ -17,6 +17,7 @@ from shared.db import (
     insert_fill,
     insert_position_snapshot,
     record_strategy_decisions,
+    upsert_service_runtime_status,
     update_order_status,
 )
 from trader.exchange import BinanceFutures
@@ -44,8 +45,20 @@ def _json_object(value):
 async def _account_trading_loop(account):
     from shared.accounts import account_exchange_config
     from shared.db import set_account_context
-    set_account_context(account["id"])
-    exchange_cfg = account_exchange_config(account)
+    account_id = int(account["id"])
+    set_account_context(account_id)
+    try:
+        exchange_cfg = account_exchange_config(account)
+    except Exception as exc:
+        logger.error("Trading account configuration failed: %s", exc, exc_info=True)
+        upsert_service_runtime_status(
+            "trader",
+            account_id=account_id,
+            status="error",
+            error_code="account_configuration_failed",
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+        return
     missing_vars = []
     if not exchange_cfg.get("api_key"):
         missing_vars.append("API_KEY")
@@ -53,10 +66,23 @@ async def _account_trading_loop(account):
         missing_vars.append("API_SECRET")
     if missing_vars:
         logger.error("Binance API credentials missing: %s", ", ".join(missing_vars))
+        upsert_service_runtime_status(
+            "trader",
+            account_id=account_id,
+            status="error",
+            error_code="account_credentials_missing",
+            last_error=f"Binance API credentials missing: {', '.join(missing_vars)}",
+        )
         return
 
     network = "Testnet" if exchange_cfg.get("testnet") else "Mainnet"
     logger.info("=== 启动实盘交易引擎 (%s) ===", network)
+    upsert_service_runtime_status(
+        "trader",
+        account_id=account_id,
+        status="starting",
+        details={"network": network},
+    )
 
     # 初始化
     ex = BinanceFutures(exchange_cfg, account_id=account["id"], account_name=account["name"])
@@ -114,6 +140,14 @@ async def _account_trading_loop(account):
             scan, rows = fetch_latest_scan()
             if not rows:
                 logger.warning("暂无评分数据")
+                upsert_service_runtime_status(
+                    "trader",
+                    account_id=account_id,
+                    status="degraded",
+                    error_code="live_scan_empty",
+                    last_error="实盘交易循环没有可用评分数据，当前无法判断开仓。",
+                    details={"balance": balance, "position_count": len(positions)},
+                )
                 await asyncio.sleep(60)
                 continue
 
@@ -235,11 +269,59 @@ async def _account_trading_loop(account):
                 results = engine.execute(actions)
                 alpha_signal_consumer.finalize(account["id"], results)
                 logger.info(f"执行完成: {sum(1 for r in results if r['status']=='ok')} OK / {sum(1 for r in results if r['status']=='error')} ERR")
+                execution_errors = [r for r in results if r.get("status") == "error"]
+                if execution_errors:
+                    first_error = execution_errors[0]
+                    upsert_service_runtime_status(
+                        "trader",
+                        account_id=account_id,
+                        status="error",
+                        error_code="order_execution_failed",
+                        last_error=str(first_error.get("error") or first_error.get("message") or first_error)[:2000],
+                        details={
+                            "run_id": run_id,
+                            "action_count": len(actions),
+                            "error_count": len(execution_errors),
+                        },
+                    )
+                else:
+                    upsert_service_runtime_status(
+                        "trader",
+                        account_id=account_id,
+                        status="ok",
+                        details={
+                            "run_id": run_id,
+                            "balance": balance,
+                            "position_count": len(positions),
+                            "action_count": len(actions),
+                            "open_action_count": sum(a.get("action") == "open" for a in actions),
+                        },
+                    )
             else:
                 logger.info("无需操作")
+                upsert_service_runtime_status(
+                    "trader",
+                    account_id=account_id,
+                    status="ok",
+                    details={
+                        "run_id": run_id,
+                        "balance": balance,
+                        "position_count": len(positions),
+                        "action_count": 0,
+                        "open_action_count": 0,
+                        "message": "策略正常运行，当前没有满足条件的开仓。",
+                    },
+                )
 
         except Exception as e:
             logger.error(f"循环异常: {e}", exc_info=True)
+            upsert_service_runtime_status(
+                "trader",
+                account_id=account_id,
+                status="error",
+                error_code="trading_loop_failed",
+                last_error=f"{type(e).__name__}: {e}",
+            )
 
         await asyncio.sleep(loop_interval)
 
@@ -256,6 +338,12 @@ async def trading_loop():
             accounts = list_accounts(include_secrets=True, enabled_only=True)
         except Exception as exc:
             logger.warning("Trading account configuration temporarily unavailable: %s", exc)
+            upsert_service_runtime_status(
+                "trader",
+                status="error",
+                error_code="trading_accounts_unavailable",
+                last_error=f"{type(exc).__name__}: {exc}",
+            )
             await asyncio.sleep(5)
             continue
         active_ids = set()

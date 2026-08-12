@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from alpha_pipeline.collector import AlphaCollector
-from shared.db import init_db, purge_old_kline_data, RETENTION_DAYS
+from shared.db import (
+    init_db,
+    purge_old_kline_data,
+    RETENTION_DAYS,
+    upsert_service_runtime_status,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,12 +41,33 @@ async def collect_alpha(collector):
     logger.info("=== Alpha collect ===")
     try:
         purge_old_kline_data(days=RETENTION_DAYS)
-        await collector.collect_all(
+        universe = await collector.collect_all(
             universe_limit=ALPHA_UNIVERSE_LIMIT,
             market_top_n=ALPHA_MARKET_TOP_N,
         )
+        if universe:
+            upsert_service_runtime_status(
+                "alpha_pipeline",
+                status="ok",
+                details={"universe_count": len(universe), "market_env": collector.market_env},
+            )
+        else:
+            upsert_service_runtime_status(
+                "alpha_pipeline",
+                status="degraded",
+                error_code="alpha_universe_empty",
+                last_error="Alpha 币种池为空，无法生成 Alpha 扫描数据。",
+                details={"market_env": collector.market_env},
+            )
     except Exception as exc:
         logger.error("Alpha collect failed: %s", exc, exc_info=True)
+        upsert_service_runtime_status(
+            "alpha_pipeline",
+            status="error",
+            error_code="alpha_market_collection_failed",
+            last_error=f"{type(exc).__name__}: {exc}",
+            details={"market_env": collector.market_env},
+        )
     finally:
         if lock is not None and lock.locked():
             lock.release()
@@ -93,6 +119,11 @@ async def run_once():
 
 async def main():
     init_db()
+    upsert_service_runtime_status(
+        "alpha_pipeline",
+        status="starting",
+        details={"message": "Alpha 行情采集服务已启动，正在执行首轮采集。"},
+    )
     collector = AlphaCollector()
     collector.job_lock = asyncio.Lock()
     scheduler = AsyncIOScheduler()

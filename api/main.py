@@ -1404,6 +1404,7 @@ async def get_trading_status(user=Depends(get_user)):
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from shared.accounts import account_exchange_config, get_default_account
+    from shared.live_diagnostics import build_live_diagnostics
     from shared.db import (
         fetch_position_trade_groups,
         get_conn,
@@ -1430,6 +1431,7 @@ async def get_trading_status(user=Depends(get_user)):
             "recent_trades": [],
             "total_pnl": 0,
             "trading_controls": _safe_trading_runtime_controls(),
+            "runtime_diagnostics": build_live_diagnostics(account, exchange_error=str(exc)),
         }
 
     EXCLUDED_REASONS = ("historical_import", "鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)")
@@ -1810,6 +1812,7 @@ async def get_trading_status(user=Depends(get_user)):
             },
             "decision_panel": decision_panel,
             "trading_controls": controls,
+            "runtime_diagnostics": build_live_diagnostics(account),
         }
         # 淇濆瓨缂撳瓨
         _trading_status_cache["data"] = result
@@ -1822,6 +1825,10 @@ async def get_trading_status(user=Depends(get_user)):
             fallback["stale"] = True
             fallback["binance_warning"] = f"Binance 查询暂时超时，当前展示最近成功数据: {e}"
             fallback["stale_age_seconds"] = round(max(0, time.time() - _trading_status_cache.get("time", 0)), 1)
+            fallback["runtime_diagnostics"] = build_live_diagnostics(
+                account,
+                exchange_error=f"{type(e).__name__}: {e}",
+            )
             return fallback
         return {
             "error": str(e),
@@ -1831,6 +1838,10 @@ async def get_trading_status(user=Depends(get_user)):
             "recent_trades": [],
             "total_pnl": 0,
             "trading_controls": _safe_trading_runtime_controls(),
+            "runtime_diagnostics": build_live_diagnostics(
+                account,
+                exchange_error=f"{type(e).__name__}: {e}",
+            ),
         }
     finally:
         if conn is not None:
@@ -2028,6 +2039,7 @@ def _account_status_payload(account: dict) -> dict:
         set_account_context,
     )
     from trader.exchange import BinanceFutures
+    from shared.live_diagnostics import build_live_diagnostics
 
     account_token = set_account_context(account["id"])
     ex = None
@@ -2194,6 +2206,7 @@ def _account_status_payload(account: dict) -> dict:
             "normal_trading_enabled": bool(account.get("normal_trading_enabled")),
             "alpha_trading_enabled": bool(account.get("alpha_trading_enabled")),
             "auto_trading_enabled": bool(account.get("auto_trading_enabled")),
+            "runtime_diagnostics": build_live_diagnostics(account),
         }
     except Exception as exc:
         return {
@@ -2202,6 +2215,10 @@ def _account_status_payload(account: dict) -> dict:
             "error": str(exc), "positions": [], "recent_trades": [],
             "initial_capital": float(account.get("initial_capital") or 0),
             "max_positions": int(account.get("max_positions") or 5),
+            "runtime_diagnostics": build_live_diagnostics(
+                account,
+                exchange_error=f"{type(exc).__name__}: {exc}",
+            ),
         }
     finally:
         if ex is not None:

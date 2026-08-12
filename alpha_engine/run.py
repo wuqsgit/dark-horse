@@ -13,7 +13,7 @@ from alpha_engine.strategy.state_machine import (
     StateMachineConfig,
 )
 from alpha_engine.strategy.worker import AlphaStrategyWorker
-from shared.db import init_db, purge_old_kline_data
+from shared.db import init_db, purge_old_kline_data, upsert_service_runtime_status
 from trader.config import TRADING_CONFIG
 
 logging.basicConfig(
@@ -33,8 +33,28 @@ async def score_alpha():
         engine = AlphaScoringEngine()
         rows = engine.score_all(limit=ALPHA_SCORE_LIMIT)
         logger.info("Alpha scored %s symbols", len(rows))
+        if rows:
+            upsert_service_runtime_status(
+                "alpha_engine",
+                status="ok",
+                details={"scored_count": len(rows), "strategy_mode": ALPHA_STRATEGY_CFG.get("mode")},
+            )
+        else:
+            upsert_service_runtime_status(
+                "alpha_engine",
+                status="degraded",
+                error_code="alpha_scores_empty",
+                last_error="Alpha 策略没有生成评分结果。",
+                details={"strategy_mode": ALPHA_STRATEGY_CFG.get("mode")},
+            )
     except Exception as exc:
         logger.error("Alpha scoring failed: %s", exc, exc_info=True)
+        upsert_service_runtime_status(
+            "alpha_engine",
+            status="error",
+            error_code="alpha_scoring_failed",
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def build_strategy_worker():
@@ -83,8 +103,38 @@ async def process_alpha_strategy(worker):
             result["skipped"],
             len(result["errors"]),
         )
+        if result["errors"]:
+            upsert_service_runtime_status(
+                "alpha_engine",
+                status="error",
+                error_code="alpha_strategy_worker_errors",
+                last_error=str(result["errors"][0])[:2000],
+                details={
+                    "processed": result["processed"],
+                    "applied": result["applied"],
+                    "skipped": result["skipped"],
+                    "error_count": len(result["errors"]),
+                },
+            )
+        else:
+            upsert_service_runtime_status(
+                "alpha_engine",
+                status="ok",
+                details={
+                    "processed": result["processed"],
+                    "applied": result["applied"],
+                    "skipped": result["skipped"],
+                    "strategy_mode": ALPHA_STRATEGY_CFG.get("mode"),
+                },
+            )
     except Exception as exc:
         logger.error("Alpha Strategy V2 failed: %s", exc, exc_info=True)
+        upsert_service_runtime_status(
+            "alpha_engine",
+            status="error",
+            error_code="alpha_strategy_worker_failed",
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 async def run_once():

@@ -154,6 +154,50 @@ function DecisionPanel({ panel }) {
   );
 }
 
+function RuntimeDiagnostics({ diagnostics }) {
+  if (!diagnostics) return null;
+  const issues = diagnostics.issues || [];
+  const state = diagnostics.status || 'degraded';
+  const stateText = {
+    healthy: '运行正常，可以开仓',
+    degraded: '部分能力降级，请留意',
+    blocked: '存在异常，当前可能无法开仓',
+  }[state] || state;
+  return (
+    <div className={`trading-section runtime-diagnostics runtime-${state}`} role="status">
+      <div className="runtime-diagnostics-header">
+        <div>
+          <h3>实盘运行诊断</h3>
+          <div className="plain-meta">
+            最后检查：{timeText(diagnostics.checked_at)} · 最后策略执行：{timeText(diagnostics.last_execution_at)}
+          </div>
+        </div>
+        <span className={`runtime-state runtime-state-${state}`}>{stateText}</span>
+      </div>
+      <div className="runtime-scan-times">
+        <span>普通评分：{timeText(diagnostics.normal_scan_at)}</span>
+        <span>Alpha 评分：{timeText(diagnostics.alpha_scan_at)}</span>
+      </div>
+      {issues.length === 0 ? (
+        <div className="runtime-healthy-text">账户连接、行情采集、策略引擎和交易循环均未发现阻断异常。</div>
+      ) : (
+        <div className="runtime-issue-list">
+          {issues.map((issue, index) => (
+            <div className={`runtime-issue runtime-issue-${issue.severity}`} key={`${issue.code}-${index}`}>
+              <div className="runtime-issue-title">
+                <strong>{issue.title}</strong>
+                <span>{issue.severity === 'error' ? '阻断' : '提醒'}</span>
+              </div>
+              <div>{issue.message}</div>
+              {issue.observed_at && <div className="plain-meta">发生时间：{timeText(issue.observed_at)}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function LiveTrading() {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -207,6 +251,7 @@ export default function LiveTrading() {
   const recentTrades = selectedRow?.recent_trades || [];
   const stats = selectedRow?.stats || {};
   const accountSummary = selectedRow || {};
+  const runtimeDiagnostics = selectedRow?.runtime_diagnostics || status?.runtime_diagnostics;
   const filteredTrades = useMemo(() => {
     if (tradeFilter === 'all') return recentTrades;
     return recentTrades.filter((t) => (t.strategy_source || 'normal') === tradeFilter);
@@ -282,6 +327,7 @@ export default function LiveTrading() {
           <button type="button" onClick={() => setToast(null)}>×</button>
         </div>
       )}
+      <RuntimeDiagnostics diagnostics={runtimeDiagnostics} />
       <div className="trading-section">
         <h3>交易开关</h3>
         <div className="plain-grid">
