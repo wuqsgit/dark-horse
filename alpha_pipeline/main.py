@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from alpha_pipeline.collector import AlphaCollector
+from alpha_pipeline.square_collector import BinanceSquareCollector
 from shared.db import (
     init_db,
     purge_old_kline_data,
@@ -19,6 +20,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger("alpha_pipeline")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 ALPHA_UNIVERSE_LIMIT = int(os.getenv("ALPHA_UNIVERSE_LIMIT", "200"))
 ALPHA_MARKET_TOP_N = int(os.getenv("ALPHA_MARKET_TOP_N", "80"))
@@ -28,6 +30,9 @@ ALPHA_DERIVATIVES_INTERVAL_MIN = int(
 )
 ALPHA_FAST_INTERVAL_SECONDS = int(
     os.getenv("ALPHA_FAST_INTERVAL_SECONDS", "60")
+)
+ALPHA_SQUARE_INTERVAL_MIN = int(
+    os.getenv("ALPHA_SQUARE_INTERVAL_MIN", "5")
 )
 
 
@@ -40,6 +45,7 @@ async def collect_alpha(collector):
         await lock.acquire()
     logger.info("=== Alpha collect ===")
     try:
+        await collector.reset_client()
         purge_old_kline_data(days=RETENTION_DAYS)
         universe = await collector.collect_all(
             universe_limit=ALPHA_UNIVERSE_LIMIT,
@@ -107,14 +113,35 @@ async def collect_derivatives(collector):
             lock.release()
 
 
+async def collect_square(square_collector):
+    if not square_collector.enabled:
+        return
+    try:
+        result = await square_collector.collect_once(
+            limit=ALPHA_UNIVERSE_LIMIT,
+        )
+        logger.info(
+            "Alpha Square feed: symbols=%s posts=%s snapshots=%s errors=%s",
+            result.get("symbols"),
+            result.get("posts"),
+            result.get("snapshots"),
+            len(result.get("errors") or []),
+        )
+    except Exception as exc:
+        logger.error("Alpha Square feed failed: %s", exc, exc_info=True)
+
+
 async def run_once():
     init_db()
     collector = AlphaCollector()
+    square_collector = BinanceSquareCollector()
     collector.job_lock = asyncio.Lock()
     try:
         await collect_alpha(collector)
+        await collect_square(square_collector)
     finally:
         await collector.close()
+        await square_collector.close()
 
 
 async def main():
@@ -125,6 +152,7 @@ async def main():
         details={"message": "Alpha 行情采集服务已启动，正在执行首轮采集。"},
     )
     collector = AlphaCollector()
+    square_collector = BinanceSquareCollector()
     collector.job_lock = asyncio.Lock()
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
@@ -138,6 +166,18 @@ async def main():
         max_instances=1,
         coalesce=True,
     )
+    if square_collector.enabled:
+        scheduler.add_job(
+            collect_square,
+            "interval",
+            minutes=ALPHA_SQUARE_INTERVAL_MIN,
+            args=[square_collector],
+            id="alpha_square",
+            replace_existing=True,
+            next_run_time=datetime.now(tz=timezone.utc) + timedelta(seconds=30),
+            max_instances=1,
+            coalesce=True,
+        )
     scheduler.add_job(
         collect_strategy_fast,
         "interval",
@@ -176,6 +216,7 @@ async def main():
         pass
     scheduler.shutdown()
     await collector.close()
+    await square_collector.close()
     logger.info("Alpha pipeline stopped")
 
 

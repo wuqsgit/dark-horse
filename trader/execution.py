@@ -2233,6 +2233,7 @@ class ExecutionEngine:
             volume_price = evaluate_alpha_volume_price(
                 raw_alpha,
                 row.get("market_price") or 0,
+                discovery_score,
             )
 
             def record_candidate(reason=None, status="filtered"):

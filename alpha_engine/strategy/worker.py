@@ -18,6 +18,7 @@ from alpha_engine.strategy.feature_builder import (
 )
 from alpha_engine.strategy.models import StrategyObservation, TransitionResult
 from alpha_engine.strategy.models import ActionType, AlphaSignalState
+from alpha_engine.strategy.projection import build_strategy_projection
 from alpha_engine.strategy.repository import AlphaStrategyRepository
 from alpha_engine.strategy.setup_rules import detect_setup
 from alpha_engine.strategy.state_machine import (
@@ -31,6 +32,8 @@ from shared.db import (
     fetch_alpha_orderbook_depth,
     fetch_futures,
     fetch_futures_candles,
+    fetch_latest_alpha_scan,
+    fetch_latest_alpha_square_sentiment,
 )
 
 
@@ -61,24 +64,20 @@ class AlphaStrategyWorker:
         repository: AlphaStrategyRepository | None = None,
         machine: AlphaStrategyStateMachine | None = None,
         mode: str = "shadow",
-        market_env: str = "testnet",
+        market_env: str = "mainnet",
+        testnet_live_rule_fallback: bool = False,
     ):
         self.repository = repository or AlphaStrategyRepository()
         self.machine = machine or AlphaStrategyStateMachine()
         self.mode = str(mode or "shadow").lower()
-        self.market_env = str(market_env or "testnet").lower()
+        self.market_env = str(market_env or "mainnet").lower()
+        self.testnet_live_rule_fallback = bool(testnet_live_rule_fallback)
         if self.mode not in ALLOWED_MODES:
             raise ValueError(f"unsupported Alpha Strategy mode: {self.mode}")
-        if self.market_env not in {"testnet", "mainnet"}:
+        if self.market_env != "mainnet":
             raise ValueError(
-                f"unsupported Alpha Strategy market_env: {self.market_env}"
+                "Alpha Strategy market_env must be mainnet"
             )
-        if self.mode == "testnet_live" and self.market_env != "testnet":
-            raise ValueError("testnet_live requires market_env=testnet")
-        if self.mode in {"mainnet_canary", "mainnet_live"} and (
-            self.market_env != "mainnet"
-        ):
-            raise ValueError(f"{self.mode} requires market_env=mainnet")
         self.ai_evaluate = ai_evaluate or AlphaStrategyAIClient().evaluate
         self.worker_id = "alpha-v2-" + uuid.uuid4().hex[:12]
 
@@ -103,6 +102,7 @@ class AlphaStrategyWorker:
             "accumulation": 1.0,
             "continuation": 2.0,
             "reclaim": 3.0,
+            "sentiment_reversal": 4.0,
         }.get(str(setup_name or "").lower(), 0.0)
         enriched_quality = dict(snapshot.quality)
         missing = [
@@ -127,7 +127,11 @@ class AlphaStrategyWorker:
             quality=enriched_quality,
         )
         self.repository.save_feature_snapshot(snapshot)
-        trigger = evaluate_trigger(snapshot.features, current)
+        trigger = evaluate_trigger(
+            snapshot.features,
+            current,
+            setup_type=setup_name,
+        )
         stage = self._stage(current)
         payload = {
             "request_id": (
@@ -157,9 +161,10 @@ class AlphaStrategyWorker:
             )
             return WorkerResult(False, f"ai_unavailable:{exc}")
 
-        prediction = self._shadow_prediction_if_collecting(
+        prediction = self._rule_prediction_if_collecting(
             prediction,
             setup_score=setup.score,
+            setup_type=setup_name,
             trigger=trigger,
             stage=stage,
         )
@@ -184,6 +189,7 @@ class AlphaStrategyWorker:
             )
 
         features = snapshot.features
+        projection = build_strategy_projection(features, setup_type=setup_name)
         base_low = features.get("base_low_2h")
         base_high = features.get("base_high_2h")
         breakout_level = features.get("breakout_level") or base_high
@@ -233,6 +239,7 @@ class AlphaStrategyWorker:
                 ]
             ),
             model_versions=prediction.get("model_versions") or {},
+            metrics={"projection": projection},
         )
         transition = self.machine.transition(
             current,
@@ -264,6 +271,13 @@ class AlphaStrategyWorker:
     def run_once(self, *, limit: int = 200, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         symbols = [dict(row) for row in fetch_active_alpha_symbols(limit=limit)]
+        _scan, score_rows = fetch_latest_alpha_scan()
+        alpha_scores = {
+            str(row["base_asset"] or "").upper(): float(
+                row["alpha_score"] or 0
+            )
+            for row in score_rows
+        }
         futures_symbols = sorted(
             {
                 str(row.get("futures_symbol") or "").upper()
@@ -398,6 +412,12 @@ class AlphaStrategyWorker:
                     else [],
                     market_context=symbol_context,
                     listing_time=symbol_row.get("first_seen"),
+                    square_sentiment=fetch_latest_alpha_square_sentiment(
+                        symbol_row.get("base_asset"),
+                    ),
+                    alpha_discovery_score=alpha_scores.get(
+                        str(symbol_row.get("base_asset") or "").upper()
+                    ),
                 )
                 processed = self.process_snapshot(snapshot)
                 result["processed"] += 1
@@ -541,17 +561,22 @@ class AlphaStrategyWorker:
             return "acceptance"
         return "retest"
 
-    def _shadow_prediction_if_collecting(
+    def _rule_prediction_if_collecting(
         self,
         prediction: dict,
         *,
         setup_score: float,
+        setup_type: str | None,
         trigger,
         stage: str,
     ) -> dict:
         if prediction.get("p_setup_success") is not None:
             return prediction
-        if self.mode != "shadow":
+        allow_rule_fallback = self.mode == "shadow" or (
+            self.mode == "testnet_live"
+            and self.testnet_live_rule_fallback
+        )
+        if not allow_rule_fallback:
             return prediction
         followthrough = 0.0
         fakeout = 0.5
@@ -559,6 +584,22 @@ class AlphaStrategyWorker:
             followthrough, fakeout = 0.68, 0.30
         elif trigger.acceptance_confirmed:
             followthrough, fakeout = 0.72, 0.22
+        max_position_factor = 0.0
+        if trigger.trigger_detected:
+            max_position_factor = 0.5 if (
+                stage == "setup"
+                and setup_type == "sentiment_reversal"
+                and setup_score >= 100
+            ) else 0.30
+        elif trigger.acceptance_confirmed:
+            max_position_factor = 0.70
+        elif trigger.retest_confirmed:
+            max_position_factor = 1.0
+        fallback_name = (
+            "rule-live-v1"
+            if self.mode == "testnet_live"
+            else "rule-shadow-v1"
+        )
         return {
             **prediction,
             "status": "rule_shadow",
@@ -567,11 +608,11 @@ class AlphaStrategyWorker:
             "p_followthrough": followthrough,
             "p_fakeout": fakeout,
             "expected_r": max(0.0, followthrough - fakeout),
-            "max_position_factor": 0.0,
-            "model_versions": {"fallback": "rule-shadow-v1"},
+            "max_position_factor": max_position_factor,
+            "model_versions": {"fallback": fallback_name},
             "reasons": [
                 *(prediction.get("reasons") or []),
-                "AI model collecting; rule shadow probability used",
+                "AI model collecting; bounded rule probability used",
             ],
         }
 
@@ -587,6 +628,10 @@ class AlphaStrategyWorker:
         """Represent an evaluated bar while models are still collecting."""
         state = current.state if current else AlphaSignalState.IDLE
         features = snapshot.features
+        projection = build_strategy_projection(
+            features,
+            setup_type=setup.setup_type or (current.setup_type if current else None),
+        )
         base_low = features.get("base_low_2h")
         base_high = features.get("base_high_2h")
         breakout_level = features.get("breakout_level") or base_high
@@ -646,4 +691,5 @@ class AlphaStrategyWorker:
                 else dict(prediction.get("model_versions") or {})
             ),
             previous_version=current.state_version if current else 0,
+            metrics={"projection": projection},
         )

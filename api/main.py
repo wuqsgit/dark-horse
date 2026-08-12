@@ -26,6 +26,7 @@ from shared.db import (
     get_trading_runtime_controls,
     set_trading_runtime_control,
     fetch_market_data_health,
+    fetch_candle_sync_status,
     init_db,
 )
 from shared.policy_loop import (
@@ -467,6 +468,75 @@ async def auth_status():
 @app.get("/api/market-data/health")
 async def get_market_data_health(user=Depends(get_user)):
     return json_response(await asyncio.to_thread(fetch_market_data_health))
+
+
+@app.get("/api/market-data/minute/status")
+async def get_minute_market_data_status(user=Depends(get_user)):
+    status = await asyncio.to_thread(fetch_candle_sync_status)
+    alerts = []
+    now = datetime.now(timezone.utc)
+    for runtime in status.get("runtime") or []:
+        metrics = runtime.pop("metrics_json", "{}")
+        try:
+            runtime["metrics"] = json.loads(metrics or "{}")
+        except (TypeError, ValueError):
+            runtime["metrics"] = {}
+        heartbeat = runtime.get("heartbeat_at")
+        if heartbeat and runtime.get("status") != "completed":
+            try:
+                observed = datetime.fromisoformat(
+                    str(heartbeat).replace("Z", "+00:00")
+                )
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                age = (now - observed.astimezone(timezone.utc)).total_seconds()
+                runtime["heartbeat_age_seconds"] = round(max(0, age), 1)
+                if age > 180:
+                    alerts.append(
+                        {
+                            "severity": "error",
+                            "code": "minute_collector_stale",
+                            "collector_id": runtime.get("collector_id"),
+                            "age_seconds": round(age, 1),
+                        }
+                    )
+            except (TypeError, ValueError):
+                pass
+        if runtime.get("status") == "degraded":
+            alerts.append(
+                {
+                    "severity": "warning",
+                    "code": "minute_collector_degraded",
+                    "collector_id": runtime.get("collector_id"),
+                    "error": runtime.get("last_error"),
+                }
+            )
+    for gap in status.get("gaps") or []:
+        alerts.append(
+            {
+                "severity": "warning",
+                "code": "minute_candle_gap",
+                "market_kind": gap.get("market_kind"),
+                "source_env": gap.get("source_env"),
+                "count": gap.get("count"),
+                "oldest_start": gap.get("oldest_start"),
+            }
+        )
+    for aggregate in status.get("aggregates") or []:
+        mismatch_count = int(aggregate.get("mismatch_count") or 0)
+        if mismatch_count:
+            alerts.append(
+                {
+                    "severity": "warning",
+                    "code": "minute_aggregate_mismatch",
+                    "market_kind": aggregate.get("market_kind"),
+                    "interval": aggregate.get("interval"),
+                    "count": mismatch_count,
+                }
+            )
+    status["mode"] = os.getenv("MINUTE_PIPELINE_MODE", "live")
+    status["alerts"] = alerts
+    return json_response(status)
 
 
 def _build_scan_payload(scan, rows):
@@ -2582,8 +2652,8 @@ async def get_alpha_strategy_status(
     from alpha_engine.strategy.repository import AlphaStrategyRepository
     from shared.db import get_conn
 
-    env = str(market_env or "").lower() or None
-    if env not in {None, "testnet", "mainnet"}:
+    env = str(market_env or "mainnet").lower()
+    if env != "mainnet":
         return {"error": f"unsupported market_env: {market_env}"}
     limit = max(1, min(int(recent_limit), 200))
     repository = AlphaStrategyRepository()
@@ -2628,7 +2698,7 @@ async def get_alpha_strategy_status(
         conn.close()
     status.update(
         {
-            "market_env": env or "all",
+            "market_env": env,
             "snapshot_summary": dict(latest_snapshot or {}),
             "recent_states": [
                 _alpha_strategy_json_row(
@@ -2729,12 +2799,11 @@ async def get_alpha_strategy_snapshots(
 
     where = []
     params = []
-    if market_env:
-        env = str(market_env).lower()
-        if env not in {"testnet", "mainnet"}:
-            return {"error": f"unsupported market_env: {market_env}", "snapshots": []}
-        where.append("market_env=?")
-        params.append(env)
+    env = str(market_env or "mainnet").lower()
+    if env != "mainnet":
+        return {"error": f"unsupported market_env: {market_env}", "snapshots": []}
+    where.append("market_env=?")
+    params.append(env)
     if symbol:
         where.append("futures_symbol=?")
         params.append(str(symbol).upper())

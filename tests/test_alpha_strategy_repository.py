@@ -73,14 +73,14 @@ class AlphaStrategyRepositoryTest(unittest.TestCase):
         )
 
         first = self.repo.apply_transition(
-            market_env="testnet",
+            market_env="mainnet",
             futures_symbol="AKEUSDT",
             alpha_symbol="AKEALPHAUSDT",
             transition=transition,
             strategy_mode="testnet_live",
         )
         second = self.repo.apply_transition(
-            market_env="testnet",
+            market_env="mainnet",
             futures_symbol="AKEUSDT",
             alpha_symbol="AKEALPHAUSDT",
             transition=transition,
@@ -89,9 +89,9 @@ class AlphaStrategyRepositoryTest(unittest.TestCase):
 
         self.assertTrue(first.applied)
         self.assertFalse(second.applied)
-        state = self.repo.get_state("testnet", "AKEUSDT")
+        state = self.repo.get_state("mainnet", "AKEUSDT")
         self.assertEqual(state.state, AlphaSignalState.PROBE_READY)
-        events = self.repo.fetch_actionable_events("testnet")
+        events = self.repo.fetch_actionable_events("mainnet")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["action_type"], "PROBE_LONG")
         self.assertEqual(events[0]["strategy_mode"], "testnet_live")
@@ -125,14 +125,14 @@ class AlphaStrategyRepositoryTest(unittest.TestCase):
         )
 
         self.repo.apply_transition(
-            market_env="testnet",
+            market_env="mainnet",
             futures_symbol="AKEUSDT",
             alpha_symbol="AKEALPHAUSDT",
             transition=transition,
             strategy_mode="shadow",
         )
 
-        self.assertEqual(self.repo.fetch_actionable_events("testnet"), [])
+        self.assertEqual(self.repo.fetch_actionable_events("mainnet"), [])
 
     def test_account_consumes_event_only_once(self):
         now = datetime(2026, 7, 28, 4, 0, tzinfo=timezone.utc)
@@ -162,7 +162,7 @@ class AlphaStrategyRepositoryTest(unittest.TestCase):
             previous_version=0,
         )
         applied = self.repo.apply_transition(
-            market_env="testnet",
+            market_env="mainnet",
             futures_symbol="AKEUSDT",
             alpha_symbol="AKEALPHAUSDT",
             transition=transition,

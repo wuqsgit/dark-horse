@@ -70,6 +70,14 @@ class AlphaSignalConsumer:
         mode = str(self.strategy.get("mode") or "shadow").lower()
         return (mode,) if mode in LIVE_MODES | {"signal"} else ()
 
+    @staticmethod
+    def _mode_allows_account(mode: str, execution_env: str) -> bool:
+        if mode == "testnet_live":
+            return execution_env == "testnet"
+        if mode in {"mainnet_canary", "mainnet_live"}:
+            return execution_env == "mainnet"
+        return mode == "signal"
+
     def _account_loss_state(self, account_id: int) -> tuple[float, int]:
         conn = get_conn()
         try:
@@ -130,13 +138,15 @@ class AlphaSignalConsumer:
         ):
             return []
         account_id = int(account["id"])
-        market_env = self.account_market_env(account)
-        configured_env = str(self.strategy.get("market_env") or "").lower()
-        if configured_env and configured_env != market_env:
+        execution_env = self.account_market_env(account)
+        if not self._mode_allows_account(modes[0], execution_env):
             return []
+        data_env = str(
+            self.strategy.get("market_env") or "mainnet"
+        ).strip().lower()
         events = self.repository.fetch_account_events(
             account_id=account_id,
-            market_env=market_env,
+            market_env=data_env,
             strategy_modes=modes,
         )
         if not events:
@@ -365,7 +375,9 @@ class AlphaSignalConsumer:
                 )
                 continue
             stage_cap = {
-                "PROBE_LONG": float(self.strategy.get("probe_stage_cap") or 0.30),
+                "PROBE_LONG": float(
+                    self.strategy.get("probe_stage_cap") or 0.30
+                ),
                 "CONFIRM_LONG": float(
                     self.strategy.get("confirmed_stage_cap") or 0.70
                 ),
@@ -373,6 +385,15 @@ class AlphaSignalConsumer:
                     self.strategy.get("retest_stage_cap") or 1.00
                 ),
             }[action_type]
+            event_reasons = _json(event.get("reason_codes_json"), [])
+            sentiment_reversal = (
+                action_type == "PROBE_LONG"
+                and "sentiment_reversal_probe_confirmed" in event_reasons
+            )
+            if sentiment_reversal:
+                stage_cap = float(
+                    self.strategy.get("sentiment_reversal_stage_cap") or 0.50
+                )
             ai_factor = float(event.get("max_position_factor") or 0)
             final_factor = min(stage_cap, ai_factor)
             if event["strategy_mode"] == "mainnet_canary":
@@ -492,6 +513,8 @@ class AlphaSignalConsumer:
                 "leverage": int(pos_info["leverage"]),
                 "strategy_source": "alpha",
                 "signal_source": "alpha_strategy_v2",
+                "market_data_env": data_env,
+                "execution_env": execution_env,
                 "alpha_symbol": event.get("alpha_symbol"),
                 "alpha_profile": "ai_state_machine",
                 "alpha_entry_level": action_type.lower(),

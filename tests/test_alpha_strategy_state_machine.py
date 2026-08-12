@@ -51,7 +51,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
         self.assertEqual(watch.action_type, ActionType.NONE)
 
         armed = self.machine.transition(
-            watch.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            watch.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-2",
                 candle_close_time=NOW + timedelta(minutes=15),
@@ -62,7 +62,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
         self.assertEqual(armed.to_state, AlphaSignalState.ARMED)
 
         probe = self.machine.transition(
-            armed.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            armed.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-3",
                 candle_close_time=NOW + timedelta(minutes=30),
@@ -83,7 +83,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
             None,
             _observation(setup_probability=0.7),
             now=NOW,
-        ).as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT")
+        ).as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT")
         armed = self.machine.transition(
             current,
             _observation(
@@ -92,7 +92,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
                 setup_probability=0.7,
             ),
             now=NOW + timedelta(minutes=15),
-        ).as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT")
+        ).as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT")
 
         result = self.machine.transition(
             armed,
@@ -115,7 +115,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
             None,
             _observation(setup_probability=0.7),
             now=NOW,
-        ).as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT")
+        ).as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT")
 
         result = self.machine.transition(
             current,
@@ -153,7 +153,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
             now=NOW,
         )
         armed = self.machine.transition(
-            watch.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            watch.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-2",
                 candle_close_time=NOW + timedelta(minutes=15),
@@ -162,7 +162,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
             now=NOW + timedelta(minutes=15),
         )
         probe = self.machine.transition(
-            armed.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            armed.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-3",
                 candle_close_time=NOW + timedelta(minutes=30),
@@ -175,7 +175,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
         )
 
         failed = self.machine.transition(
-            probe.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            probe.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-4",
                 candle_close_time=NOW + timedelta(minutes=45),
@@ -188,7 +188,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
         self.assertEqual(failed.action_type, ActionType.INVALIDATE_PROBE)
 
         cooldown = self.machine.transition(
-            failed.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            failed.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-5",
                 candle_close_time=NOW + timedelta(hours=1),
@@ -200,7 +200,7 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
         self.assertEqual(cooldown.action_type, ActionType.NONE)
 
         idle = self.machine.transition(
-            cooldown.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT"),
+            cooldown.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
             _observation(
                 snapshot_id="snap-6",
                 candle_close_time=NOW + timedelta(hours=2),
@@ -214,12 +214,31 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
 
     def test_same_closed_candle_is_idempotent(self):
         first = self.machine.transition(None, _observation(), now=NOW)
-        current = first.as_state_record("testnet", "AKEUSDT", "AKEALPHAUSDT")
+        current = first.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT")
 
         duplicate = self.machine.transition(current, _observation(), now=NOW)
 
         self.assertFalse(duplicate.changed)
         self.assertEqual(duplicate.to_state, AlphaSignalState.WATCH_ACCUMULATION)
+
+    def test_sentiment_reversal_can_emit_probe_from_idle(self):
+        result = self.machine.transition(
+            None,
+            _observation(
+                setup_type="sentiment_reversal",
+                setup_probability=1.0,
+                followthrough_probability=0.68,
+                fakeout_probability=0.30,
+                trigger_detected=True,
+                max_position_factor=0.5,
+                reasons=("square_extreme_bearishness",),
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual(result.to_state, AlphaSignalState.PROBE_READY)
+        self.assertEqual(result.action_type, ActionType.PROBE_LONG)
+        self.assertIn("sentiment_reversal_probe_confirmed", result.reasons)
 
 
 if __name__ == "__main__":

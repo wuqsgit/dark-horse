@@ -19,6 +19,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger("pipeline")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOP_SYMBOLS = int(os.getenv("TOP_SYMBOLS", "150"))
 

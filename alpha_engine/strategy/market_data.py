@@ -6,23 +6,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
 
-MARKET_ENVS = {"mainnet", "testnet"}
+MARKET_ENV = "mainnet"
+MARKET_ENVS = {MARKET_ENV}
 
 
 def resolve_market_env(value: str | None = None) -> str:
     """Resolve an explicit market-data environment.
 
-    Alpha market data can be configured independently from account execution,
-    but every persisted row and model sample must retain the resolved value.
+    Market data is independent from account execution. Runtime defaults to
+    mainnet so testnet accounts evaluate the same public market as production.
+    Explicit values remain supported for historical replay and migrations.
     """
     raw = value
     if raw is None:
         raw = os.getenv("ALPHA_FUTURES_MARKET_ENV")
     if raw is None:
-        is_testnet = os.getenv("BINANCE_TESTNET", "true").strip().lower() in {
-            "1", "true", "yes", "on",
-        }
-        raw = "testnet" if is_testnet else "mainnet"
+        raw = MARKET_ENV
     result = str(raw).strip().lower()
     if result not in MARKET_ENVS:
         raise ValueError(f"unsupported Alpha futures market environment: {value}")
@@ -30,12 +29,8 @@ def resolve_market_env(value: str | None = None) -> str:
 
 
 def futures_rest_base(market_env: str) -> str:
-    env = resolve_market_env(market_env)
-    return (
-        "https://testnet.binancefuture.com"
-        if env == "testnet"
-        else "https://fapi.binance.com"
-    )
+    resolve_market_env(market_env)
+    return "https://fapi.binance.com"
 
 
 def is_closed_kline(row, *, now_ms: int | None = None) -> bool:

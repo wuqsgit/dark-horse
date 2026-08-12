@@ -67,7 +67,7 @@ class AIAlphaStrategyModelsTest(unittest.TestCase):
                     "candle_close_time": (
                         start + timedelta(days=index)
                     ).isoformat().replace("+00:00", "Z"),
-                    "feature_schema_version": 3,
+                    "feature_schema_version": 4,
                     "features": {
                         "ret_15m": float(label),
                         "ret_30m": float(1 - label),

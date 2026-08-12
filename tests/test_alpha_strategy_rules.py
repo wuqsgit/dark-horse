@@ -112,6 +112,60 @@ class AlphaStrategyRulesTest(unittest.TestCase):
         self.assertFalse(result.trigger_detected)
         self.assertIn("price_efficiency_too_low", result.reasons)
 
+    def test_square_extreme_bearishness_detects_sentiment_reversal(self):
+        features = {
+            "square_sentiment_available": 1,
+            "square_sentiment_age_minutes": 5,
+            "square_bearish_ratio": 0.84,
+            "square_effective_post_count": 24,
+            "square_unique_authors": 20,
+            "square_top3_author_share": 0.15,
+            "square_bearish_shift_24h": 0.34,
+            "square_substantive_risk_count": 0,
+            "alpha_discovery_score": 85,
+            "spot_volume_ratio_15m": 2.0,
+            "futures_volume_ratio_15m": 1.8,
+            "volume_sync_score": 0.9,
+            "spread_pct_current": 0.10,
+            "ret_15m": 0.3,
+            "quote_volume_ratio_15m": 1.8,
+            "close_location": 0.62,
+            "upper_wick_ratio": 0.30,
+            "breakout_distance_pct": -0.2,
+        }
+
+        setup = detect_setup(features)
+        trigger = evaluate_trigger(
+            features,
+            setup_type=setup.setup_type,
+        )
+
+        self.assertTrue(setup.detected)
+        self.assertEqual(setup.setup_type, "sentiment_reversal")
+        self.assertTrue(trigger.trigger_detected)
+        self.assertIn("square_reversal_price_stabilized", trigger.reasons)
+
+    def test_square_substantive_risk_blocks_sentiment_reversal(self):
+        result = detect_setup(
+            {
+                "square_sentiment_available": 1,
+                "square_sentiment_age_minutes": 2,
+                "square_bearish_ratio": 0.90,
+                "square_effective_post_count": 30,
+                "square_unique_authors": 25,
+                "square_top3_author_share": 0.12,
+                "square_bearish_shift_24h": 0.40,
+                "square_substantive_risk_count": 1,
+                "alpha_discovery_score": 90,
+                "spot_volume_ratio_15m": 2.0,
+                "futures_volume_ratio_15m": 2.0,
+                "volume_sync_score": 1.0,
+                "spread_pct_current": 0.05,
+            }
+        )
+
+        self.assertNotEqual(result.setup_type, "sentiment_reversal")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,7 +39,7 @@ class AlphaFeatureBuilderV3Test(unittest.TestCase):
         first = build_alpha_feature_snapshot(
             alpha_symbol="AKEALPHAUSDT",
             futures_symbol="AKEUSDT",
-            market_env="testnet",
+            market_env="mainnet",
             cutoff_time=cutoff,
             candles_15m=rows_15m,
             candles_1h=rows_1h,
@@ -47,7 +47,7 @@ class AlphaFeatureBuilderV3Test(unittest.TestCase):
         second = build_alpha_feature_snapshot(
             alpha_symbol="AKEALPHAUSDT",
             futures_symbol="AKEUSDT",
-            market_env="testnet",
+            market_env="mainnet",
             cutoff_time=cutoff,
             candles_15m=rows_15m,
             candles_1h=rows_1h,
@@ -55,7 +55,7 @@ class AlphaFeatureBuilderV3Test(unittest.TestCase):
 
         self.assertEqual(first.snapshot_id, second.snapshot_id)
         self.assertEqual(first.feature_schema_version, FEATURE_SCHEMA_VERSION)
-        self.assertEqual(first.market_env, "testnet")
+        self.assertEqual(first.market_env, "mainnet")
         self.assertEqual(first.features["higher_lows_8x15m"], 7.0)
         self.assertGreater(first.features["ema20_slope_1h"], 0)
         self.assertGreater(first.features["taker_buy_quote_ratio"], 0.5)
@@ -72,7 +72,7 @@ class AlphaFeatureBuilderV3Test(unittest.TestCase):
         snapshot = build_alpha_feature_snapshot(
             alpha_symbol="AKEALPHAUSDT",
             futures_symbol="AKEUSDT",
-            market_env="testnet",
+            market_env="mainnet",
             cutoff_time=cutoff,
             candles_15m=rows_15m,
             candles_1h=rows_1h,
@@ -90,7 +90,7 @@ class AlphaFeatureBuilderV3Test(unittest.TestCase):
         snapshot = build_alpha_feature_snapshot(
             alpha_symbol="AKEALPHAUSDT",
             futures_symbol="AKEUSDT",
-            market_env="testnet",
+            market_env="mainnet",
             cutoff_time=start + timedelta(hours=10),
             candles_15m=rows_15m,
             candles_1h=rows_1h,
@@ -98,6 +98,39 @@ class AlphaFeatureBuilderV3Test(unittest.TestCase):
 
         self.assertIsNone(snapshot.features["taker_buy_quote_ratio"])
         self.assertIn("taker_buy_quote_ratio", snapshot.quality["missing_features"])
+
+    def test_includes_square_sentiment_features(self):
+        start = datetime(2026, 7, 27, tzinfo=timezone.utc)
+        snapshot = build_alpha_feature_snapshot(
+            alpha_symbol="AKEALPHAUSDT",
+            futures_symbol="AKEUSDT",
+            market_env="mainnet",
+            cutoff_time=start + timedelta(hours=10),
+            candles_15m=_rows(40, start=start, interval_minutes=15),
+            candles_1h=_rows(
+                30,
+                start=start - timedelta(hours=20),
+                interval_minutes=60,
+            ),
+            square_sentiment={
+                "bearish_ratio": 0.85,
+                "baseline_bearish_ratio_24h": 0.40,
+                "effective_post_count": 24,
+                "unique_authors": 20,
+                "top3_author_share": 0.15,
+                "substantive_risk_count": 0,
+                "age_minutes": 4,
+            },
+            alpha_discovery_score=86,
+        )
+
+        self.assertEqual(snapshot.feature_schema_version, 4)
+        self.assertEqual(snapshot.features["square_sentiment_available"], 1)
+        self.assertAlmostEqual(
+            snapshot.features["square_bearish_shift_24h"],
+            0.45,
+        )
+        self.assertEqual(snapshot.features["alpha_discovery_score"], 86)
 
 
 if __name__ == "__main__":

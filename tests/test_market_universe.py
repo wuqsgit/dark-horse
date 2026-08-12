@@ -47,8 +47,8 @@ class MarketUniverseTest(unittest.TestCase):
 
     def test_readiness_rejects_stale_or_short_market(self):
         now = datetime(2026, 7, 10, 4, 0, tzinfo=timezone.utc)
-        spot = CandleState(now - timedelta(minutes=5), now - timedelta(minutes=30), 40, 60)
-        futures = CandleState(now - timedelta(minutes=5), now - timedelta(minutes=30), 40, 49)
+        spot = CandleState(now - timedelta(minutes=15), now - timedelta(hours=1), 40, 60)
+        futures = CandleState(now - timedelta(minutes=15), now - timedelta(hours=1), 40, 49)
 
         result = assess_dual_market_readiness(now, spot, futures)
 
@@ -58,7 +58,7 @@ class MarketUniverseTest(unittest.TestCase):
 
     def test_readiness_accepts_complete_fresh_markets(self):
         now = datetime(2026, 7, 10, 4, 0, tzinfo=timezone.utc)
-        state = CandleState(now - timedelta(minutes=5), now - timedelta(minutes=30), 40, 50)
+        state = CandleState(now - timedelta(minutes=15), now - timedelta(hours=1), 40, 50)
 
         result = assess_dual_market_readiness(now, state, state)
 

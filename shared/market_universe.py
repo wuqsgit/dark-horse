@@ -1,6 +1,6 @@
 """Deterministic market-universe selection and candle readiness checks."""
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 
 MIN_1H_CANDLES = 50
@@ -107,13 +107,26 @@ def _utc(value):
 
 def assess_dual_market_readiness(now, spot, futures):
     now = _utc(now)
+
+    def latest_closed_bucket_open(interval_minutes):
+        minute_index = int(now.timestamp() // 60)
+        current_bucket = (
+            minute_index // interval_minutes
+        ) * interval_minutes
+        return datetime.fromtimestamp(
+            (current_bucket - interval_minutes) * 60,
+            tz=timezone.utc,
+        )
+
+    expected_15m = latest_closed_bucket_open(15)
+    expected_1h = latest_closed_bucket_open(60)
     checks = [
-        ("spot_15m_age", spot.latest_15m is not None and now - _utc(spot.latest_15m) <= timedelta(minutes=20)),
-        ("spot_1h_age", spot.latest_1h is not None and now - _utc(spot.latest_1h) <= timedelta(minutes=75)),
+        ("spot_15m_age", spot.latest_15m is not None and _utc(spot.latest_15m) == expected_15m),
+        ("spot_1h_age", spot.latest_1h is not None and _utc(spot.latest_1h) == expected_1h),
         ("spot_15m_count", spot.count_15m >= 32),
         ("spot_1h_count", spot.count_1h >= MIN_1H_CANDLES),
-        ("futures_15m_age", futures.latest_15m is not None and now - _utc(futures.latest_15m) <= timedelta(minutes=20)),
-        ("futures_1h_age", futures.latest_1h is not None and now - _utc(futures.latest_1h) <= timedelta(minutes=75)),
+        ("futures_15m_age", futures.latest_15m is not None and _utc(futures.latest_15m) == expected_15m),
+        ("futures_1h_age", futures.latest_1h is not None and _utc(futures.latest_1h) == expected_1h),
         ("futures_15m_count", futures.count_15m >= 32),
         ("futures_1h_count", futures.count_1h >= MIN_1H_CANDLES),
     ]

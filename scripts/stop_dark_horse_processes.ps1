@@ -5,38 +5,52 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Pattern,
 
-    [int[]]$Ports = @()
+    [string]$Ports = ""
 )
 
 $ErrorActionPreference = "SilentlyContinue"
 $rootPath = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
-$allProcesses = @(Get-CimInstance Win32_Process)
-$matches = @(
-    $allProcesses | Where-Object {
-        $_.ProcessId -ne $PID -and
-        $_.CommandLine -and
-        $_.CommandLine.Contains($Pattern) -and
-        (
-            ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($rootPath, [System.StringComparison]::OrdinalIgnoreCase)) -or
-            $_.CommandLine.Contains($rootPath)
-        )
-    }
-)
+$targetIds = [System.Collections.Generic.HashSet[int]]::new()
 
-$matchedIds = @($matches | ForEach-Object { [int]$_.ProcessId })
-$roots = @($matches | Where-Object { $matchedIds -notcontains [int]$_.ParentProcessId })
-foreach ($process in $roots) {
-    & taskkill.exe /PID $process.ProcessId /T /F 2>$null | Out-Null
+# All DarkHorse Python launchers live inside the workspace virtualenv. Stopping
+# a launcher also terminates the child base-Python process without a WMI scan.
+if ($Pattern -eq "__dark_horse_all__") {
+    Get-Process | ForEach-Object {
+        $path = $_.Path
+        if (
+            $_.Id -ne $PID -and
+            $path -and
+            $path.StartsWith(
+                $rootPath,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            [void]$targetIds.Add([int]$_.Id)
+        }
+    }
 }
 
-foreach ($port in $Ports) {
-    $owners = @(
-        Get-NetTCPConnection -State Listen -LocalPort $port |
-            Select-Object -ExpandProperty OwningProcess -Unique
-    )
-    foreach ($ownerPid in $owners) {
-        if ($ownerPid -and $ownerPid -ne $PID) {
-            & taskkill.exe /PID $ownerPid /T /F 2>$null | Out-Null
+$portSet = @(
+    $Ports -split "," |
+        Where-Object { $_ } |
+        ForEach-Object { [int]$_ }
+)
+if ($portSet.Count -gt 0) {
+    netstat.exe -ano -p tcp | ForEach-Object {
+        $parts = @($_ -split '\s+' | Where-Object { $_ })
+        if ($parts.Count -lt 5 -or $parts[3] -ne "LISTENING") {
+            return
         }
+        $localEndpoint = $parts[1]
+        $portText = ($localEndpoint -split ':')[-1]
+        if ($portText -match '^\d+$' -and $portSet -contains [int]$portText) {
+            [void]$targetIds.Add([int]$parts[4])
+        }
+    }
+}
+
+foreach ($processId in $targetIds) {
+    if ($processId -and $processId -ne $PID) {
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
 }

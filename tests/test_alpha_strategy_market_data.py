@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from alpha_engine.strategy.market_data import (
     futures_rest_base,
@@ -10,14 +11,21 @@ from alpha_engine.strategy.market_data import (
 
 
 class AlphaStrategyMarketDataTest(unittest.TestCase):
-    def test_market_environment_is_explicit_and_has_matching_base_url(self):
-        self.assertEqual(resolve_market_env("TESTNET"), "testnet")
+    def test_market_data_defaults_to_mainnet_independent_of_trading_account(self):
+        with patch.dict(
+            "os.environ",
+            {"BINANCE_TESTNET": "true"},
+            clear=True,
+        ):
+            self.assertEqual(resolve_market_env(), "mainnet")
+
+    def test_market_environment_is_mainnet_only(self):
         self.assertEqual(resolve_market_env("mainnet"), "mainnet")
-        self.assertEqual(
-            futures_rest_base("testnet"),
-            "https://testnet.binancefuture.com",
-        )
         self.assertEqual(futures_rest_base("mainnet"), "https://fapi.binance.com")
+        with self.assertRaisesRegex(ValueError, "market environment"):
+            resolve_market_env("testnet")
+        with self.assertRaisesRegex(ValueError, "market environment"):
+            futures_rest_base("testnet")
 
     def test_unknown_market_environment_is_rejected(self):
         with self.assertRaises(ValueError):

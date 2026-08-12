@@ -142,7 +142,7 @@ class AIStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sample_key TEXT NOT NULL UNIQUE,
                     request_id TEXT NOT NULL,
-                    market_env TEXT NOT NULL,
+                    market_env TEXT NOT NULL CHECK(market_env='mainnet'),
                     model_key TEXT NOT NULL,
                     futures_symbol TEXT NOT NULL,
                     alpha_symbol TEXT,
@@ -173,7 +173,7 @@ class AIStore:
                 CREATE TABLE IF NOT EXISTS alpha_strategy_decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     request_id TEXT NOT NULL,
-                    market_env TEXT NOT NULL,
+                    market_env TEXT NOT NULL CHECK(market_env='mainnet'),
                     futures_symbol TEXT NOT NULL,
                     alpha_symbol TEXT,
                     stage TEXT NOT NULL,
@@ -198,7 +198,7 @@ class AIStore:
                 CREATE TABLE IF NOT EXISTS alpha_strategy_models (
                     version TEXT PRIMARY KEY,
                     model_key TEXT NOT NULL,
-                    market_env TEXT NOT NULL,
+                    market_env TEXT NOT NULL CHECK(market_env='mainnet'),
                     stage TEXT NOT NULL,
                     target TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -219,7 +219,7 @@ class AIStore:
                 CREATE TABLE IF NOT EXISTS alpha_strategy_model_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     model_key TEXT NOT NULL,
-                    market_env TEXT NOT NULL,
+                    market_env TEXT NOT NULL CHECK(market_env='mainnet'),
                     stage TEXT NOT NULL,
                     target TEXT NOT NULL,
                     version TEXT,
@@ -358,7 +358,7 @@ class AIStore:
         clauses = [
             "stage='setup'",
             "setup_type IS NOT NULL",
-            "feature_schema_version=3",
+            "feature_schema_version=4",
             "strftime('%M', candle_close_time)='00'",
         ]
         params = []

@@ -55,6 +55,7 @@ class StrategyObservation:
     max_position_factor: float = 0.0
     reasons: tuple[str, ...] = ()
     model_versions: Mapping[str, str] = field(default_factory=dict)
+    metrics: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,7 @@ class TransitionResult:
     reasons: tuple[str, ...]
     model_versions: Mapping[str, str]
     previous_version: int
+    metrics: Mapping[str, Any] = field(default_factory=dict)
 
     def as_state_record(
         self,
@@ -142,6 +144,7 @@ class TransitionResult:
             expected_r=self.expected_r,
             model_versions=dict(self.model_versions),
             reasons=tuple(self.reasons),
+            metrics=dict(self.metrics),
         )
 
 

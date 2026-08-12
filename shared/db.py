@@ -50,6 +50,8 @@ OPERATIONAL_RETENTION_TABLES = {
     "alpha_scores": "time",
     "training_samples": "timestamp",
     "alpha_scan_scores": "time",
+    "alpha_square_posts": "published_at",
+    "alpha_square_sentiment_snapshots": "time",
     "alpha_trade_candidates": "time",
     "strategy_decisions": "time",
     "decision_actions": "time",
@@ -66,7 +68,7 @@ _local = threading.local()
 _account_context = ContextVar("darkhorse_account_id", default=1)
 _init_lock = threading.RLock()
 _initialized_databases = set()
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 
 class _AutoClosingConnection:
@@ -222,6 +224,40 @@ def init_db():
             open REAL, high REAL, low REAL, close REAL,
             volume REAL, quote_vol REAL, trades INTEGER,
             PRIMARY KEY (time, symbol)
+        );
+        CREATE TABLE IF NOT EXISTS candles_1m (
+            time TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL DEFAULT 0,
+            quote_vol REAL NOT NULL DEFAULT 0,
+            trades INTEGER NOT NULL DEFAULT 0,
+            taker_buy_quote_vol REAL NOT NULL DEFAULT 0,
+            source_env TEXT NOT NULL DEFAULT 'mainnet',
+            is_closed INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'stream',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (time, symbol, source_env)
+        );
+        CREATE TABLE IF NOT EXISTS futures_candles_1m (
+            time TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL DEFAULT 0,
+            quote_vol REAL NOT NULL DEFAULT 0,
+            trades INTEGER NOT NULL DEFAULT 0,
+            taker_buy_quote_vol REAL NOT NULL DEFAULT 0,
+            source_env TEXT NOT NULL DEFAULT 'mainnet',
+            is_closed INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'stream',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (time, symbol, source_env)
         );
         CREATE TABLE IF NOT EXISTS futures_candles_1h (
             time TEXT, symbol TEXT,
@@ -938,6 +974,38 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_alpha_symbols_tradeability ON alpha_symbols(tradeability);
         CREATE INDEX IF NOT EXISTS idx_alpha_symbols_volume ON alpha_symbols(volume_24h DESC);
+        CREATE TABLE IF NOT EXISTS alpha_square_posts (
+            post_id TEXT PRIMARY KEY,
+            base_asset TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            author_id TEXT,
+            author_name TEXT,
+            content TEXT,
+            sentiment TEXT NOT NULL,
+            sentiment_confidence REAL DEFAULT 0,
+            substantive_risk INTEGER DEFAULT 0,
+            engagement REAL DEFAULT 0,
+            source_url TEXT,
+            raw_json TEXT,
+            collected_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_square_posts_asset_time
+            ON alpha_square_posts(base_asset, published_at DESC);
+        CREATE TABLE IF NOT EXISTS alpha_square_sentiment_snapshots (
+            time TEXT NOT NULL,
+            base_asset TEXT NOT NULL,
+            window_minutes INTEGER NOT NULL DEFAULT 30,
+            effective_post_count INTEGER NOT NULL DEFAULT 0,
+            unique_authors INTEGER NOT NULL DEFAULT 0,
+            bearish_ratio REAL NOT NULL DEFAULT 0,
+            baseline_bearish_ratio_24h REAL NOT NULL DEFAULT 0,
+            top3_author_share REAL NOT NULL DEFAULT 1,
+            substantive_risk_count INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT,
+            PRIMARY KEY (time, base_asset, window_minutes)
+        );
+        CREATE INDEX IF NOT EXISTS idx_alpha_square_sentiment_asset_time
+            ON alpha_square_sentiment_snapshots(base_asset, time DESC);
         CREATE TABLE IF NOT EXISTS alpha_candles_1h (
             time TEXT, alpha_symbol TEXT,
             open REAL, high REAL, low REAL, close REAL,
@@ -961,6 +1029,77 @@ def init_db():
             open REAL, high REAL, low REAL, close REAL,
             volume REAL, quote_vol REAL, trades INTEGER,
             PRIMARY KEY (time, alpha_symbol)
+        );
+        CREATE TABLE IF NOT EXISTS alpha_candles_1m (
+            time TEXT NOT NULL,
+            alpha_symbol TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL DEFAULT 0,
+            quote_vol REAL NOT NULL DEFAULT 0,
+            trades INTEGER NOT NULL DEFAULT 0,
+            taker_buy_quote_vol REAL NOT NULL DEFAULT 0,
+            source_env TEXT NOT NULL DEFAULT 'mainnet',
+            is_closed INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'rest',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (time, alpha_symbol, source_env)
+        );
+        CREATE TABLE IF NOT EXISTS aggregated_candles (
+            market_kind TEXT NOT NULL,
+            source_env TEXT NOT NULL DEFAULT 'mainnet',
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            time TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL DEFAULT 0,
+            quote_vol REAL NOT NULL DEFAULT 0,
+            trades INTEGER NOT NULL DEFAULT 0,
+            taker_buy_quote_vol REAL NOT NULL DEFAULT 0,
+            minute_count INTEGER NOT NULL,
+            expected_count INTEGER NOT NULL,
+            is_complete INTEGER NOT NULL DEFAULT 0,
+            comparison_status TEXT NOT NULL DEFAULT 'pending',
+            comparison_details_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (market_kind, source_env, symbol, interval, time)
+        );
+        CREATE TABLE IF NOT EXISTS candle_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_kind TEXT NOT NULL,
+            source_env TEXT NOT NULL DEFAULT 'mainnet',
+            symbol TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            detected_at TEXT NOT NULL,
+            resolved_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(market_kind, source_env, symbol, start_time, end_time)
+        );
+        CREATE TABLE IF NOT EXISTS candle_sync_runtime (
+            collector_id TEXT PRIMARY KEY,
+            market_kind TEXT NOT NULL,
+            source_env TEXT NOT NULL DEFAULT 'mainnet',
+            status TEXT NOT NULL DEFAULT 'starting',
+            connection_state TEXT NOT NULL DEFAULT 'disconnected',
+            heartbeat_at TEXT NOT NULL,
+            last_event_at TEXT,
+            last_closed_time TEXT,
+            queue_depth INTEGER NOT NULL DEFAULT 0,
+            lag_seconds REAL,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            reconnect_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS alpha_orderbook_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1053,7 +1192,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_alpha_cooldowns_symbol ON alpha_cooldowns(symbol);
         CREATE TABLE IF NOT EXISTS alpha_feature_snapshots (
             snapshot_id TEXT PRIMARY KEY,
-            market_env TEXT NOT NULL,
+            market_env TEXT NOT NULL CHECK(market_env='mainnet'),
             alpha_symbol TEXT,
             futures_symbol TEXT NOT NULL,
             candle_close_time TEXT NOT NULL,
@@ -1070,7 +1209,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_alpha_feature_snapshots_symbol_time
             ON alpha_feature_snapshots(market_env, futures_symbol, candle_close_time DESC);
         CREATE TABLE IF NOT EXISTS alpha_signal_states (
-            market_env TEXT NOT NULL,
+            market_env TEXT NOT NULL CHECK(market_env='mainnet'),
             futures_symbol TEXT NOT NULL,
             alpha_symbol TEXT,
             state TEXT NOT NULL,
@@ -1100,7 +1239,7 @@ def init_db():
             ON alpha_signal_states(market_env, state, updated_at DESC);
         CREATE TABLE IF NOT EXISTS alpha_signal_events (
             event_id TEXT PRIMARY KEY,
-            market_env TEXT NOT NULL,
+            market_env TEXT NOT NULL CHECK(market_env='mainnet'),
             strategy_mode TEXT NOT NULL DEFAULT 'signal',
             futures_symbol TEXT NOT NULL,
             alpha_symbol TEXT,
@@ -1141,7 +1280,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_alpha_signal_consumptions_status
             ON alpha_signal_consumptions(account_id, status, updated_at DESC);
         CREATE TABLE IF NOT EXISTS alpha_strategy_runtime (
-            market_env TEXT PRIMARY KEY,
+            market_env TEXT PRIMARY KEY CHECK(market_env='mainnet'),
             strategy_mode TEXT NOT NULL,
             worker_id TEXT,
             heartbeat_at TEXT NOT NULL,
@@ -1187,6 +1326,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_position_roll_events_symbol ON position_roll_events(symbol, created_at DESC);
     """)
     for table in (
+        "candles_1m", "futures_candles_1m", "alpha_candles_1m",
         "futures_candles_15m", "futures_candles_1h",
         "futures_candles_6h", "futures_candles_24h",
         "alpha_candles_15m", "alpha_candles_1h",
@@ -1616,6 +1756,13 @@ def _ensure_performance_indexes(conn):
         ("idx_c6h_time_symbol", "candles_6h", "time DESC, symbol"),
         ("idx_c24h_sym_time", "candles_24h", "symbol, time DESC"),
         ("idx_c24h_time_symbol", "candles_24h", "time DESC, symbol"),
+        ("idx_c1m_env_sym_time", "candles_1m", "source_env, symbol, time DESC"),
+        ("idx_fc1m_env_sym_time", "futures_candles_1m", "source_env, symbol, time DESC"),
+        ("idx_ac1m_env_sym_time", "alpha_candles_1m", "source_env, alpha_symbol, time DESC"),
+        ("idx_agg_candles_lookup", "aggregated_candles", "market_kind, source_env, symbol, interval, time DESC"),
+        ("idx_agg_candles_complete", "aggregated_candles", "interval, is_complete, time DESC"),
+        ("idx_candle_gaps_status", "candle_gaps", "status, detected_at"),
+        ("idx_candle_runtime_market", "candle_sync_runtime", "market_kind, source_env"),
         ("idx_fc1h_sym_time", "futures_candles_1h", "symbol, time DESC"),
         ("idx_fc15m_sym_time", "futures_candles_15m", "symbol, time DESC"),
         ("idx_fc6h_sym_time", "futures_candles_6h", "symbol, time DESC"),
@@ -1901,6 +2048,529 @@ def fetch_futures_candles(
         conn.close()
 
 
+_MINUTE_CANDLE_TABLES = {
+    "spot": ("candles_1m", "symbol"),
+    "futures": ("futures_candles_1m", "symbol"),
+    "alpha": ("alpha_candles_1m", "alpha_symbol"),
+}
+
+
+def _minute_table(market_kind):
+    try:
+        return _MINUTE_CANDLE_TABLES[str(market_kind).strip().lower()]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported minute candle market: {market_kind}"
+        ) from exc
+
+
+def upsert_minute_candles(market_kind, rows):
+    """Batch upsert fully normalized closed 1m candles."""
+    if not rows:
+        return 0
+    table, symbol_column = _minute_table(market_kind)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    values = []
+    for raw in rows:
+        row = dict(raw)
+        values.append(
+            (
+                row["time"],
+                row.get("symbol") or row.get("alpha_symbol"),
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row.get("volume") or 0),
+                float(row.get("quote_vol") or 0),
+                int(row.get("trades") or 0),
+                float(row.get("taker_buy_quote_vol") or 0),
+                str(row.get("source_env") or "mainnet").lower(),
+                int(bool(row.get("is_closed", True))),
+                str(row.get("source") or "stream"),
+                str(row.get("updated_at") or now),
+            )
+        )
+    conn = get_conn()
+    try:
+        conn.executemany(
+            f"""INSERT INTO {table}
+                (time, {symbol_column}, open, high, low, close, volume,
+                 quote_vol, trades, taker_buy_quote_vol, source_env,
+                 is_closed, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(time, {symbol_column}, source_env) DO UPDATE SET
+                  open=excluded.open,
+                  high=excluded.high,
+                  low=excluded.low,
+                  close=excluded.close,
+                  volume=excluded.volume,
+                  quote_vol=excluded.quote_vol,
+                  trades=excluded.trades,
+                  taker_buy_quote_vol=excluded.taker_buy_quote_vol,
+                  is_closed=excluded.is_closed,
+                  source=excluded.source,
+                  updated_at=excluded.updated_at""",
+            values,
+        )
+        conn.commit()
+        return len(values)
+    finally:
+        conn.close()
+
+
+def fetch_minute_candles(
+    market_kind,
+    symbol,
+    start_time,
+    end_time,
+    source_env="mainnet",
+):
+    table, symbol_column = _minute_table(market_kind)
+    conn = get_conn()
+    try:
+        return conn.execute(
+            f"""SELECT time, {symbol_column} AS symbol, open, high, low,
+                       close, volume, quote_vol, trades,
+                       taker_buy_quote_vol, source_env, is_closed, source
+                FROM {table}
+                WHERE {symbol_column}=? AND source_env=?
+                  AND time>=? AND time<=? AND is_closed=1
+                ORDER BY time""",
+            (
+                str(symbol),
+                str(source_env).lower(),
+                str(start_time),
+                str(end_time),
+            ),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_latest_minute_time(market_kind, symbol, source_env="mainnet"):
+    table, symbol_column = _minute_table(market_kind)
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            f"""SELECT MAX(time) AS latest
+                FROM {table}
+                WHERE {symbol_column}=? AND source_env=? AND is_closed=1""",
+            (str(symbol), str(source_env).lower()),
+        ).fetchone()
+        return row["latest"] if row else None
+    finally:
+        conn.close()
+
+
+def upsert_aggregated_candles(rows):
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    values = []
+    for raw in rows:
+        row = dict(raw)
+        values.append(
+            (
+                row["market_kind"],
+                str(row.get("source_env") or "mainnet").lower(),
+                row["symbol"],
+                row["interval"],
+                row["time"],
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row.get("volume") or 0),
+                float(row.get("quote_vol") or 0),
+                int(row.get("trades") or 0),
+                float(row.get("taker_buy_quote_vol") or 0),
+                int(row["minute_count"]),
+                int(row["expected_count"]),
+                int(bool(row.get("is_complete"))),
+                str(row.get("comparison_status") or "pending"),
+                json.dumps(
+                    row.get("comparison_details") or {},
+                    ensure_ascii=False,
+                ),
+                str(row.get("updated_at") or now),
+            )
+        )
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """INSERT INTO aggregated_candles
+               (market_kind, source_env, symbol, interval, time,
+                open, high, low, close, volume, quote_vol, trades,
+                taker_buy_quote_vol, minute_count, expected_count,
+                is_complete, comparison_status, comparison_details_json,
+                updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?)
+               ON CONFLICT(market_kind, source_env, symbol, interval, time)
+               DO UPDATE SET
+                 open=excluded.open,
+                 high=excluded.high,
+                 low=excluded.low,
+                 close=excluded.close,
+                 volume=excluded.volume,
+                 quote_vol=excluded.quote_vol,
+                 trades=excluded.trades,
+                 taker_buy_quote_vol=excluded.taker_buy_quote_vol,
+                 minute_count=excluded.minute_count,
+                 expected_count=excluded.expected_count,
+                 is_complete=excluded.is_complete,
+                 comparison_status=excluded.comparison_status,
+                 comparison_details_json=excluded.comparison_details_json,
+                 updated_at=excluded.updated_at""",
+            values,
+        )
+        conn.commit()
+        return len(values)
+    finally:
+        conn.close()
+
+
+_AGGREGATE_LEGACY_TABLES = {
+    ("spot", "15m"): ("candles_15m", "symbol", False),
+    ("spot", "1h"): ("candles_1h", "symbol", False),
+    ("spot", "6h"): ("candles_6h", "symbol", False),
+    ("spot", "1d"): ("candles_24h", "symbol", False),
+    ("futures", "15m"): (
+        "futures_candles_15m",
+        "symbol",
+        True,
+    ),
+    ("futures", "1h"): ("futures_candles_1h", "symbol", True),
+    ("futures", "6h"): ("futures_candles_6h", "symbol", True),
+    ("futures", "1d"): ("futures_candles_24h", "symbol", True),
+    ("alpha", "15m"): ("alpha_candles_15m", "alpha_symbol", True),
+    ("alpha", "1h"): ("alpha_candles_1h", "alpha_symbol", True),
+    ("alpha", "6h"): ("alpha_candles_6h", "alpha_symbol", True),
+    ("alpha", "1d"): ("alpha_candles_24h", "alpha_symbol", True),
+}
+
+
+def materialize_aggregated_candles(rows):
+    """Publish complete unified aggregates to legacy strategy tables."""
+    grouped = {}
+    for raw in rows or []:
+        row = dict(raw)
+        if not bool(row.get("is_complete")):
+            continue
+        mapping = _AGGREGATE_LEGACY_TABLES.get(
+            (row.get("market_kind"), row.get("interval"))
+        )
+        if not mapping:
+            continue
+        grouped.setdefault(mapping, []).append(row)
+    if not grouped:
+        return 0
+    conn = get_conn()
+    written = 0
+    try:
+        for (table, symbol_column, extended), items in grouped.items():
+            if extended:
+                values = [
+                    (
+                        row["time"],
+                        row["symbol"],
+                        float(row["open"]),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
+                        float(row.get("volume") or 0),
+                        float(row.get("quote_vol") or 0),
+                        int(row.get("trades") or 0),
+                        float(row.get("taker_buy_quote_vol") or 0),
+                        str(row.get("source_env") or "mainnet").lower(),
+                        1,
+                    )
+                    for row in items
+                ]
+                conn.executemany(
+                    f"""INSERT OR REPLACE INTO {table}
+                       (time, {symbol_column}, open, high, low, close,
+                        volume, quote_vol, trades, taker_buy_quote_vol,
+                        source_env, is_closed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+            else:
+                values = [
+                    (
+                        row["time"],
+                        row["symbol"],
+                        float(row["open"]),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
+                        float(row.get("volume") or 0),
+                        float(row.get("quote_vol") or 0),
+                        int(row.get("trades") or 0),
+                    )
+                    for row in items
+                ]
+                conn.executemany(
+                    f"""INSERT OR REPLACE INTO {table}
+                       (time, {symbol_column}, open, high, low, close,
+                        volume, quote_vol, trades)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+            written += len(values)
+        conn.commit()
+        return written
+    finally:
+        conn.close()
+
+
+def materialize_stored_aggregates():
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM aggregated_candles
+               WHERE is_complete=1
+               ORDER BY time"""
+        ).fetchall()
+    finally:
+        conn.close()
+    return materialize_aggregated_candles(rows)
+
+
+def upsert_candle_gap(
+    market_kind,
+    symbol,
+    start_time,
+    end_time,
+    *,
+    source_env="mainnet",
+    status="pending",
+    error=None,
+):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO candle_gaps
+               (market_kind, source_env, symbol, start_time, end_time,
+                status, attempt_count, last_error, detected_at, resolved_at,
+                updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?)
+               ON CONFLICT(
+                 market_kind, source_env, symbol, start_time, end_time
+               ) DO UPDATE SET
+                 status=excluded.status,
+                 last_error=excluded.last_error,
+                 resolved_at=NULL,
+                 updated_at=excluded.updated_at""",
+            (
+                market_kind,
+                str(source_env).lower(),
+                symbol,
+                start_time,
+                end_time,
+                status,
+                error,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_candle_gap(gap_id, status, error=None):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    resolved_at = now if status == "resolved" else None
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE candle_gaps
+               SET status=?,
+                   attempt_count=attempt_count
+                     + CASE WHEN ?='repairing' THEN 1 ELSE 0 END,
+                   last_error=?,
+                   resolved_at=?, updated_at=?
+               WHERE id=?""",
+            (status, status, error, resolved_at, now, int(gap_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_candle_gaps(status="pending", limit=200):
+    conn = get_conn()
+    try:
+        if status:
+            rows = conn.execute(
+                """SELECT * FROM candle_gaps WHERE status=?
+                   ORDER BY detected_at LIMIT ?""",
+                (status, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM candle_gaps
+                   ORDER BY detected_at DESC LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def reset_stale_candle_repairs():
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            """UPDATE candle_gaps
+               SET status='pending', updated_at=datetime('now')
+               WHERE status='repairing'"""
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
+def upsert_candle_sync_runtime(collector_id, market_kind, **fields):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "source_env": "mainnet",
+        "status": "running",
+        "connection_state": "connected",
+        "heartbeat_at": now,
+        "last_event_at": None,
+        "last_closed_time": None,
+        "queue_depth": 0,
+        "lag_seconds": None,
+        "error_count": 0,
+        "reconnect_count": 0,
+        "last_error": None,
+        "metrics": {},
+        **fields,
+    }
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO candle_sync_runtime
+               (collector_id, market_kind, source_env, status,
+                connection_state, heartbeat_at, last_event_at,
+                last_closed_time, queue_depth, lag_seconds, error_count,
+                reconnect_count, last_error, metrics_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(collector_id) DO UPDATE SET
+                 market_kind=excluded.market_kind,
+                 source_env=excluded.source_env,
+                 status=excluded.status,
+                 connection_state=excluded.connection_state,
+                 heartbeat_at=excluded.heartbeat_at,
+                 last_event_at=COALESCE(
+                   excluded.last_event_at,
+                   candle_sync_runtime.last_event_at
+                 ),
+                 last_closed_time=COALESCE(
+                   excluded.last_closed_time,
+                   candle_sync_runtime.last_closed_time
+                 ),
+                 queue_depth=excluded.queue_depth,
+                 lag_seconds=excluded.lag_seconds,
+                 error_count=excluded.error_count,
+                 reconnect_count=excluded.reconnect_count,
+                 last_error=excluded.last_error,
+                 metrics_json=excluded.metrics_json,
+                 updated_at=excluded.updated_at""",
+            (
+                collector_id,
+                market_kind,
+                str(payload["source_env"]).lower(),
+                payload["status"],
+                payload["connection_state"],
+                payload["heartbeat_at"],
+                payload["last_event_at"],
+                payload["last_closed_time"],
+                int(payload["queue_depth"] or 0),
+                payload["lag_seconds"],
+                int(payload["error_count"] or 0),
+                int(payload["reconnect_count"] or 0),
+                payload["last_error"],
+                json.dumps(payload["metrics"], ensure_ascii=False),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_candle_sync_status():
+    conn = get_conn()
+    try:
+        runtime = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT * FROM candle_sync_runtime
+                   ORDER BY market_kind, collector_id"""
+            ).fetchall()
+        ]
+        pending = conn.execute(
+            """SELECT market_kind, source_env, COUNT(*) AS count,
+                      MIN(start_time) AS oldest_start
+               FROM candle_gaps
+               WHERE status != 'resolved'
+               GROUP BY market_kind, source_env"""
+        ).fetchall()
+        aggregates = conn.execute(
+            """SELECT market_kind, source_env, interval,
+                      MAX(time) AS latest_time,
+                      SUM(CASE WHEN is_complete=1 THEN 1 ELSE 0 END)
+                        AS complete_count,
+                      SUM(CASE WHEN comparison_status='matched' THEN 1 ELSE 0 END)
+                        AS matched_count,
+                      SUM(CASE WHEN comparison_status='mismatch' THEN 1 ELSE 0 END)
+                        AS mismatch_count
+               FROM aggregated_candles
+               GROUP BY market_kind, source_env, interval"""
+        ).fetchall()
+        return {
+            "runtime": runtime,
+            "gaps": [dict(row) for row in pending],
+            "aggregates": [dict(row) for row in aggregates],
+        }
+    finally:
+        conn.close()
+
+
+def purge_minute_candle_data(days=4):
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = get_conn()
+    try:
+        deleted = {}
+        for table in (
+            "candles_1m",
+            "futures_candles_1m",
+            "alpha_candles_1m",
+        ):
+            cursor = conn.execute(
+                f"DELETE FROM {table} WHERE time < ?",
+                (cutoff,),
+            )
+            deleted[table] = cursor.rowcount
+        conn.execute(
+            """DELETE FROM candle_gaps
+               WHERE status='resolved' AND updated_at < ?""",
+            (cutoff,),
+        )
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
 def upsert_market_universe(rows):
     if not rows:
         return
@@ -1992,21 +2662,24 @@ def futures_candles_current(
     max_age_minutes=20,
     source_env=None,
     table="futures_candles_15m",
+    closed_only=False,
 ):
     if table not in _FUTURES_CANDLE_TABLES:
         raise ValueError(f"unsupported futures candle table: {table}")
     conn = get_conn()
     try:
+        closed_clause = " AND is_closed = 1" if closed_only else ""
         if source_env:
             row = conn.execute(
                 f"""SELECT MAX(time) AS latest
                     FROM {table}
-                    WHERE symbol = ? AND source_env = ?""",
+                    WHERE symbol = ? AND source_env = ?{closed_clause}""",
                 (symbol, source_env),
             ).fetchone()
         else:
             row = conn.execute(
-                f"SELECT MAX(time) AS latest FROM {table} WHERE symbol = ?",
+                f"""SELECT MAX(time) AS latest FROM {table}
+                    WHERE symbol = ?{closed_clause}""",
                 (symbol,),
             ).fetchone()
     finally:
@@ -2175,6 +2848,94 @@ def upsert_alpha_symbols(rows):
         rows,
     )
     conn.commit()
+
+
+def upsert_alpha_square_posts(rows):
+    if not rows:
+        return 0
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """INSERT INTO alpha_square_posts
+               (post_id, base_asset, published_at, author_id, author_name,
+                content, sentiment, sentiment_confidence, substantive_risk,
+                engagement, source_url, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(post_id) DO UPDATE SET
+                 base_asset=excluded.base_asset,
+                 published_at=excluded.published_at,
+                 author_id=excluded.author_id,
+                 author_name=excluded.author_name,
+                 content=excluded.content,
+                 sentiment=excluded.sentiment,
+                 sentiment_confidence=excluded.sentiment_confidence,
+                 substantive_risk=excluded.substantive_risk,
+                 engagement=excluded.engagement,
+                 source_url=excluded.source_url,
+                 raw_json=excluded.raw_json,
+                 collected_at=datetime('now')""",
+            rows,
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def insert_alpha_square_sentiment_snapshot(row):
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO alpha_square_sentiment_snapshots
+               (time, base_asset, window_minutes, effective_post_count,
+                unique_authors, bearish_ratio, baseline_bearish_ratio_24h,
+                top3_author_share, substantive_risk_count, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            row,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_latest_alpha_square_sentiment(base_asset, max_age_minutes=20):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT *,
+                      (julianday('now') - julianday(time)) * 1440 AS age_minutes
+               FROM alpha_square_sentiment_snapshots
+               WHERE base_asset=?
+                 AND datetime(time) >= datetime('now', ?)
+               ORDER BY datetime(time) DESC
+               LIMIT 1""",
+            (
+                str(base_asset or "").upper(),
+                f"-{float(max_age_minutes):g} minutes",
+            ),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def fetch_alpha_square_posts(base_asset, hours=24):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT *
+               FROM alpha_square_posts
+               WHERE base_asset=?
+                 AND datetime(published_at) >= datetime('now', ?)
+               ORDER BY datetime(published_at)""",
+            (
+                str(base_asset or "").upper(),
+                f"-{float(hours):g} hours",
+            ),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 def insert_alpha_candles(table, rows):
@@ -3943,7 +4704,82 @@ def is_market_entry_ready(symbol, strategy_source="normal", alpha_symbol=None):
             ).fetchone()
         if not row:
             return False, "not_in_current_universe"
-        return bool(row["data_ready"]), row["data_error"]
+        if not bool(row["data_ready"]):
+            return False, row["data_error"]
+        if pool_type == "alpha":
+            source_symbol = alpha_symbol or ""
+        else:
+            source_symbol = symbol
+
+        def candle_state(market_kind, market_symbol):
+            legacy = {
+                "spot": ("candles_15m", "candles_1h", "symbol", False),
+                "futures": (
+                    "futures_candles_15m",
+                    "futures_candles_1h",
+                    "symbol",
+                    True,
+                ),
+                "alpha": (
+                    "alpha_candles_15m",
+                    "alpha_candles_1h",
+                    "alpha_symbol",
+                    True,
+                ),
+            }[market_kind]
+
+            def interval_state(interval, legacy_table):
+                latest = conn.execute(
+                    """SELECT MAX(time) latest, COUNT(*) count
+                       FROM aggregated_candles
+                       WHERE market_kind=? AND source_env='mainnet'
+                         AND symbol=? AND interval=? AND is_complete=1""",
+                    (market_kind, market_symbol, interval),
+                ).fetchone()
+                env_sql = " AND source_env='mainnet'" if legacy[3] else ""
+                count = conn.execute(
+                    f"""SELECT COUNT(*) count FROM {legacy_table}
+                        WHERE {legacy[2]}=?{env_sql}""",
+                    (market_symbol,),
+                ).fetchone()
+                return latest["latest"], count["count"]
+
+            latest_15m, count_15m = interval_state("15m", legacy[0])
+            latest_1h, count_1h = interval_state("1h", legacy[1])
+            from shared.market_universe import CandleState
+
+            def parse(value):
+                if not value:
+                    return None
+                parsed = datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                )
+                return (
+                    parsed.replace(tzinfo=timezone.utc)
+                    if parsed.tzinfo is None
+                    else parsed.astimezone(timezone.utc)
+                )
+
+            return CandleState(
+                parse(latest_15m),
+                parse(latest_1h),
+                int(count_15m or 0),
+                int(count_1h or 0),
+            )
+
+        spot_state = candle_state(
+            "alpha" if pool_type == "alpha" else "spot",
+            source_symbol,
+        )
+        futures_state = candle_state("futures", symbol)
+        from shared.market_universe import assess_dual_market_readiness
+
+        readiness = assess_dual_market_readiness(
+            datetime.now(timezone.utc),
+            spot_state,
+            futures_state,
+        )
+        return readiness.ready, readiness.error
     finally:
         conn.close()
 

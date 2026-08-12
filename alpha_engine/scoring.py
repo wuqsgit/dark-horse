@@ -20,6 +20,7 @@ from shared.db import (
     fetch_alpha_orderbook_depth,
     fetch_futures,
     fetch_futures_candles,
+    fetch_latest_alpha_square_sentiment,
     insert_alpha_scan_scores,
 )
 
@@ -242,6 +243,11 @@ class AlphaScoringEngine:
             "volume_sync_score": round(min(volume_growth, futures_growth), 4),
             "synchronized": volume_growth >= 1.3 and futures_growth >= 1.3,
         }
+        square_sentiment = fetch_latest_alpha_square_sentiment(
+            symbol_row["base_asset"],
+        )
+        if square_sentiment:
+            raw["square_sentiment"] = square_sentiment
         raw["alpha_trend"] = compute_trend_continuation(raw)
         alpha_trend = raw.get("alpha_trend") or {}
         market_tech = _technical_from_price_rows(
@@ -257,7 +263,6 @@ class AlphaScoringEngine:
             },
             raw,
         )
-        raw["volume_price"] = evaluate_alpha_volume_price(raw, price)
         base_scores = {
             "discovery_score": discovery_score,
             "momentum_score": momentum_score,
@@ -269,6 +274,11 @@ class AlphaScoringEngine:
         # Alpha score is now only a discovery priority. It must not be treated
         # as an entry score; live entry is re-scored by the normal engine.
         alpha_score = clamp(weighted_alpha_score(base_scores, alpha_profile))
+        raw["volume_price"] = evaluate_alpha_volume_price(
+            raw,
+            price,
+            alpha_score,
+        )
         discovery_only_thresholds = {
             "open_gate": "normal_trading_engine",
             "alpha_discovery_bonus_cap": 5,
@@ -302,9 +312,15 @@ class AlphaScoringEngine:
         if not alpha_symbols:
             return []
 
-        candles_1h = fetch_alpha_candles("alpha_candles_1h", alpha_symbols, hours=96)
-        candles_15m = fetch_alpha_candles("alpha_candles_15m", alpha_symbols, hours=18)
-        candles_24h = fetch_alpha_candles("alpha_candles_24h", alpha_symbols, days=40)
+        candles_1h = fetch_alpha_candles(
+            "alpha_candles_1h", alpha_symbols, hours=96, closed_only=True
+        )
+        candles_15m = fetch_alpha_candles(
+            "alpha_candles_15m", alpha_symbols, hours=18, closed_only=True
+        )
+        candles_24h = fetch_alpha_candles(
+            "alpha_candles_24h", alpha_symbols, days=40, closed_only=True
+        )
         futures_symbols = sorted({r["futures_symbol"] for r in symbols if r["futures_symbol"]})
         futures_1h = (
             fetch_futures_candles(

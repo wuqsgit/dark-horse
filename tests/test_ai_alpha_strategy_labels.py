@@ -84,7 +84,7 @@ class AIAlphaStrategyLabelerTest(unittest.TestCase):
                     "+00:00",
                     "Z",
                 ),
-                "feature_schema_version": 3,
+                "feature_schema_version": 4,
                 "features": {
                     "current_price": 100,
                     "base_low_2h": 98,

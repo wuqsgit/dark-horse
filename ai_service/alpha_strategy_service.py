@@ -64,8 +64,8 @@ class AlphaStrategyService:
             )
         if str(payload["stage"]).lower() not in STAGES:
             raise ValueError(f"unsupported Alpha Strategy stage: {payload['stage']}")
-        if str(payload["market_env"]).lower() not in {"mainnet", "testnet"}:
-            raise ValueError(f"unsupported market_env: {payload['market_env']}")
+        if str(payload["market_env"]).lower() != "mainnet":
+            raise ValueError("Alpha Strategy market_env must be mainnet")
 
     def evaluate(self, payload: dict) -> dict:
         self._validate(payload)
@@ -93,7 +93,7 @@ class AlphaStrategyService:
                 "expected_r": None,
                 "recommended_action": "observe",
                 "max_position_factor": 0.0,
-                "reasons": ["collecting Alpha Strategy V3 samples"],
+                "reasons": ["collecting Alpha Strategy V4 samples"],
                 "feature_schema_version": FEATURE_SCHEMA_VERSION,
             }
         else:
@@ -119,6 +119,8 @@ class AlphaStrategyService:
     @staticmethod
     def _model_requirements(stage: str, market_env: str) -> list[tuple[str, str]]:
         env = str(market_env).lower()
+        if env != "mainnet":
+            raise ValueError("Alpha Strategy market_env must be mainnet")
         stage_key = str(stage).lower()
         if stage_key == "setup":
             return [(f"alpha_setup_v1_{env}", "setup_success")]

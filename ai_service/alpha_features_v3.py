@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 
-FEATURE_SCHEMA_VERSION = 3
+FEATURE_SCHEMA_VERSION = 4
 
 FEATURE_NAMES = (
     "ret_15m", "ret_30m", "ret_1h", "ret_2h", "ret_4h", "ret_6h", "ret_24h",
@@ -36,6 +36,11 @@ FEATURE_NAMES = (
     "market_breadth_1h", "market_breadth_6h",
     "alpha_universe_median_return", "category_relative_strength",
     "listing_age_hours", "market_phase_code", "setup_type_code",
+    "alpha_discovery_score", "square_sentiment_available",
+    "square_bearish_ratio", "square_effective_post_count",
+    "square_unique_authors", "square_top3_author_share",
+    "square_bearish_shift_24h", "square_substantive_risk_count",
+    "square_sentiment_age_minutes",
 )
 
 

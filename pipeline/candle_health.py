@@ -23,33 +23,48 @@ def _parse_time(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def _candle_state(
-    conn,
-    table_15m,
-    table_1h,
-    symbol,
-    symbol_column="symbol",
-    source_env=None,
-):
-    env_clause = " AND source_env = ?" if source_env else ""
-    params = (symbol, source_env) if source_env else (symbol,)
-    row_15m = conn.execute(
-        f"""SELECT MAX(time) latest, COUNT(*) count
-            FROM {table_15m}
-            WHERE {symbol_column} = ?{env_clause}""",
-        params,
-    ).fetchone()
-    row_1h = conn.execute(
-        f"""SELECT MAX(time) latest, COUNT(*) count
-            FROM {table_1h}
-            WHERE {symbol_column} = ?{env_clause}""",
-        params,
-    ).fetchone()
+def _candle_state(conn, market_kind, symbol, source_env="mainnet"):
+    legacy = {
+        "spot": ("candles_15m", "candles_1h", "symbol", False),
+        "futures": (
+            "futures_candles_15m",
+            "futures_candles_1h",
+            "symbol",
+            True,
+        ),
+        "alpha": (
+            "alpha_candles_15m",
+            "alpha_candles_1h",
+            "alpha_symbol",
+            True,
+        ),
+    }[market_kind]
+
+    def interval_state(interval, legacy_table):
+        latest = conn.execute(
+            """SELECT MAX(time) latest, COUNT(*) count
+               FROM aggregated_candles
+               WHERE market_kind=? AND source_env=? AND symbol=?
+                 AND interval=? AND is_complete=1""",
+            (market_kind, source_env, symbol, interval),
+        ).fetchone()
+        symbol_column = legacy[2]
+        env_clause = " AND source_env=?" if legacy[3] else ""
+        params = (symbol, source_env) if legacy[3] else (symbol,)
+        count = conn.execute(
+            f"""SELECT COUNT(*) count FROM {legacy_table}
+                WHERE {symbol_column}=?{env_clause}""",
+            params,
+        ).fetchone()
+        return latest["latest"], count["count"]
+
+    latest_15m, count_15m = interval_state("15m", legacy[0])
+    latest_1h, count_1h = interval_state("1h", legacy[1])
     return CandleState(
-        _parse_time(row_15m["latest"]),
-        _parse_time(row_1h["latest"]),
-        int(row_15m["count"] or 0),
-        int(row_1h["count"] or 0),
+        _parse_time(latest_15m),
+        _parse_time(latest_1h),
+        int(count_15m or 0),
+        int(count_1h or 0),
     )
 
 
@@ -61,21 +76,14 @@ def refresh_universe_readiness(pool_type, now=None, futures_source_env=None):
     try:
         for row in rows:
             if pool_type == "alpha":
-                spot = _candle_state(
-                    conn, "alpha_candles_15m", "alpha_candles_1h",
-                    row["source_symbol"], "alpha_symbol",
-                    source_env="mainnet",
-                )
+                spot = _candle_state(conn, "alpha", row["source_symbol"])
             else:
-                spot = _candle_state(
-                    conn, "candles_15m", "candles_1h", row["spot_symbol"],
-                )
+                spot = _candle_state(conn, "spot", row["spot_symbol"])
             futures = _candle_state(
                 conn,
-                "futures_candles_15m",
-                "futures_candles_1h",
+                "futures",
                 row["futures_symbol"],
-                source_env=futures_source_env,
+                futures_source_env or "mainnet",
             )
             result = assess_dual_market_readiness(now, spot, futures)
             results[row["source_symbol"]] = result

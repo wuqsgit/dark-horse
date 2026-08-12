@@ -48,6 +48,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.db_path = str(Path(self.temp_dir.name) / "strategy.db")
         self.db_patch = patch.object(db, "DB_PATH", self.db_path)
         self.db_patch.start()
+        self.readiness_patch = patch(
+            "trader.alpha_signal_consumer.is_market_entry_ready",
+            return_value=(True, None),
+        )
+        self.readiness_patch.start()
         db.init_db()
         self.account_token = db.set_account_context(7)
         self.repo = AlphaStrategyRepository()
@@ -71,10 +76,18 @@ class AlphaSignalConsumerTest(unittest.TestCase):
 
     def tearDown(self):
         db.reset_account_context(self.account_token)
+        self.readiness_patch.stop()
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
-    def _event(self, symbol="AKEUSDT", alpha="AKEALPHAUSDT", mode="testnet_live"):
+    def _event(
+        self,
+        symbol="AKEUSDT",
+        alpha="AKEALPHAUSDT",
+        mode="testnet_live",
+        reasons=("trigger_confirmed",),
+        max_position_factor=0.3,
+    ):
         now = datetime.now(timezone.utc)
         transition = TransitionResult(
             from_state=AlphaSignalState.ARMED,
@@ -96,13 +109,13 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             followthrough_probability=0.78,
             fakeout_probability=0.18,
             expected_r=0.5,
-            max_position_factor=0.3,
-            reasons=("trigger_confirmed",),
+            max_position_factor=max_position_factor,
+            reasons=reasons,
             model_versions={"trigger": "v1"},
             previous_version=0,
         )
         return self.repo.apply_transition(
-            market_env="testnet",
+            market_env="mainnet",
             futures_symbol=symbol,
             alpha_symbol=alpha,
             transition=transition,
@@ -129,7 +142,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
                 "alpha_strategy_v2": {
                     "enabled": True,
                     "mode": "testnet_live",
-                    "market_env": "testnet",
+                    "market_env": "mainnet",
                     "max_alpha_positions": 2,
                     "probe_stage_cap": 0.30,
                 },
@@ -155,6 +168,8 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0]["action"], "open")
         self.assertEqual(actions[0]["strategy_source"], "alpha")
+        self.assertEqual(actions[0]["market_data_env"], "mainnet")
+        self.assertEqual(actions[0]["execution_env"], "testnet")
         self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.30)
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
         self.assertEqual(duplicate, [])
@@ -171,7 +186,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
                 "alpha_strategy_v2": {
                     "enabled": True,
                     "mode": "signal",
-                    "market_env": "testnet",
+                    "market_env": "mainnet",
                 },
             },
             repository=self.repo,
@@ -196,6 +211,44 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             conn.close()
         self.assertEqual(status, "SIGNAL_ONLY")
 
+    def test_sentiment_reversal_probe_uses_half_position_cap(self):
+        self._event(
+            reasons=(
+                "square_extreme_bearishness",
+                "sentiment_reversal_probe_confirmed",
+            ),
+            max_position_factor=0.5,
+        )
+        consumer = AlphaSignalConsumer(
+            FakeExchange(),
+            config={
+                "risk_per_trade_pct": 0.015,
+                "alpha_strategy_v2": {
+                    "enabled": True,
+                    "mode": "testnet_live",
+                    "market_env": "mainnet",
+                    "max_alpha_positions": 2,
+                    "probe_stage_cap": 0.30,
+                    "sentiment_reversal_stage_cap": 0.50,
+                },
+            },
+            repository=self.repo,
+        )
+
+        actions = consumer.build_actions(
+            account=self._account(),
+            positions=[],
+            balance=1000,
+            engine=FakeEngine(),
+            run_id="run-square",
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertLessEqual(
+            actions[0]["alpha_suggested_position_pct"],
+            0.50,
+        )
+
     def test_restart_releases_unsubmitted_plan_for_safe_retry(self):
         applied = self._event()
         self.repo.claim_event(
@@ -216,7 +269,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
                 "alpha_strategy_v2": {
                     "enabled": True,
                     "mode": "testnet_live",
-                    "market_env": "testnet",
+                    "market_env": "mainnet",
                 },
             },
             repository=self.repo,
@@ -227,10 +280,35 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(result["retryable"], 1)
         events = self.repo.fetch_account_events(
             account_id=7,
-            market_env="testnet",
+            market_env="mainnet",
             strategy_modes=("testnet_live",),
         )
         self.assertEqual(len(events), 1)
+
+    def test_testnet_live_does_not_execute_for_mainnet_account(self):
+        self._event()
+        consumer = AlphaSignalConsumer(
+            FakeExchange(),
+            config={
+                "alpha_strategy_v2": {
+                    "enabled": True,
+                    "mode": "testnet_live",
+                    "market_env": "mainnet",
+                },
+            },
+            repository=self.repo,
+        )
+        account = {**self._account(), "environment": "prod"}
+
+        actions = consumer.build_actions(
+            account=account,
+            positions=[],
+            balance=1000,
+            engine=FakeEngine(),
+            run_id="run-prod",
+        )
+
+        self.assertEqual(actions, [])
 
 
 if __name__ == "__main__":
