@@ -5,7 +5,12 @@ from minute_pipeline.aggregation import (
     aggregate_minutes,
     bucket_start,
 )
-from minute_pipeline.collectors import normalize_ws_message
+from minute_pipeline.collectors import (
+    RestKlineClient,
+    normalize_ws_message,
+    subscription_batches,
+)
+from minute_pipeline.main import _batch_failure_detail
 
 
 def minute_row(index, start=None):
@@ -96,6 +101,41 @@ class MinuteAggregationTest(unittest.TestCase):
         self.assertIsNone(
             normalize_ws_message(__import__("json").dumps(payload))
         )
+
+    def test_websocket_subscriptions_are_split_per_connection(self):
+        symbols = [f"TOKEN{index}USDT" for index in range(233)]
+        batches = subscription_batches(symbols, 180)
+
+        self.assertEqual([len(batch) for batch in batches], [180, 53])
+        self.assertEqual(batches[0][0], "TOKEN0USDT")
+        self.assertEqual(batches[1][-1], "TOKEN232USDT")
+
+    def test_batch_failure_detail_preserves_real_exception(self):
+        detail = _batch_failure_detail(
+            [TimeoutError("proxy connection expired"), None]
+        )
+
+        self.assertEqual(
+            detail,
+            "TimeoutError: proxy connection expired",
+        )
+
+
+class RestKlineClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reset_replaces_only_failed_market_transport(self):
+        client = RestKlineClient()
+        previous_futures = client._clients["futures"]
+        previous_spot = client._clients["spot"]
+        try:
+            await client.reset("futures")
+
+            self.assertIsNot(
+                client._clients["futures"],
+                previous_futures,
+            )
+            self.assertIs(client._clients["spot"], previous_spot)
+        finally:
+            await client.close()
 
 
 if __name__ == "__main__":

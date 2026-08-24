@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from alpha_engine.strategy.ai_client import AlphaStrategyAIClient
@@ -66,12 +66,14 @@ class AlphaStrategyWorker:
         mode: str = "shadow",
         market_env: str = "mainnet",
         testnet_live_rule_fallback: bool = False,
+        recovery_max_bars: int = 96,
     ):
         self.repository = repository or AlphaStrategyRepository()
         self.machine = machine or AlphaStrategyStateMachine()
         self.mode = str(mode or "shadow").lower()
         self.market_env = str(market_env or "mainnet").lower()
         self.testnet_live_rule_fallback = bool(testnet_live_rule_fallback)
+        self.recovery_max_bars = max(0, int(recovery_max_bars))
         if self.mode not in ALLOWED_MODES:
             raise ValueError(f"unsupported Alpha Strategy mode: {self.mode}")
         if self.market_env != "mainnet":
@@ -81,7 +83,12 @@ class AlphaStrategyWorker:
         self.ai_evaluate = ai_evaluate or AlphaStrategyAIClient().evaluate
         self.worker_id = "alpha-v2-" + uuid.uuid4().hex[:12]
 
-    def process_snapshot(self, snapshot: AlphaFeatureSnapshot) -> WorkerResult:
+    def process_snapshot(
+        self,
+        snapshot: AlphaFeatureSnapshot,
+        *,
+        recovery: bool = False,
+    ) -> WorkerResult:
         if snapshot.market_env != self.market_env:
             return WorkerResult(False, "market_environment_mismatch")
         current = self.repository.get_state(
@@ -151,15 +158,18 @@ class AlphaStrategyWorker:
             "feature_quality": dict(snapshot.quality),
             "features": dict(snapshot.features),
         }
-        try:
-            prediction = dict(self.ai_evaluate(payload) or {})
-        except Exception as exc:
-            logger.warning(
-                "Alpha Strategy AI unavailable for %s: %s",
-                snapshot.futures_symbol,
-                exc,
-            )
-            return WorkerResult(False, f"ai_unavailable:{exc}")
+        if recovery:
+            prediction = self._recovery_prediction(setup.score, trigger)
+        else:
+            try:
+                prediction = dict(self.ai_evaluate(payload) or {})
+            except Exception as exc:
+                logger.warning(
+                    "Alpha Strategy AI unavailable for %s: %s",
+                    snapshot.futures_symbol,
+                    exc,
+                )
+                return WorkerResult(False, f"ai_unavailable:{exc}")
 
         prediction = self._rule_prediction_if_collecting(
             prediction,
@@ -218,6 +228,7 @@ class AlphaStrategyWorker:
             retest_confirmed=trigger.retest_confirmed,
             invalidated=trigger.invalidated,
             data_ready=snapshot.quality.get("status") == "ready",
+            near_trigger_detected=trigger.near_trigger_detected,
             reference_price=features.get("current_price"),
             base_low=base_low,
             base_high=base_high,
@@ -246,6 +257,20 @@ class AlphaStrategyWorker:
             observation,
             now=snapshot.candle_close_time,
         )
+        if (
+            recovery
+            and transition.action_type
+            in {ActionType.PROBE_LONG, ActionType.CONFIRM_LONG, ActionType.RETEST_ADD}
+        ):
+            transition = replace(
+                transition,
+                to_state=AlphaSignalState.COOLDOWN,
+                action_type=ActionType.NONE,
+                expires_at=snapshot.candle_close_time + timedelta(hours=1),
+                max_position_factor=0.0,
+                reasons=tuple(transition.reasons)
+                + ("historical_recovery_entry_suppressed",),
+            )
         if not transition.changed:
             self.repository.save_observation(
                 market_env=snapshot.market_env,
@@ -267,6 +292,27 @@ class AlphaStrategyWorker:
             transition,
             applied.event_id,
         )
+
+    @staticmethod
+    def _recovery_prediction(setup_score: float, trigger) -> dict:
+        """Deterministic state reconstruction without historical AI calls."""
+        followthrough = 0.0
+        fakeout = 0.5
+        max_position_factor = 0.0
+        if trigger.trigger_detected:
+            followthrough, fakeout, max_position_factor = 0.68, 0.30, 0.30
+        elif trigger.acceptance_confirmed:
+            followthrough, fakeout, max_position_factor = 0.72, 0.22, 0.70
+        return {
+            "status": "historical_recovery",
+            "p_setup_success": min(1.0, max(0.0, setup_score / 100.0)),
+            "p_followthrough": followthrough,
+            "p_fakeout": fakeout,
+            "expected_r": max(0.0, followthrough - fakeout),
+            "max_position_factor": max_position_factor,
+            "model_versions": {"fallback": "rule-recovery-v1"},
+            "reasons": ["historical_gap_recovery"],
+        }
 
     def run_once(self, *, limit: int = 200, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
@@ -365,6 +411,7 @@ class AlphaStrategyWorker:
             "errors": [],
             "last_candle_close_time": None,
             "reason_counts": {},
+            "recovered_bars": 0,
         }
         for symbol_row in symbols:
             futures_symbol = str(symbol_row.get("futures_symbol") or "").upper()
@@ -386,6 +433,60 @@ class AlphaStrategyWorker:
                         else 0.0
                     ),
                 }
+                orderbook_rows = (
+                    [
+                        dict(row)
+                        for row in fetch_alpha_orderbook_depth(
+                            symbol_row.get("alpha_symbol"),
+                            hours=30,
+                        )
+                    ]
+                    if symbol_row.get("alpha_symbol")
+                    else []
+                )
+                current_state = self.repository.get_state(
+                    self.market_env,
+                    futures_symbol,
+                )
+                recovery_cutoffs = self._recovery_cutoffs(
+                    by_15m[futures_symbol],
+                    current_state.last_candle_close_time if current_state else None,
+                    now,
+                    max_bars=self.recovery_max_bars,
+                )
+                for cutoff in recovery_cutoffs:
+                    recovery_context = self._market_context_at(by_15m, cutoff)
+                    recovery_return_1h = self._return_change(
+                        self._rows_closed_before(by_15m[futures_symbol], cutoff),
+                        4,
+                    )
+                    recovery_context["category_relative_strength"] = (
+                        recovery_return_1h
+                        - float(recovery_context["alpha_universe_median_return"])
+                        if recovery_return_1h is not None
+                        and recovery_context.get("alpha_universe_median_return") is not None
+                        else 0.0
+                    )
+                    recovery_snapshot = build_alpha_feature_snapshot(
+                        alpha_symbol=symbol_row.get("alpha_symbol"),
+                        futures_symbol=futures_symbol,
+                        market_env=self.market_env,
+                        cutoff_time=cutoff,
+                        candles_15m=by_15m[futures_symbol],
+                        candles_1h=by_1h[futures_symbol],
+                        spot_candles_15m=by_spot_15m.get(
+                            symbol_row.get("alpha_symbol"), []
+                        ),
+                        futures_snapshots=by_futures_snapshots.get(
+                            futures_symbol, []
+                        ),
+                        orderbook_snapshots=orderbook_rows,
+                        market_context=recovery_context,
+                        listing_time=symbol_row.get("first_seen"),
+                    )
+                    self.process_snapshot(recovery_snapshot, recovery=True)
+                    result["recovered_bars"] += 1
+
                 snapshot = build_alpha_feature_snapshot(
                     alpha_symbol=symbol_row.get("alpha_symbol"),
                     futures_symbol=futures_symbol,
@@ -401,15 +502,7 @@ class AlphaStrategyWorker:
                         futures_symbol,
                         [],
                     ),
-                    orderbook_snapshots=[
-                        dict(row)
-                        for row in fetch_alpha_orderbook_depth(
-                            symbol_row.get("alpha_symbol"),
-                            hours=6,
-                        )
-                    ]
-                    if symbol_row.get("alpha_symbol")
-                    else [],
+                    orderbook_snapshots=orderbook_rows,
                     market_context=symbol_context,
                     listing_time=symbol_row.get("first_seen"),
                     square_sentiment=fetch_latest_alpha_square_sentiment(
@@ -473,6 +566,7 @@ class AlphaStrategyWorker:
                     "ai_prediction_not_ready",
                     0,
                 ),
+                "recovered_bars": result["recovered_bars"],
             },
         )
         if result["last_candle_close_time"] is not None:
@@ -491,6 +585,58 @@ class AlphaStrategyWorker:
         start = float(rows[-bars - 1].get("close") or 0)
         end = float(rows[-1].get("close") or 0)
         return (end / start - 1) * 100 if start > 0 and end > 0 else None
+
+    @staticmethod
+    def _row_close_time(row: dict) -> datetime:
+        value = row.get("time")
+        parsed = (
+            value
+            if isinstance(value, datetime)
+            else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc) + timedelta(minutes=15)
+
+    @classmethod
+    def _rows_closed_before(cls, rows: list[dict], cutoff: datetime) -> list[dict]:
+        return [row for row in rows if cls._row_close_time(row) <= cutoff]
+
+    @classmethod
+    def _recovery_cutoffs(
+        cls,
+        rows: list[dict],
+        last_processed: datetime | None,
+        now: datetime,
+        *,
+        max_bars: int,
+    ) -> list[datetime]:
+        if last_processed is None:
+            return []
+        cutoffs = sorted(
+            {
+                cls._row_close_time(row)
+                for row in rows
+                if last_processed < cls._row_close_time(row) < now
+            }
+        )
+        # Leave the newest closed bar for the normal live evaluation path.
+        if cutoffs:
+            cutoffs = cutoffs[:-1]
+        return cutoffs[-max(0, int(max_bars)):]
+
+    @classmethod
+    def _market_context_at(
+        cls,
+        by_15m: dict[str, list[dict]],
+        cutoff: datetime,
+    ) -> dict:
+        return cls._market_context(
+            {
+                symbol: cls._rows_closed_before(rows, cutoff)
+                for symbol, rows in by_15m.items()
+            }
+        )
 
     @classmethod
     def _market_context(cls, by_15m: dict[str, list[dict]]) -> dict:
@@ -551,7 +697,7 @@ class AlphaStrategyWorker:
         state = current.state.value
         if state.startswith("WATCH") or state in {"IDLE"}:
             return "setup"
-        if state == "ARMED":
+        if state in {"ARMED", "TRIGGER_PENDING"}:
             return "trigger"
         if state in {
             "PROBE_READY",

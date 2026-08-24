@@ -130,6 +130,7 @@ class StrategyInsightsTest(unittest.TestCase):
             and insight["category"] == "discovery"
         )
         self.assertIn("discovery", item["recommendation"])
+        self.assertIn("逆向波动过深", item["recommendation"])
         self.assertIn("representative_cases", item)
         case_symbols = [case["symbol"] for case in item["representative_cases"]]
         self.assertEqual(len(case_symbols), len(set(case_symbols)))
@@ -137,6 +138,61 @@ class StrategyInsightsTest(unittest.TestCase):
         self.assertIn("BSBUSDT", bsb_case["action"])
         self.assertIn("MFE", bsb_case["diagnosis"])
         self.assertIn("保护止损", bsb_case["action"])
+
+    def test_duplicate_historical_execution_is_counted_once(self):
+        conn = sqlite3.connect(self.main_db)
+        conn.execute("DELETE FROM trade_entry_reviews")
+        conn.executemany(
+            """INSERT INTO trade_entry_reviews
+               VALUES (?, ?, 'alpha', 'alpha', 'futures_mapped', ?, ?, ?, ?)""",
+            [
+                (f"synthetic-{idx}", "DUPUSDT", "bad_condition", -10.0, 0.01, -0.08)
+                for idx in range(10)
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        result = generate_strategy_insights(
+            self.main_db,
+            self.ai_db,
+            min_trade_samples=2,
+        )
+
+        trade_items = [
+            item
+            for item in result["insights"]
+            if item["source"] == "real_trades"
+        ]
+        self.assertEqual(trade_items, [])
+
+    def test_legacy_alpha_samples_are_not_reported_as_current_incident(self):
+        conn = sqlite3.connect(self.main_db)
+        conn.execute("DELETE FROM trade_entry_reviews")
+        conn.executemany(
+            """INSERT INTO trade_entry_reviews
+               VALUES (?, ?, 'alpha', 'alpha', 'futures_mapped', ?, ?, ?, ?)""",
+            [
+                (f"legacy-{idx}", f"LEGACY{idx}USDT", "bad_condition", -5.0, 0.01, -0.08)
+                for idx in range(5)
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        result = generate_strategy_insights(
+            self.main_db,
+            self.ai_db,
+            min_trade_samples=5,
+        )
+        item = next(
+            insight
+            for insight in result["insights"]
+            if insight["source"] == "real_trades"
+        )
+
+        self.assertEqual(item["priority"], "历史问题")
+        self.assertIn("旧入口保持关闭", item["recommendation"])
 
 
 if __name__ == "__main__":

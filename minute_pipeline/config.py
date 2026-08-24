@@ -33,9 +33,16 @@ FUTURES_WS_URL = os.getenv(
     "wss://fstream.binance.com/ws",
 )
 
+WS_MAX_STREAMS_PER_CONNECTION = max(
+    1,
+    int(os.getenv("MINUTE_WS_MAX_STREAMS_PER_CONNECTION", "180")),
+)
+
 BOOTSTRAP_MINUTES = max(
     0,
-    int(os.getenv("MINUTE_BOOTSTRAP_MINUTES", "180")),
+    # Two hours always contain at least one complete UTC 1h bucket while
+    # keeping startup replay bounded for hundreds of symbols.
+    int(os.getenv("MINUTE_BOOTSTRAP_MINUTES", "120")),
 )
 REST_CONCURRENCY = max(
     1,
@@ -68,4 +75,8 @@ GAP_REPAIR_INTERVAL_SECONDS = max(
 FUTURES_FALLBACK_AFTER_SECONDS = max(
     30,
     int(os.getenv("MINUTE_FUTURES_FALLBACK_AFTER_SECONDS", "90")),
+)
+READINESS_RECONCILE_SECONDS = max(
+    300,
+    int(os.getenv("MINUTE_READINESS_RECONCILE_SECONDS", "900")),
 )

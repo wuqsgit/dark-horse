@@ -22,6 +22,16 @@ logger = logging.getLogger("minute_pipeline.collectors")
 ALPHA_KLINES_PATH = "/bapi/defi/v1/public/alpha-trade/klines"
 
 
+def subscription_batches(symbols, max_streams_per_connection=180):
+    """Split a universe so each WebSocket stays below Binance stream limits."""
+    size = max(1, int(max_streams_per_connection))
+    normalized = tuple(str(symbol).upper() for symbol in symbols if symbol)
+    return tuple(
+        normalized[index : index + size]
+        for index in range(0, len(normalized), size)
+    )
+
+
 def normalize_rest_kline(symbol: str, row, source: str = "rest") -> dict:
     return {
         "time": format_utc(
@@ -75,7 +85,14 @@ def normalize_ws_message(message) -> dict | None:
 
 class RestKlineClient:
     def __init__(self):
-        self.client = httpx.AsyncClient(
+        self._clients = {
+            market_kind: self._new_client()
+            for market_kind in ("spot", "futures", "alpha")
+        }
+
+    @staticmethod
+    def _new_client():
+        return httpx.AsyncClient(
             timeout=httpx.Timeout(15, pool=5),
             limits=httpx.Limits(
                 max_connections=20,
@@ -83,10 +100,26 @@ class RestKlineClient:
                 keepalive_expiry=30,
             ),
             headers={"User-Agent": "Mozilla/5.0"},
+            # Honor HTTP(S)_PROXY/NO_PROXY.  This matters on hosts where a
+            # local proxy provides the route to Binance after sleep/wake.
+            trust_env=True,
         )
 
     async def close(self):
-        await self.client.aclose()
+        clients = tuple(self._clients.values())
+        self._clients.clear()
+        await asyncio.gather(
+            *(client.aclose() for client in clients),
+            return_exceptions=True,
+        )
+
+    async def reset(self, market_kind: str):
+        """Replace one stale transport without disturbing the other feeds."""
+        if market_kind not in self._clients:
+            raise ValueError(f"unsupported market kind: {market_kind}")
+        previous = self._clients[market_kind]
+        self._clients[market_kind] = self._new_client()
+        await previous.aclose()
 
     async def fetch(
         self,
@@ -116,7 +149,7 @@ class RestKlineClient:
         else:
             raise ValueError(f"unsupported market kind: {market_kind}")
 
-        response = await self.client.get(url, params=params)
+        response = await self._clients[market_kind].get(url, params=params)
         response.raise_for_status()
         payload = response.json()
         if market_kind == "alpha":
@@ -148,6 +181,7 @@ class BinanceKlineStream:
         symbols_provider,
         writer,
         reconnect_seconds: int,
+        max_streams_per_connection: int = 180,
     ):
         self.collector_id = collector_id
         self.market_kind = market_kind
@@ -155,6 +189,10 @@ class BinanceKlineStream:
         self.symbols_provider = symbols_provider
         self.writer = writer
         self.reconnect_seconds = reconnect_seconds
+        self.max_streams_per_connection = max(
+            1,
+            int(max_streams_per_connection),
+        )
         self.error_count = 0
         self.reconnect_count = 0
         self.event_count = 0
@@ -166,6 +204,10 @@ class BinanceKlineStream:
         if not force and now - self._last_runtime_write < 5:
             return
         self._last_runtime_write = now
+        metrics = {
+            "closed_events": self.event_count,
+            **(fields.pop("metrics", {}) or {}),
+        }
         await asyncio.to_thread(
             upsert_candle_sync_runtime,
             self.collector_id,
@@ -174,7 +216,7 @@ class BinanceKlineStream:
             queue_depth=self.writer.queue.qsize(),
             error_count=self.error_count,
             reconnect_count=self.reconnect_count,
-            metrics={"closed_events": self.event_count},
+            metrics=metrics,
             **fields,
         )
 
@@ -218,6 +260,25 @@ class BinanceKlineStream:
         )
 
     async def _consume(self, symbols, stop):
+        batches = subscription_batches(
+            symbols,
+            self.max_streams_per_connection,
+        )
+        tasks = [
+            asyncio.create_task(
+                self._consume_connection(batch, stop, index)
+            )
+            for index, batch in enumerate(batches, start=1)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _consume_connection(self, symbols, stop, connection_index):
         async with websockets.connect(
             self.ws_url,
             ping_interval=20,
@@ -225,31 +286,39 @@ class BinanceKlineStream:
             close_timeout=5,
             max_queue=2048,
         ) as websocket:
-            for index in range(0, len(symbols), 100):
-                params = [
-                    f"{symbol.lower()}@kline_1m"
-                    for symbol in symbols[index : index + 100]
-                ]
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "method": "SUBSCRIBE",
-                            "params": params,
-                            "id": index // 100 + 1,
-                        }
-                    )
+            params = [
+                f"{symbol.lower()}@kline_1m"
+                for symbol in symbols
+            ]
+            await websocket.send(
+                json.dumps(
+                    {
+                        "method": "SUBSCRIBE",
+                        "params": params,
+                        "id": f"{self.collector_id}-{connection_index}",
+                    }
                 )
-                await asyncio.sleep(0.25)
+            )
             await self._runtime(
                 force=True,
                 status="running",
                 connection_state="connected",
                 last_error=None,
+                metrics={
+                    "closed_events": self.event_count,
+                    "connections": len(
+                        subscription_batches(
+                            self.symbols_provider(),
+                            self.max_streams_per_connection,
+                        )
+                    ),
+                },
             )
             deadline = (
                 asyncio.get_running_loop().time() + self.reconnect_seconds
             )
             connected_at = asyncio.get_running_loop().time()
+            last_message_at = connected_at
             while not stop.is_set():
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
@@ -262,9 +331,7 @@ class BinanceKlineStream:
                     )
                 except asyncio.TimeoutError:
                     now = asyncio.get_running_loop().time()
-                    silence = now - (
-                        self._last_event_monotonic or connected_at
-                    )
+                    silence = now - last_message_at
                     await self._runtime(
                         status="degraded" if silence > 90 else "running",
                         connection_state=(
@@ -278,7 +345,13 @@ class BinanceKlineStream:
                             else None
                         ),
                     )
+                    if silence > 90:
+                        raise TimeoutError(
+                            f"connection {connection_index} received no market event "
+                            f"for {silence:.0f}s"
+                        )
                     continue
+                last_message_at = asyncio.get_running_loop().time()
                 row = normalize_ws_message(message)
                 if not row or not row["symbol"]:
                     continue

@@ -86,20 +86,21 @@ class NormalSoftExitTest(unittest.TestCase):
         }, hist=state(entry_score=95), hold_alpha=60, composite_score=50, cooldown=True)
         self.assertEqual(actions, [])
 
-    def test_hard_stop_bypasses_soft_exit_cooldown(self):
+    def test_structure_stop_bypasses_soft_exit_cooldown(self):
         actions = self._actions({
             "ema20": 95, "ema20_slope": -1.0, "ema20_50_ratio": 0.98,
             "return_6h": -0.05, "return_24h": -0.10,
-        }, pos=position(mark=99, pnl=-1201), cooldown=True)
+        }, pos=position(mark=87.9, pnl=-1210), cooldown=True)
         self.assertEqual(actions[0]["action"], "close")
-        self.assertIn("margin_hard_stop", actions[0]["reason"])
+        self.assertIn("structure_1r_stop", actions[0]["reason"])
 
-    def test_loss_above_hard_stop_ignores_ordinary_weak_signals(self):
+    def test_weak_structure_at_minus_half_r_exits_early(self):
         actions = self._actions({
             "ema20": 101, "ema20_slope": -1.0, "ema20_50_ratio": 0.98,
             "return_6h": -0.05, "return_24h": -0.10,
         }, pos=position(mark=94, pnl=-1100), hold_alpha=20)
-        self.assertEqual(actions, [])
+        self.assertEqual(actions[0]["action"], "close")
+        self.assertIn("structure_invalidated", actions[0]["reason"])
 
     def test_cooldown_reads_recent_planned_soft_exit_from_decision_log(self):
         with tempfile.TemporaryDirectory() as tmp:

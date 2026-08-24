@@ -12,6 +12,11 @@ class MinuteUniverse:
     alpha: tuple[str, ...]
 
 
+def _valid_usdt_futures_symbol(symbol: str) -> bool:
+    value = str(symbol or "").upper()
+    return value.endswith("USDT") and "_PERP" not in value
+
+
 def load_minute_universe() -> MinuteUniverse:
     normal = [
         dict(row)
@@ -32,7 +37,11 @@ def load_minute_universe() -> MinuteUniverse:
         str(row.get("futures_symbol") or "").upper()
         for row in [*normal, *alpha]
     }
-    futures_symbols.update(str(symbol).upper() for symbol in tracked)
+    futures_symbols.update(
+        str(symbol).upper()
+        for symbol in tracked
+        if _valid_usdt_futures_symbol(symbol)
+    )
     futures_symbols.add("BTCUSDT")
     alpha_symbols = {
         str(row.get("source_symbol") or "").upper()
@@ -40,7 +49,12 @@ def load_minute_universe() -> MinuteUniverse:
     }
     return MinuteUniverse(
         spot=tuple(sorted(symbol for symbol in spot_symbols if symbol)),
-        futures=tuple(sorted(symbol for symbol in futures_symbols if symbol)),
+        futures=tuple(
+            sorted(
+                symbol
+                for symbol in futures_symbols
+                if _valid_usdt_futures_symbol(symbol)
+            )
+        ),
         alpha=tuple(sorted(symbol for symbol in alpha_symbols if symbol)),
     )
-

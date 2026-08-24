@@ -62,6 +62,35 @@ class ExchangeSymbolInfoTest(unittest.TestCase):
         self.assertEqual(requests[0]["triggerPrice"], 3968.0)
         self.assertEqual(requests[1]["triggerPrice"], 3968.1)
 
+    def test_cancel_protective_stops_uses_algo_order_type_field(self):
+        exchange = BinanceFutures.__new__(BinanceFutures)
+        requests = []
+
+        def request(method, path, signed, params):
+            requests.append((method, path, params))
+            if method == "GET":
+                return [
+                    {
+                        "algoId": 101,
+                        "orderType": "STOP_MARKET",
+                        "symbol": "ETHUSDT",
+                    },
+                    {
+                        "algoId": 102,
+                        "orderType": "TAKE_PROFIT_MARKET",
+                        "symbol": "ETHUSDT",
+                    },
+                ]
+            return {"code": 200}
+
+        exchange._request = request
+
+        cancelled = exchange.cancel_other_protective_stops("ETHUSDT")
+
+        self.assertEqual(cancelled, 1)
+        deletes = [item for item in requests if item[0] == "DELETE"]
+        self.assertEqual(deletes[0][2]["algoId"], 101)
+
 
 if __name__ == "__main__":
     unittest.main()

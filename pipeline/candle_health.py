@@ -2,7 +2,11 @@
 import asyncio
 from datetime import datetime, timezone
 
-from shared.db import get_conn, fetch_market_universe, update_market_readiness
+from shared.db import (
+    fetch_market_universe,
+    get_conn,
+    update_market_readiness_batch,
+)
 from shared.market_universe import CandleState, assess_dual_market_readiness
 
 
@@ -89,6 +93,5 @@ def refresh_universe_readiness(pool_type, now=None, futures_source_env=None):
             results[row["source_symbol"]] = result
     finally:
         conn.close()
-    for source_symbol, result in results.items():
-        update_market_readiness(pool_type, source_symbol, result.ready, result.error)
+    update_market_readiness_batch(pool_type, results)
     return results

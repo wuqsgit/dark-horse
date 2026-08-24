@@ -177,6 +177,9 @@ def sync_decision_actions(limit: int = 5000) -> int:
         conn.execute(
             "DELETE FROM trade_entry_reviews WHERE COALESCE(entry_price, 0) <= 0 OR COALESCE(side, '') = ''"
         )
+        # Do not retain SQLite's single writer lock while the large joins and
+        # JSON normalization below are running.
+        conn.commit()
         rows = conn.execute(
             """SELECT d.*
                FROM strategy_decisions d
@@ -222,16 +225,16 @@ def sync_decision_actions(limit: int = 5000) -> int:
                 )
             )
         if payload:
-            conn.executemany(
-                """INSERT OR IGNORE INTO decision_actions
+            sql = """INSERT OR IGNORE INTO decision_actions
                    (action_id, source_decision_id, run_id, time, symbol, category,
                     strategy_source, action_type, action_result, side, price, score,
                     entry_alpha, hold_alpha, grade, reason_code, reason_text,
                     reason_json, features_json, risk_params_json, position_params_json,
-                    policy_version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                payload,
-            )
+                   policy_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            for offset in range(0, len(payload), 100):
+                conn.executemany(sql, payload[offset:offset + 100])
+                conn.commit()
         trade_rows = conn.execute(
             """SELECT t.*
                FROM trades t
@@ -278,15 +281,15 @@ def sync_decision_actions(limit: int = 5000) -> int:
                 )
             )
         if trade_payload:
-            conn.executemany(
-                """INSERT OR IGNORE INTO decision_actions
+            sql = """INSERT OR IGNORE INTO decision_actions
                    (action_id, source_trade_id, time, symbol, category, strategy_source,
                     action_type, action_result, side, price, score, grade,
-                    reason_code, reason_text, reason_json, features_json,
-                    risk_params_json, position_params_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                trade_payload,
-            )
+                   reason_code, reason_text, reason_json, features_json,
+                   risk_params_json, position_params_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            for offset in range(0, len(trade_payload), 100):
+                conn.executemany(sql, trade_payload[offset:offset + 100])
+                conn.commit()
         conn.commit()
         return len(payload) + len(trade_payload)
     finally:
@@ -533,6 +536,41 @@ def review_position_trade_entries(limit: int = 300) -> dict:
     init_db()
     conn = get_conn()
     try:
+        # Income reconciliation can replace synthetic position IDs while the
+        # underlying exchange execution remains unchanged. Remove obsolete
+        # historical snapshots and collapse exact execution duplicates before
+        # rebuilding reviews.
+        conn.execute(
+            """DELETE FROM trade_entry_reviews
+               WHERE snapshot_source='historical_rebuild'
+                 AND position_status='closed'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM position_trades pt
+                     WHERE pt.position_trade_id=trade_entry_reviews.position_trade_id
+                 )"""
+        )
+        conn.execute(
+            """DELETE FROM trade_entry_reviews
+               WHERE id IN (
+                   SELECT id FROM (
+                       SELECT id,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY symbol, COALESCE(side, ''),
+                                    COALESCE(entry_time, ''),
+                                    ROUND(COALESCE(entry_price, 0), 10),
+                                    ROUND(COALESCE(quantity, 0), 10),
+                                    COALESCE(exit_time, ''),
+                                    ROUND(COALESCE(exit_price, 0), 10),
+                                    ROUND(COALESCE(net_pnl, 0), 8)
+                                  ORDER BY id DESC
+                              ) AS duplicate_rank
+                       FROM trade_entry_reviews
+                       WHERE snapshot_source='historical_rebuild'
+                         AND position_status='closed'
+                   ) duplicates
+                   WHERE duplicate_rank > 1
+               )"""
+        )
         conn.execute(
             """DELETE FROM trade_entry_reviews
                WHERE position_status='open'
@@ -834,8 +872,7 @@ def label_decision_outcomes(limit: int = 2500) -> int:
                 )
             )
         if updates:
-            conn.executemany(
-                """INSERT INTO decision_outcomes
+            sql = """INSERT INTO decision_outcomes
                    (action_id, symbol, category, action_type, action_result,
                     signal_time, entry_price, side, return_1h, return_4h,
                     return_12h, return_24h, return_48h, return_72h,
@@ -872,10 +909,10 @@ def label_decision_outcomes(limit: int = 2500) -> int:
                     trend_capture_ratio=excluded.trend_capture_ratio,
                     bars_observed=excluded.bars_observed,
                     is_complete=excluded.is_complete,
-                    updated_at=datetime('now')""",
-                updates,
-            )
-        conn.commit()
+                    updated_at=datetime('now')"""
+            for offset in range(0, len(updates), 100):
+                conn.executemany(sql, updates[offset:offset + 100])
+                conn.commit()
         return len(updates)
     finally:
         conn.close()

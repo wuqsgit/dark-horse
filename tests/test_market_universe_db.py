@@ -64,6 +64,48 @@ class MarketUniverseDbTest(unittest.TestCase):
         self.assertEqual(stored["data_ready"], 1)
         self.assertIsNone(stored["data_error"])
 
+    def test_replace_publishes_new_selection_in_one_transaction(self):
+        db.init_db()
+        db.upsert_market_universe([{
+            "pool_type": "normal", "source_symbol": "OLDUSDT",
+            "spot_symbol": "OLDUSDT", "futures_symbol": "OLDUSDT",
+            "selected": True, "data_ready": True,
+        }])
+        commits = []
+        real_get_conn = db.get_conn
+
+        class TrackedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, *args, **kwargs):
+                return self.connection.execute(*args, **kwargs)
+
+            def executemany(self, *args, **kwargs):
+                return self.connection.executemany(*args, **kwargs)
+
+            def commit(self):
+                commits.append("commit")
+                return self.connection.commit()
+
+            def rollback(self):
+                return self.connection.rollback()
+
+            def close(self):
+                return self.connection.close()
+
+        with patch.object(db, "get_conn", lambda: TrackedConnection(real_get_conn())):
+            db.replace_market_universe("normal", [{
+                "pool_type": "normal", "source_symbol": "NEWUSDT",
+                "spot_symbol": "NEWUSDT", "futures_symbol": "NEWUSDT",
+                "selected": True, "data_ready": True,
+            }])
+
+        self.assertEqual(commits, ["commit"])
+        rows = db.fetch_market_universe("normal")
+        selected = [row["source_symbol"] for row in rows if row["selected"]]
+        self.assertEqual(selected, ["NEWUSDT"])
+
 
 if __name__ == "__main__":
     unittest.main()

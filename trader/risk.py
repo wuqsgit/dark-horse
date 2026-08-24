@@ -111,9 +111,16 @@ def calculate_position(
     leverage_stop_pct = _leverage_stop_pct(atr_pct)
     hard_stop_pct = float(sizing.get("hard_stop_pct", cfg.get("hard_stop_pct", 0.05)))
     min_stop_pct = float(sizing.get("min_stop_pct", sizing.get("min_effective_stop_pct", 0.003)))
+    max_stop_pct = max(
+        min_stop_pct,
+        float(sizing.get("max_stop_pct", (cfg.get("dynamic_leverage") or {}).get("max_stop_pct", 0.10))),
+    )
     atr_multiplier = float(sizing.get("atr_stop_multiplier", 2.5))
     raw_stop_pct = atr_pct * atr_multiplier
-    stop_pct = hard_stop_pct / leverage
+    # 1R is a price/structure risk, independent from leverage.  The old model
+    # divided a margin-ROI stop by leverage, which made identical setups use a
+    # different market stop whenever leverage changed.
+    stop_pct = min(max_stop_pct, max(min_stop_pct, raw_stop_pct))
     stop_distance = price * stop_pct
 
     mode = str(entry_mode or "confirmed").lower()
@@ -131,17 +138,17 @@ def calculate_position(
     target_margin = balance * margin_pct
     target_notional = target_margin * leverage
 
-    risk_budget = balance * float(sizing.get("risk_per_trade_pct", cfg.get("risk_per_trade_pct", 0.015)))
+    risk_per_trade_pct = float(
+        sizing.get("probe_risk_per_trade_pct", sizing.get("risk_per_trade_pct", cfg.get("risk_per_trade_pct", 0.005)))
+        if mode in {"probe", "normal_review_probe", "trend_probe"}
+        else sizing.get("risk_per_trade_pct", cfg.get("risk_per_trade_pct", 0.005))
+    )
+    risk_budget = balance * risk_per_trade_pct
     risk_notional = risk_budget / stop_pct
     capped_notional = min(target_notional, risk_notional)
-
-    min_margin_pct = float(sizing.get("min_effective_margin_pct", 0))
-    min_stop_pct = float(sizing.get("min_effective_stop_pct", 0))
-    min_notional = balance * min_margin_pct * leverage
-    if min_notional > 0 and stop_pct <= min_stop_pct:
-        position_value = max(capped_notional, min(target_notional, min_notional))
-    else:
-        position_value = capped_notional
+    # Never force a minimum position above the 1R risk budget.  If a position
+    # is too small for exchange filters, the execution layer rejects it safely.
+    position_value = capped_notional
 
     max_notional = balance * max_margin_pct * leverage
     position_value = min(position_value, max_notional)
@@ -153,10 +160,11 @@ def calculate_position(
         "take_profit": round(stop_distance * 2, 8),
         "tp1_distance": round(stop_distance, 8),
         "tp2_distance": round(stop_distance * 2, 8),
-        "stop_model": "margin_hard_stop",
+        "stop_model": "structure_atr_1r",
         "stop_pct": round(stop_pct, 6),
         "raw_stop_pct": round(raw_stop_pct, 6),
         "min_stop_pct": round(min_stop_pct, 6),
+        "max_stop_pct": round(max_stop_pct, 6),
         "hard_stop_pct": round(hard_stop_pct, 6),
         "hard_stop_price_pct": round(stop_pct, 6),
         "atr_stop_multiplier": atr_multiplier,
@@ -174,6 +182,7 @@ def calculate_position(
         "sizing_class": class_key,
         "entry_mode": mode,
         "risk_budget": risk_budget,
+        "risk_per_trade_pct": risk_per_trade_pct,
     }
 
 

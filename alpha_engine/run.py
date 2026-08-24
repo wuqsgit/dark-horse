@@ -77,6 +77,8 @@ def build_strategy_worker():
             armed_ttl_hours=float(cfg.get("armed_ttl_hours", 4)),
             acceptance_ttl_bars=int(cfg.get("acceptance_ttl_bars", 2)),
             wait_retest_ttl_hours=float(cfg.get("wait_retest_ttl_hours", 4)),
+            trigger_pending_bars=int(cfg.get("trigger_pending_bars", 2)),
+            early_probe_stage_cap=float(cfg.get("early_probe_stage_cap", 0.15)),
         )
     )
     ai_client = AlphaStrategyAIClient(
@@ -90,6 +92,7 @@ def build_strategy_worker():
         testnet_live_rule_fallback=bool(
             cfg.get("testnet_live_rule_fallback", False)
         ),
+        recovery_max_bars=int(cfg.get("recovery_max_bars", 96)),
     )
 
 
@@ -163,6 +166,14 @@ async def main():
         next_run_time=startup_time,
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=60,
+    )
+    scheduler.add_job(
+        score_alpha,
+        "date",
+        run_date=startup_time + timedelta(seconds=45),
+        id="alpha_score_startup_retry",
+        replace_existing=True,
         misfire_grace_time=60,
     )
     if (

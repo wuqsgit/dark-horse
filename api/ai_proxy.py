@@ -21,9 +21,12 @@ class AIServiceProxy:
             "/v1/entry-quality/status", fallback={"models": {}},
         )
 
-    async def alpha_strategy_status(self):
+    async def alpha_strategy_status(self, market_env=None):
+        path = "/v2/alpha-strategy/status"
+        if market_env:
+            path = f"{path}?market_env={str(market_env).lower()}"
         return await self._get(
-            "/v2/alpha-strategy/status",
+            path,
             fallback={
                 "execution_mode": "unknown",
                 "samples": {},

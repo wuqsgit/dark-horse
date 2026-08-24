@@ -149,10 +149,10 @@ async def run_scoring():
 
 async def run_signal_labeling():
     try:
-        count = label_signal_outcomes(max_rows=2000)
+        count = label_signal_outcomes(max_rows=500)
         if count:
             logger.info(f"[signal-outcomes] labeled/updated {count} decisions")
-        loop_count = label_decision_outcomes(limit=2500)
+        loop_count = label_decision_outcomes(limit=500)
         if loop_count:
             logger.info(f"[policy-loop] labeled/updated {loop_count} decision outcomes")
     except Exception as e:
@@ -194,7 +194,9 @@ def register_retention_job(scheduler):
     scheduler.add_job(
         run_data_retention,
         trigger="date",
-        run_date=datetime.now(tz=timezone.utc) + timedelta(minutes=2),
+        # Let candle bootstrap and the first scoring pass finish before a
+        # multi-table delete acquires SQLite's single writer lock.
+        run_date=datetime.now(tz=timezone.utc) + timedelta(minutes=20),
         id="startup_data_retention",
         replace_existing=True,
     )
@@ -206,6 +208,18 @@ def register_retention_job(scheduler):
         timezone="Asia/Shanghai",
         id="daily_data_retention",
         replace_existing=True,
+    )
+
+
+def register_startup_scoring_retry(scheduler, startup_time):
+    """Retry after collectors have published their startup universe."""
+    scheduler.add_job(
+        run_scoring,
+        trigger="date",
+        run_date=startup_time + timedelta(seconds=45),
+        id="startup_scoring_retry",
+        replace_existing=True,
+        misfire_grace_time=60,
     )
 
 
@@ -232,7 +246,7 @@ async def main():
     sched.add_job(
         run_signal_labeling,
         "interval",
-        minutes=5,
+        minutes=30,
         id="signal_labeling",
         next_run_time=startup_time + timedelta(seconds=15),
         **common_job_options,
@@ -254,6 +268,7 @@ async def main():
         **common_job_options,
     )
     register_retention_job(sched)
+    register_startup_scoring_retry(sched, startup_time)
     logger.info("Legacy backtest scheduler removed; policy loop is the only review/autotune path")
     sched.start()
     logger.info("Engine scheduler started")

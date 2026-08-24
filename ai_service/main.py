@@ -153,8 +153,8 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v2/alpha-strategy/status")
-    def alpha_strategy_status():
-        return alpha.status()
+    def alpha_strategy_status(market_env: str | None = None):
+        return alpha.status(market_env)
 
     @app.post("/v2/alpha-strategy/outcomes/label")
     def label_alpha_strategy(payload: dict = Body(default={})):

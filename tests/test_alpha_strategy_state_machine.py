@@ -78,6 +78,76 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
         self.assertEqual(probe.to_state, AlphaSignalState.PROBE_READY)
         self.assertEqual(probe.action_type, ActionType.PROBE_LONG)
 
+    def test_high_quality_setup_can_probe_from_idle_on_trigger_bar(self):
+        result = self.machine.transition(
+            None,
+            _observation(
+                setup_probability=0.75,
+                followthrough_probability=0.68,
+                fakeout_probability=0.30,
+                trigger_detected=True,
+                max_position_factor=0.3,
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual(result.to_state, AlphaSignalState.PROBE_READY)
+        self.assertEqual(result.action_type, ActionType.PROBE_LONG)
+        self.assertIn("same_bar_probe_trigger_confirmed", result.reasons)
+
+    def test_watch_can_probe_without_intermediate_armed_bar(self):
+        watch = self.machine.transition(None, _observation(), now=NOW)
+
+        result = self.machine.transition(
+            watch.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(
+                snapshot_id="snap-2",
+                candle_close_time=NOW + timedelta(minutes=15),
+                setup_probability=0.75,
+                followthrough_probability=0.68,
+                fakeout_probability=0.30,
+                trigger_detected=True,
+                max_position_factor=0.3,
+            ),
+            now=NOW + timedelta(minutes=15),
+        )
+
+        self.assertEqual(result.to_state, AlphaSignalState.PROBE_READY)
+        self.assertEqual(result.action_type, ActionType.PROBE_LONG)
+        self.assertIn("same_bar_probe_trigger_confirmed", result.reasons)
+
+    def test_low_quality_idle_trigger_only_starts_watch(self):
+        result = self.machine.transition(
+            None,
+            _observation(
+                setup_probability=0.58,
+                followthrough_probability=0.68,
+                fakeout_probability=0.30,
+                trigger_detected=True,
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual(result.to_state, AlphaSignalState.WATCH_ACCUMULATION)
+        self.assertEqual(result.action_type, ActionType.NONE)
+
+    def test_overheated_idle_trigger_waits_for_retest(self):
+        result = self.machine.transition(
+            None,
+            _observation(
+                setup_probability=0.75,
+                followthrough_probability=0.68,
+                fakeout_probability=0.30,
+                trigger_detected=True,
+                overheated=True,
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual(result.to_state, AlphaSignalState.WAIT_RETEST)
+        self.assertEqual(result.action_type, ActionType.NONE)
+        self.assertIn("same_bar_overheated_wait_retest", result.reasons)
+
     def test_overheated_trigger_waits_for_retest_instead_of_cooldown(self):
         current = self.machine.transition(
             None,
@@ -109,6 +179,70 @@ class AlphaStrategyStateMachineTest(unittest.TestCase):
 
         self.assertEqual(result.to_state, AlphaSignalState.WAIT_RETEST)
         self.assertEqual(result.action_type, ActionType.NONE)
+
+    def test_near_trigger_is_retained_and_next_hold_opens_small_probe(self):
+        watch = self.machine.transition(
+            None,
+            _observation(setup_probability=0.7),
+            now=NOW,
+        )
+        armed = self.machine.transition(
+            watch.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(
+                snapshot_id="snap-2",
+                candle_close_time=NOW + timedelta(minutes=15),
+                setup_probability=0.7,
+            ),
+            now=NOW + timedelta(minutes=15),
+        )
+        pending = self.machine.transition(
+            armed.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(
+                snapshot_id="snap-3",
+                candle_close_time=NOW + timedelta(minutes=30),
+                setup_probability=0.7,
+                near_trigger_detected=True,
+                reference_price=1.03,
+            ),
+            now=NOW + timedelta(minutes=30),
+        )
+
+        self.assertEqual(pending.to_state, AlphaSignalState.TRIGGER_PENDING)
+        self.assertEqual(pending.action_type, ActionType.NONE)
+
+        probe = self.machine.transition(
+            pending.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(
+                snapshot_id="snap-4",
+                candle_close_time=NOW + timedelta(minutes=45),
+                setup_probability=0.7,
+                followthrough_probability=0.72,
+                fakeout_probability=0.22,
+                acceptance_confirmed=True,
+                max_position_factor=0.7,
+            ),
+            now=NOW + timedelta(minutes=45),
+        )
+
+        self.assertEqual(probe.to_state, AlphaSignalState.PROBE_READY)
+        self.assertEqual(probe.action_type, ActionType.PROBE_LONG)
+        self.assertEqual(probe.max_position_factor, 0.15)
+        self.assertIn("multi_bar_trigger_confirmed", probe.reasons)
+
+        confirmed = self.machine.transition(
+            probe.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(
+                snapshot_id="snap-5",
+                candle_close_time=NOW + timedelta(hours=1),
+                setup_probability=0.7,
+                followthrough_probability=0.75,
+                fakeout_probability=0.20,
+                acceptance_confirmed=True,
+            ),
+            now=NOW + timedelta(hours=1),
+        )
+        self.assertEqual(confirmed.to_state, AlphaSignalState.CONFIRMED)
+        self.assertIsNone(confirmed.expires_at)
 
     def test_watch_invalidation_has_priority_without_exit_event(self):
         current = self.machine.transition(

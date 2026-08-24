@@ -394,6 +394,21 @@ class BinanceFutures:
             params=params,
         )
 
+    def get_open_protective_stops(self, symbol: str | None = None) -> list[dict]:
+        params = {"symbol": symbol} if symbol else {}
+        orders = self._request(
+            "GET",
+            "/fapi/v1/openAlgoOrders",
+            signed=True,
+            params=params,
+        )
+        return [
+            order
+            for order in (orders or [])
+            if str(order.get("orderType") or order.get("type") or "").upper()
+            in {"STOP", "STOP_MARKET"}
+        ]
+
     def get_order_by_client_id(
         self,
         symbol: str,
@@ -430,14 +445,11 @@ class BinanceFutures:
         return self._request("POST", "/fapi/v1/algoOrder", signed=True, params=params)
 
     def cancel_other_protective_stops(self, symbol: str, keep_order_id=None):
-        orders = self._request(
-            "GET", "/fapi/v1/openAlgoOrders", signed=True, params={"symbol": symbol}
-        )
-        for order in orders or []:
+        orders = self.get_open_protective_stops(symbol)
+        cancelled = 0
+        for order in orders:
             order_id = order.get("algoId") or order.get("orderId")
             if order_id is None or str(order_id) == str(keep_order_id):
-                continue
-            if str(order.get("type") or "").upper() not in {"STOP", "STOP_MARKET"}:
                 continue
             self._request(
                 "DELETE",
@@ -445,6 +457,8 @@ class BinanceFutures:
                 signed=True,
                 params={"symbol": symbol, "algoId": order_id},
             )
+            cancelled += 1
+        return cancelled
 
     def place_take_profit_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
         self.adjust_quantity(symbol, quantity)

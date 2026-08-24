@@ -542,6 +542,12 @@ def _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=No
             if entry * 0.05 <= fallback_stop <= entry * 20
             else 0
         )
+    if current_stop <= 0 and entry > 0:
+        current_stop = (
+            entry * (1 + stop_pct)
+            if side_u == "SHORT"
+            else entry * (1 - stop_pct)
+        )
     trailing_price = None
     trailing_enabled = False
 
@@ -557,7 +563,7 @@ def _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=No
             trailing_price = high - atr_v * trail_mult
             current_stop = max(current_stop or 0, trailing_price)
             trailing_enabled = True
-        stop_triggered = current_stop > 0 and mark <= current_stop and r_multiple > 0
+        stop_triggered = current_stop > 0 and mark <= current_stop
     else:
         if r_multiple >= 1:
             current_stop = min(current_stop or entry * 10, entry * 0.998)
@@ -567,7 +573,7 @@ def _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=No
             trailing_price = low + atr_v * trail_mult
             current_stop = min(current_stop or entry * 10, trailing_price)
             trailing_enabled = True
-        stop_triggered = current_stop > 0 and mark >= current_stop and r_multiple > 0
+        stop_triggered = current_stop > 0 and mark >= current_stop
 
     return {
         "r_multiple": r_multiple,
@@ -1019,6 +1025,150 @@ class ExecutionEngine:
     def get_balance(self) -> float:
         return self.ex.get_balance()
 
+    def reconcile_exchange_protective_stops(self, positions: list) -> dict:
+        """Remove orphan stops and ensure one correctly sized stop per position."""
+        if not hasattr(self.ex, "get_open_protective_stops"):
+            return {"status": "unsupported", "repaired": 0, "orphaned": 0, "errors": []}
+
+        active = {
+            str(position.get("symbol") or "").upper(): position
+            for position in (positions or [])
+            if float(position.get("quantity") or 0) > 0
+        }
+        open_stops = self.ex.get_open_protective_stops()
+        by_symbol = {}
+        for order in open_stops:
+            symbol = str(order.get("symbol") or "").upper()
+            if symbol:
+                by_symbol.setdefault(symbol, []).append(order)
+
+        summary = {"status": "ok", "repaired": 0, "orphaned": 0, "errors": []}
+        for symbol in sorted(set(by_symbol) - set(active)):
+            try:
+                summary["orphaned"] += self.ex.cancel_other_protective_stops(
+                    symbol,
+                    None,
+                )
+            except Exception as exc:
+                summary["errors"].append({"symbol": symbol, "error": str(exc)})
+
+        try:
+            from shared.db import get_position_history, update_position_management
+        except Exception:
+            get_position_history = lambda _symbol: {}
+            update_position_management = lambda *_args, **_kwargs: None
+
+        from trader.roll_policy import calculate_protected_stop
+
+        for symbol, position in active.items():
+            try:
+                side = str(position.get("side") or "").upper()
+                quantity = abs(float(position.get("quantity") or 0))
+                entry_price = float(position.get("entry_price") or 0)
+                mark_price = float(position.get("mark_price") or 0)
+                history = dict(get_position_history(symbol) or {})
+                stop_price = float(
+                    history.get("protected_stop")
+                    or history.get("current_stop_loss")
+                    or history.get("initial_stop_loss")
+                    or 0
+                )
+                if history.get("tp1_hit"):
+                    break_even_stop = calculate_protected_stop(
+                        side,
+                        entry_price,
+                        self.cfg.get("roll_trading") or {},
+                    )
+                    stop_price = float(
+                        _ratchet_stop(
+                            side,
+                            stop_price,
+                            break_even_stop,
+                            entry_price,
+                        )
+                        or 0
+                    )
+
+                valid_existing = []
+                for order in by_symbol.get(symbol, []):
+                    trigger = float(
+                        order.get("triggerPrice")
+                        or order.get("stopPrice")
+                        or 0
+                    )
+                    valid = (
+                        side == "LONG" and 0 < trigger < mark_price
+                    ) or (
+                        side == "SHORT" and trigger > mark_price > 0
+                    )
+                    if valid:
+                        valid_existing.append((trigger, order))
+                if valid_existing:
+                    best_existing = (
+                        max(valid_existing, key=lambda item: item[0])
+                        if side == "LONG"
+                        else min(valid_existing, key=lambda item: item[0])
+                    )
+                    stop_price = float(
+                        _ratchet_stop(
+                            side,
+                            best_existing[0],
+                            stop_price,
+                            entry_price,
+                        )
+                        or best_existing[0]
+                    )
+
+                valid_stop = (
+                    side == "LONG" and 0 < stop_price < mark_price
+                ) or (
+                    side == "SHORT" and stop_price > mark_price > 0
+                )
+                if not valid_stop:
+                    raise RuntimeError(
+                        f"no valid protective stop candidate stop={stop_price} mark={mark_price}"
+                    )
+
+                matching = None
+                for trigger, order in valid_existing:
+                    order_qty = abs(float(order.get("quantity") or order.get("origQty") or 0))
+                    if abs(order_qty - quantity) <= max(1e-10, quantity * 1e-8) and abs(
+                        trigger - stop_price
+                    ) <= max(1e-10, stop_price * 1e-8):
+                        matching = order
+                        break
+
+                if matching is not None:
+                    keep_id = self._stop_order_id(matching)
+                    self.ex.cancel_other_protective_stops(symbol, keep_id)
+                else:
+                    stop_side = "SELL" if side == "LONG" else "BUY"
+                    new_order = self.ex.place_stop_order(
+                        symbol,
+                        stop_side,
+                        quantity,
+                        stop_price,
+                    )
+                    keep_id = self._stop_order_id(new_order)
+                    if keep_id is None:
+                        raise RuntimeError("protective stop acknowledgement missing")
+                    self.ex.cancel_other_protective_stops(symbol, keep_id)
+                    summary["repaired"] += 1
+
+                update_position_management(
+                    symbol,
+                    quantity=quantity,
+                    protected_stop=stop_price,
+                    current_stop_loss=stop_price,
+                    trailing_enabled=1,
+                )
+            except Exception as exc:
+                summary["errors"].append({"symbol": symbol, "error": str(exc)})
+
+        if summary["errors"]:
+            summary["status"] = "degraded"
+        return summary
+
     def _get_trading_symbols(self) -> set:
         if self._trading_symbols is None:
             self._trading_symbols = self.ex.get_trading_symbols()
@@ -1373,12 +1523,6 @@ class ExecutionEngine:
                 score=entry_score,
             )
 
-        alpha_hard_stop_pct = float(alpha_cfg.get("position_hard_stop_pct", 0.10)) * 100
-        if pnl_pct <= -alpha_hard_stop_pct:
-            return add(
-                f"margin_hard_stop roi={pnl_pct:.2f}% threshold=-{alpha_hard_stop_pct:.2f}%",
-                is_stop=True,
-            )
         r_state = _position_r_state(side, pos.get("entry_price"), mark_price, hist, atr, highest_price=highest_price)
         try:
             from shared.db import update_position_management
@@ -1395,9 +1539,18 @@ class ExecutionEngine:
         except Exception:
             pass
         if r_state.get("stop_triggered"):
+            r_multiple = float(r_state.get("r_multiple") or 0)
+            stop_kind = "alpha_structure_1r_stop" if r_multiple < 1 else "alpha_trailing_stop"
             return add(
-                f"alpha_trailing_stop r={float(r_state.get('r_multiple') or 0):.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}",
+                f"{stop_kind} r={r_multiple:.2f} stop={float(r_state.get('current_stop_loss') or 0):.4f}",
+                is_stop=r_multiple < 1,
                 score=entry_score,
+            )
+        emergency_stop_pct = float(alpha_cfg.get("emergency_margin_stop_pct", 0.20)) * 100
+        if pnl_pct <= -emergency_stop_pct:
+            return add(
+                f"emergency_margin_stop roi={pnl_pct:.2f}% threshold=-{emergency_stop_pct:.2f}%",
+                is_stop=True,
             )
         if profit_lock_enabled and pnl_pct > 0:
             if (
@@ -1996,16 +2149,34 @@ class ExecutionEngine:
                     actions.append(alpha_action)
                 continue
 
-            hard_stop_pct = float(self.cfg.get("hard_stop_pct", 0.12)) * 100
-            if hist.get("signal_source") == "bluechip_trend":
-                bluechip_cfg = _bluechip_cfg()
-                hard_stop_pct = float(bluechip_cfg.get("hard_stop_pct", 0.12)) * 100
-
-            if pnl_pct <= -hard_stop_pct:
+            r_multiple = float(r_state.get("r_multiple") or 0)
+            if r_state.get("stop_triggered"):
                 add(
                     "close",
-                    f"margin_hard_stop roi={pnl_pct:.2f}% threshold=-{hard_stop_pct:.2f}% "
+                    f"structure_1r_stop r={r_multiple:.2f} "
+                    f"stop={float(r_state.get('current_stop_loss') or 0):.8f} "
+                    f"roi={pnl_pct:.2f}% pnl={pnl:.2f}",
+                    is_stop=True,
+                )
+                continue
+
+            emergency_stop_pct = float(self.cfg.get("emergency_margin_stop_pct", 0.20)) * 100
+            if pnl_pct <= -emergency_stop_pct:
+                add(
+                    "close",
+                    f"emergency_margin_stop roi={pnl_pct:.2f}% threshold=-{emergency_stop_pct:.2f}% "
                     f"margin={margin:.2f} pnl={pnl:.2f} leverage={leverage:g}",
+                    is_stop=True,
+                )
+                continue
+
+            # A weak trend after half of the planned 1R has been consumed is
+            # structural invalidation, not a reason to wait for the full stop.
+            if r_multiple <= -0.5 and soft_trend_state == "weak":
+                add(
+                    "close",
+                    f"structure_invalidated r={r_multiple:.2f} trend=weak "
+                    f"roi={pnl_pct:.2f}%",
                     is_stop=True,
                 )
                 continue
@@ -2017,8 +2188,8 @@ class ExecutionEngine:
                     decision_stage="position_management",
                     decision_result="hold",
                     filter_reason=(
-                        f"loss_hold_until_margin_hard_stop roi={pnl_pct:.2f}% "
-                        f"threshold=-{hard_stop_pct:.2f}%"
+                        f"loss_hold_within_structure_1r r={r_multiple:.2f} "
+                        f"roi={pnl_pct:.2f}% stop={float(r_state.get('current_stop_loss') or 0):.8f}"
                     ),
                 )
                 continue
@@ -3638,6 +3809,150 @@ class ExecutionEngine:
         except Exception as e:
             logger.warning(f"    position management update failed: {e}")
 
+    @staticmethod
+    def _stop_order_id(order):
+        return (order or {}).get("algoId") or (order or {}).get("orderId")
+
+    def _sync_remaining_protective_stop(self, act, position, history):
+        """Replace stale exchange stops after a partial close.
+
+        The replacement is acknowledged before older conditional orders are
+        cancelled, so a transient API failure cannot create an unprotected
+        window.
+        """
+        if not position or not hasattr(self.ex, "place_stop_order"):
+            return None
+        symbol = act["symbol"]
+        side = str(position.get("side") or act.get("position_side") or "").upper()
+        quantity = abs(float(position.get("quantity") or 0))
+        entry_price = float(position.get("entry_price") or 0)
+        mark_price = float(position.get("mark_price") or 0)
+        if side not in {"LONG", "SHORT"} or quantity <= 0 or entry_price <= 0:
+            return None
+
+        history = dict(history or {})
+        strategy_source = str(
+            history.get("strategy_source")
+            or act.get("strategy_source")
+            or "normal"
+        ).lower()
+        existing_stop = (
+            history.get("protected_stop")
+            or history.get("current_stop_loss")
+            or history.get("initial_stop_loss")
+            or act.get("stop_loss")
+        )
+        stop_price = float(existing_stop or 0)
+        reason = str(act.get("reason") or "")
+        profit_milestone = any(
+            marker in reason
+            for marker in (
+                "TP1",
+                "TP2",
+                "alpha_profit_lock_stage1",
+                "alpha_profit_lock_stage2",
+            )
+        )
+        if strategy_source == "alpha" or profit_milestone:
+            from trader.roll_policy import calculate_protected_stop
+
+            break_even_stop = calculate_protected_stop(
+                side,
+                entry_price,
+                self.cfg.get("roll_trading") or {},
+            )
+            stop_price = float(
+                _ratchet_stop(side, stop_price, break_even_stop, entry_price)
+                or 0
+            )
+
+        valid_stop = (
+            side == "LONG" and 0 < stop_price < mark_price
+        ) or (
+            side == "SHORT" and stop_price > mark_price > 0
+        )
+        if not valid_stop:
+            if strategy_source == "alpha" or profit_milestone:
+                raise RuntimeError(
+                    f"remaining position has no valid break-even stop: "
+                    f"{symbol} stop={stop_price} mark={mark_price}"
+                )
+            logger.warning(
+                "  %s: skip protective stop resize; invalid stop=%s mark=%s",
+                symbol,
+                stop_price,
+                mark_price,
+            )
+            return None
+
+        stop_side = "SELL" if side == "LONG" else "BUY"
+        stop_order = self.ex.place_stop_order(
+            symbol,
+            stop_side,
+            quantity,
+            stop_price,
+        )
+        stop_order_id = self._stop_order_id(stop_order)
+        if stop_order_id is None:
+            raise RuntimeError(
+                f"protective stop acknowledgement missing after partial close: {symbol}"
+            )
+        if hasattr(self.ex, "cancel_other_protective_stops"):
+            self.ex.cancel_other_protective_stops(symbol, stop_order_id)
+
+        try:
+            from shared.db import insert_order, update_position_management
+
+            insert_order(
+                symbol,
+                stop_side,
+                "STOP_MARKET",
+                quantity,
+                stop_price,
+                status="submitted",
+                reason="partial_close_remaining_position_protection",
+                position_id=history.get("position_id") or act.get("position_id"),
+                strategy_source=strategy_source,
+                signal_source=history.get("signal_source") or act.get("signal_source"),
+                alpha_symbol=history.get("alpha_symbol") or act.get("alpha_symbol"),
+                alpha_profile=history.get("alpha_profile") or act.get("alpha_profile"),
+                alpha_entry_level=(
+                    history.get("alpha_entry_level")
+                    or act.get("alpha_entry_level")
+                ),
+                alpha_score=history.get("alpha_score") or act.get("alpha_score"),
+                alpha_suggested_position_pct=(
+                    history.get("alpha_suggested_position_pct")
+                    or act.get("alpha_suggested_position_pct")
+                ),
+                exchange_order_id=stop_order_id,
+            )
+            update_position_management(
+                symbol,
+                quantity=quantity,
+                protected_stop=stop_price,
+                current_stop_loss=stop_price,
+                trailing_enabled=1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "  %s: exchange stop synced but local protection write failed: %s",
+                symbol,
+                exc,
+            )
+        logger.info(
+            "  %s: remaining position protected qty=%s stop=%.8g order=%s",
+            symbol,
+            quantity,
+            stop_price,
+            stop_order_id,
+        )
+        return {
+            "order_id": stop_order_id,
+            "quantity": quantity,
+            "stop_price": stop_price,
+        }
+
     def _execute_open(self, act, results):
         logger.info(
             "  Opening %s %s x%s @$%.4f, notional $%.2f",
@@ -3709,7 +4024,39 @@ class ExecutionEngine:
 
         # Place the protective stop order.
         stop_side = "SELL" if act["position_side"] == "LONG" else "BUY"
-        stop_order = self.ex.place_stop_order(act["symbol"], stop_side, act["quantity"], act["stop_loss"])
+        try:
+            stop_order = self.ex.place_stop_order(
+                act["symbol"],
+                stop_side,
+                act["quantity"],
+                act["stop_loss"],
+            )
+            stop_order_id = self._stop_order_id(stop_order)
+            if stop_order_id is None:
+                raise RuntimeError("protective stop acknowledgement missing")
+            if hasattr(self.ex, "cancel_other_protective_stops"):
+                self.ex.cancel_other_protective_stops(
+                    act["symbol"],
+                    stop_order_id,
+                )
+        except Exception as exc:
+            # An entry without an acknowledged exchange stop is not allowed.
+            # Flatten the just-opened quantity instead of leaving a naked
+            # position for the next management loop.
+            try:
+                self.ex.close_position_market(
+                    act["symbol"],
+                    stop_side,
+                    act["quantity"],
+                )
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"protective stop failed and emergency flatten failed: "
+                    f"stop={exc}; flatten={rollback_exc}"
+                ) from rollback_exc
+            raise RuntimeError(
+                f"protective stop failed; opened position flattened: {exc}"
+            ) from exc
         try:
             from shared.db import insert_order
             insert_order(
@@ -3728,13 +4075,14 @@ class ExecutionEngine:
                 alpha_entry_level=act.get("alpha_entry_level"),
                 alpha_score=act.get("alpha_score"),
                 alpha_suggested_position_pct=act.get("alpha_suggested_position_pct"),
+                exchange_order_id=stop_order_id,
             )
         except Exception as e:
             logger.warning(f"    local stop order write failed: {e}")
         logger.info(
             "    Stop order @$%.4f: %s",
             act["stop_loss"],
-            stop_order.get("orderId"),
+            stop_order_id,
         )
 
         # Record the open-position cooldown.
@@ -4124,6 +4472,7 @@ class ExecutionEngine:
         executed_pct = executed_qty / pos["quantity"] if pos["quantity"] else 0
         pnl = pos["unrealized_pnl"] * executed_pct
         pnl_pct_v = round(pnl / (margin * executed_pct) * 100, 2) if margin and executed_pct else 0
+        hist = {}
         try:
             from shared.db import get_position_history, record_trade, update_position_management
 
@@ -4159,6 +4508,24 @@ class ExecutionEngine:
                 act["symbol"],
                 e,
             )
+
+        if not cleanup_residual:
+            refreshed_positions = self.ex.get_positions()
+            remaining_position = next(
+                (
+                    item
+                    for item in refreshed_positions
+                    if item["symbol"] == act["symbol"]
+                    and float(item.get("quantity") or 0) > 0
+                ),
+                None,
+            )
+            if remaining_position:
+                self._sync_remaining_protective_stop(
+                    act,
+                    remaining_position,
+                    hist,
+                )
         self._record_decision(
             act["symbol"],
             run_id=act.get("run_id"),

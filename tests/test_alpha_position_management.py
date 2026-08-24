@@ -294,14 +294,15 @@ class AlphaPositionManagementTest(unittest.TestCase):
             for item in engine.recorded_decisions
         ))
 
-    def test_alpha_hard_stop_does_not_wait_for_15m_confirmation(self):
+    def test_alpha_structure_stop_does_not_wait_for_15m_confirmation(self):
         engine = self._soft_loss_engine()
         with patch.object(execution, "_latest_alpha_soft_exit_confirmation", return_value=None, create=True), \
              patch.object(execution, "_fetch_closed_futures_15m", return_value=[], create=True):
-            action = self._soft_loss_action(engine, pnl_pct=-10.5, mark_price=99.0)
+            action = self._soft_loss_action(engine, pnl_pct=-30.3, mark_price=89.9)
 
         self.assertIsNotNone(action)
-        self.assertIn("margin_hard_stop", action["reason"])
+        self.assertIn("alpha_structure_1r_stop", action["reason"])
+        self.assertTrue(action["is_stop"])
 
     def test_margin_roi_stage1_protects_even_when_price_move_is_below_one_r(self):
         engine = ExecutionEngine(DummyExchange())

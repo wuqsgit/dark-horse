@@ -252,10 +252,16 @@ class BinanceHTTPCollector:
             insert_futures(rows_fut)
 
         purge_old_kline_data(days=RETENTION_DAYS)
-        refresh_universe_readiness(
-            "normal",
-            futures_source_env=self.futures_source_env,
-        )
+        try:
+            refresh_universe_readiness(
+                "normal",
+                futures_source_env=self.futures_source_env,
+            )
+        except Exception as exc:
+            # Candle collection is durable even when SQLite is temporarily
+            # busy publishing readiness metadata.  Do not turn an otherwise
+            # successful feed into a blocking runtime error.
+            logger.warning("normal readiness publication deferred: %s", exc)
 
         logger.info(f"Done: {len(rows_1h)} 1h + {len(rows_15m)} 15m + {len(rows_6h)} 6h + {len(rows_24h)} 24h + {len(rows_fut)} futures")
 

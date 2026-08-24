@@ -135,6 +135,11 @@ stop_matching_processes() {
     local cwd=""
     if [ -e "/proc/$pid/cwd" ]; then
       cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+    elif command -v lsof >/dev/null 2>&1; then
+      # macOS has no /proc filesystem. Resolve the process cwd through lsof
+      # so stale workers from an older terminal are stopped as well.
+      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null \
+        | sed -n 's/^n//p' | head -n 1 || true)"
     fi
     if [ "$cwd" = "$ROOT_DIR" ] || [ "$cwd" = "$ROOT_DIR/frontend" ]; then
       stop_process_tree "$pid"
@@ -223,6 +228,33 @@ wait_for_port() {
   return 1
 }
 
+wait_for_worker_ready() {
+  local name="$1"
+  local pidfile="$2"
+  local logfile="$3"
+  local pattern="$4"
+  local timeout_seconds="${5:-90}"
+  local attempt pid
+
+  for ((attempt = 0; attempt < timeout_seconds * 2; attempt++)); do
+    pid="$(tr -cd '0-9' < "$pidfile" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! process_is_running "$pid"; then
+      echo "  FAIL $name exited during startup (see $logfile)"
+      tail -n 40 "$logfile" 2>/dev/null || true
+      return 1
+    fi
+    if grep -q -- "$pattern" "$logfile" 2>/dev/null; then
+      echo "  READY $name"
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "  FAIL $name did not become ready (see $logfile)"
+  tail -n 40 "$logfile" 2>/dev/null || true
+  return 1
+}
+
 if [ "$IS_WINDOWS" -eq 1 ]; then
   powershell.exe -NoProfile -ExecutionPolicy Bypass \
     -File "$WINDOWS_STOP_HELPER" \
@@ -260,6 +292,8 @@ sleep 1
 
 start_service "Minute Pipeline" "$RUNTIME_DIR/alphadog_minute_pipeline.pid" "$RUNTIME_DIR/alphadog_minute_pipeline.log" \
   "$PYTHON_BIN" -m minute_pipeline.main
+wait_for_worker_ready "Minute Pipeline" "$RUNTIME_DIR/alphadog_minute_pipeline.pid" \
+  "$RUNTIME_DIR/alphadog_minute_pipeline.log" "minute pipeline mode=" 90
 sleep 1
 
 start_service "Engine" "$RUNTIME_DIR/alphadog_engine.pid" "$RUNTIME_DIR/alphadog_engine.log" \

@@ -380,7 +380,6 @@ button:disabled {
 }
 
 .mini-pill,
-.decision-pill,
 .policy-status {
   display: inline-flex;
   align-items: center;
@@ -638,37 +637,6 @@ button:disabled {
   font-size: 12px;
 }
 
-.reason-list {
-  display: grid;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.reason-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 42px;
-  align-items: center;
-  border: 1px solid rgba(80, 105, 140, 0.34);
-  border-radius: 8px;
-  padding: 9px 12px;
-  background: rgba(7, 12, 19, 0.68);
-  color: #c7d3e4;
-}
-
-.reason-row b {
-  color: var(--amber);
-  white-space: nowrap;
-}
-
-.decision-strip {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 12px;
-}
-
 .runtime-diagnostics {
   border-color: #334155;
 }
@@ -749,8 +717,6 @@ button:disabled {
 .runtime-issue-error .runtime-issue-title { color: #fca5a5; }
 .runtime-issue-warning .runtime-issue-title { color: #fde68a; }
 .runtime-issue-title span { font-size: 12px; }
-
-.decision-pill strong { color: var(--text); }
 
 .trade-table {
   width: 100%;

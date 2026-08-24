@@ -27,12 +27,17 @@ class AlphaStrategyReplay:
 
     @staticmethod
     def _rule_prediction(setup_score: float, trigger) -> dict:
+        confirmation = trigger.trigger_detected or trigger.acceptance_confirmed
         return {
             "p_setup_success": min(1.0, max(0.0, setup_score / 100)),
-            "p_followthrough": 0.72 if trigger.trigger_detected else 0.0,
-            "p_fakeout": 0.22 if trigger.trigger_detected else 0.5,
-            "expected_r": 0.5 if trigger.trigger_detected else 0.0,
-            "max_position_factor": 0.3 if trigger.trigger_detected else 0.0,
+            "p_followthrough": 0.72 if confirmation else 0.0,
+            "p_fakeout": 0.22 if confirmation else 0.5,
+            "expected_r": 0.5 if confirmation else 0.0,
+            "max_position_factor": (
+                0.3 if trigger.trigger_detected
+                else 0.7 if trigger.acceptance_confirmed
+                else 0.0
+            ),
             "model_versions": {"replay": "rule-v1"},
         }
 
@@ -143,6 +148,7 @@ class AlphaStrategyReplay:
                 retest_confirmed=trigger.retest_confirmed,
                 invalidated=trigger.invalidated,
                 data_ready=snapshot.quality.get("status") == "ready",
+                near_trigger_detected=trigger.near_trigger_detected,
                 reference_price=snapshot.features.get("current_price"),
                 base_low=base_low,
                 base_high=snapshot.features.get("base_high_2h"),

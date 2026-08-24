@@ -18,6 +18,7 @@ const stateLabel = (state) => ({
   WATCH_CONTINUATION: '发现趋势中继',
   WATCH_RECLAIM: '发现洗盘收复',
   ARMED: '等待启动',
+  TRIGGER_PENDING: '临界启动，等待确认',
   PROBE_READY: '可以试仓',
   WAIT_RETEST: '急拉后等待回踩',
   ACCEPTANCE_PENDING: '等待突破确认',
@@ -45,8 +46,38 @@ const stateTone = (state) => {
   return 'neutral';
 };
 
+const alertText = (alert) => {
+  const target = ({
+    setup_success: '启动成功率模型',
+    followthrough: '持续上涨模型',
+    fakeout: '假突破模型',
+  })[alert.target] || alert.target;
+  const feature = (name) => ({
+    listing_age_hours: '上市时长',
+    liquidation_pressure: '清算压力',
+  })[name] || name;
+  const details = alert.details || {};
+  const labels = {
+    worker_heartbeat_stale: '策略 Worker 心跳超时',
+    closed_candle_stale: '策略 K 线处理延迟',
+    ai_failure_rate_high: 'AI 调用失败率过高',
+    feature_readiness_low: '特征数据完整率过低',
+    model_input_drift: `${target || '模型'}输入特征发生漂移`,
+  };
+  const parts = [labels[alert.code] || alert.code];
+  if (alert.market_env) parts.push(environmentLabel(alert.market_env));
+  if (alert.age_minutes !== undefined) parts.push(`延迟 ${number(alert.age_minutes, 1)} 分钟`);
+  if (alert.rate !== undefined) parts.push(`${number(Number(alert.rate) * 100, 1)}%`);
+  if (details.max_mean_shift_feature) {
+    parts.push(`${feature(details.max_mean_shift_feature)}偏移 ${number(details.max_mean_shift_z, 2)}σ`);
+  }
+  if (details.max_missing_feature) {
+    parts.push(`${feature(details.max_missing_feature)}缺失率变化 ${number(Number(details.max_missing_rate_delta) * 100, 1)}%`);
+  }
+  return parts.join(' · ');
+};
+
 export default function AlphaStrategyMonitor() {
-  const [environment, setEnvironment] = useState('');
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -55,8 +86,7 @@ export default function AlphaStrategyMonitor() {
     let active = true;
     const load = async () => {
       try {
-        const query = environment ? `?market_env=${environment}` : '';
-        const response = await fetch(`/api/alpha-strategy/status${query}`, {
+        const response = await fetch('/api/alpha-strategy/status?market_env=mainnet', {
           cache: 'no-store',
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -78,7 +108,7 @@ export default function AlphaStrategyMonitor() {
       active = false;
       clearInterval(timer);
     };
-  }, [environment]);
+  }, []);
 
   const stateCounts = useMemo(
     () => Object.fromEntries((data?.states || []).map((row) => [
@@ -112,11 +142,7 @@ export default function AlphaStrategyMonitor() {
           <p className="muted">状态机、AI 概率、交易事件与账户消费状态实时汇总。</p>
         </div>
         <div className="alpha-monitor-controls">
-          <select value={environment} onChange={(event) => setEnvironment(event.target.value)}>
-            <option value="">全部环境</option>
-            <option value="testnet">Testnet</option>
-            <option value="mainnet">Mainnet</option>
-          </select>
+          <span className="strategy-mode">主网行情</span>
           <span className={`strategy-mode ${ai.execution_mode === 'live' ? 'live' : ''}`}>
             AI {ai.execution_mode || 'unknown'}
           </span>
@@ -129,10 +155,7 @@ export default function AlphaStrategyMonitor() {
           className={`alpha-alert ${alert.severity === 'error' ? 'bad' : 'warn'}`}
           key={`${alert.code}-${alert.market_env || alert.version || index}`}
         >
-          {alert.code}
-          {alert.market_env ? ` · ${alert.market_env}` : ''}
-          {alert.age_minutes ? ` · 延迟 ${alert.age_minutes} 分钟` : ''}
-          {alert.rate !== undefined ? ` · ${(Number(alert.rate) * 100).toFixed(1)}%` : ''}
+          {alertText(alert)}
         </div>
       ))}
       {loading && !data && <div className="alpha-empty">正在读取策略状态…</div>}

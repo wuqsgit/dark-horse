@@ -414,14 +414,20 @@ class AlphaSignalConsumer:
                 price,
                 balance,
                 score=80,
-                category=symbol_risk_category(symbol),
+                category="alpha",
                 entry_mode=entry_mode,
                 size_multiplier=final_factor,
             )
-            risk_budget = balance * float(
+            configured_risk_budget = balance * float(
                 account.get("risk_per_trade_pct")
                 or self.config.get("risk_per_trade_pct")
-                or 0.015
+                or 0.005
+            )
+            # Account rows may still contain the former 1.5% setting.  The
+            # strategy-level 1R cap is authoritative and cannot be exceeded.
+            risk_budget = min(
+                configured_risk_budget,
+                float(pos_info.get("risk_budget") or configured_risk_budget),
             )
             structural_risk = price - invalidation
             risk_qty = risk_budget / structural_risk if structural_risk > 0 else 0

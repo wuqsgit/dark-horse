@@ -74,14 +74,35 @@ def _fetch_trade_rows(main_db_path, limit):
         needed = {
             "position_trade_id", "symbol", "strategy_source", "category", "entry_template",
             "review_label", "net_pnl", "max_favorable_return", "max_adverse_return",
-            "entry_time", "exit_time",
+            "entry_time", "exit_time", "side", "entry_price", "exit_price", "quantity",
         }
         select_cols = [col for col in needed if col in columns]
         rows = conn.execute(
             f"SELECT {', '.join(select_cols)} FROM trade_entry_reviews ORDER BY rowid DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        seen = set()
+        for row in rows:
+            item = dict(row)
+            # Historical income reconciliation may regenerate a synthetic
+            # position_trade_id. Deduplicate by immutable execution facts so
+            # one exchange trade cannot inflate sample size or loss totals.
+            key = (
+                str(item.get("symbol") or "").upper(),
+                str(item.get("side") or "").upper(),
+                str(item.get("entry_time") or ""),
+                round(_num(item.get("entry_price")), 10),
+                round(_num(item.get("quantity")), 10),
+                str(item.get("exit_time") or ""),
+                round(_num(item.get("exit_price")), 10),
+                round(_num(item.get("net_pnl")), 8),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
     finally:
         conn.close()
 
@@ -133,7 +154,18 @@ def _trade_recommendation(source, category, template, bad, cases):
     template_u = str(template or "").lower()
     source_u = str(source or "").lower()
 
-    if source_u == "alpha" and "probe" in template_u:
+    legacy_alpha = source_u == "alpha" and template_u in {
+        "futures_mapped",
+        "alpha_volume_impulse_entry",
+        "unknown",
+    }
+    if legacy_alpha:
+        base = (
+            "旧版 Alpha 入口历史样本：旧入口保持关闭，不与 Alpha V2 样本混合；"
+            "当前执行侧已在部分止盈后按剩余仓位同步交易所保护止损，"
+            "后续只用 Alpha V2 新样本重新评估。"
+        )
+    elif source_u == "alpha" and "probe" in template_u:
         base = (
             "Alpha 试探仓：只保留试探仓位；趋势分低于 82，或试探超时前没有走到 1R，"
             "都不允许加仓，直接减仓或退出。"
@@ -144,10 +176,23 @@ def _trade_recommendation(source, category, template, bad, cases):
             "如果趋势分或量能衰减，先减 25%-30%，不要等硬止损兜底。"
         )
     elif category_u in {"discovery", "narrative"}:
-        base = (
-            "discovery/题材币：MFE 超过 8% 后锁住 30%-50% 浮盈；"
-            "若从最高浮盈回撤超过一半，再减 25%；没有交易所保护止损，不允许隔夜持仓。"
-        )
+        if avg_mfe >= 0.08:
+            base = (
+                "discovery/题材币：MFE 超过 8% 后锁住 30%-50% 浮盈；"
+                "若从最高浮盈回撤超过一半，再减 25%；"
+                "没有交易所保护止损，不允许隔夜持仓。"
+            )
+        elif avg_mae <= -0.08:
+            base = (
+                "discovery/题材币当前主要问题是入场后逆向波动过深："
+                "初始仓位减半，并要求趋势、放量、盘口价差和深度同时通过；"
+                "首根 15m K 线失守入场价时退出，不等待宽止损。"
+            )
+        else:
+            base = (
+                "discovery/题材币先降低初始仓位并提高趋势、放量和盘口确认；"
+                "累计足够高浮盈回吐样本后再启用 8% 分档锁盈规则。"
+            )
     elif category_u in {"core_bluechip", "bluechip"}:
         base = (
             "蓝筹仓：不要追快速拉升；只在回踩 EMA 后重新站稳、1h 趋势未破时进场；"
@@ -239,7 +284,20 @@ def _trade_insights(rows, min_samples):
                 symbols.append(symbol)
         issue_rate = len(bad) / len(items)
         total_pnl = sum(_num(item.get("net_pnl")) for item in bad)
-        priority = "\u6025\u9700\u4fee\u590d" if issue_rate >= 0.5 or total_pnl <= -5 else "\u5efa\u8bae\u4f18\u5316"
+        legacy_alpha = (
+            str(source or "").lower() == "alpha"
+            and str(template or "").lower()
+            in {"futures_mapped", "alpha_volume_impulse_entry", "unknown"}
+        )
+        priority = (
+            "历史问题"
+            if legacy_alpha
+            else (
+                "\u6025\u9700\u4fee\u590d"
+                if issue_rate >= 0.5 or total_pnl <= -5
+                else "\u5efa\u8bae\u4f18\u5316"
+            )
+        )
         representative_cases = _representative_trade_cases(source, category, template, bad)
         avg_mfe = _mean([item.get("max_favorable_return") for item in bad])
         avg_mae = _mean([item.get("max_adverse_return") for item in bad])

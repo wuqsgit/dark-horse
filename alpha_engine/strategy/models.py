@@ -13,6 +13,7 @@ class AlphaSignalState(str, Enum):
     WATCH_CONTINUATION = "WATCH_CONTINUATION"
     WATCH_RECLAIM = "WATCH_RECLAIM"
     ARMED = "ARMED"
+    TRIGGER_PENDING = "TRIGGER_PENDING"
     PROBE_READY = "PROBE_READY"
     WAIT_RETEST = "WAIT_RETEST"
     ACCEPTANCE_PENDING = "ACCEPTANCE_PENDING"
@@ -46,6 +47,7 @@ class StrategyObservation:
     retest_confirmed: bool
     invalidated: bool
     data_ready: bool
+    near_trigger_detected: bool = False
     reference_price: float | None = None
     base_low: float | None = None
     base_high: float | None = None

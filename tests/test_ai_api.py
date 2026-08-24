@@ -75,11 +75,14 @@ class AIServiceAPITest(unittest.TestCase):
             "/v2/alpha-strategy/evaluate",
             json=payload,
         )
-        status = self.client.get("/v2/alpha-strategy/status")
+        status = self.client.get(
+            "/v2/alpha-strategy/status?market_env=mainnet"
+        )
 
         self.assertEqual(evaluation.status_code, 200)
         self.assertEqual(evaluation.json()["status"], "collecting")
         self.assertEqual(status.json()["feature_schema_version"], 4)
+        self.assertEqual(status.json()["market_env"], "mainnet")
         self.assertEqual(status.json()["samples"]["total"], 1)
 
 

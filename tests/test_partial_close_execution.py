@@ -31,6 +31,13 @@ class PartialCloseExchange:
             self.quantity = max(0.0, self.quantity - quantity)
         return self.response or {"orderId": 123, "executedQty": str(quantity), "avgPrice": "102.0"}
 
+    def place_stop_order(self, symbol, side, quantity, stop_price):
+        self.events.append(("new_stop", quantity, stop_price))
+        return {"algoId": "new-stop-1"}
+
+    def cancel_other_protective_stops(self, symbol, keep_order_id):
+        self.events.append(("cancel_old", keep_order_id))
+
 
 class PartialCloseExecutionTest(unittest.TestCase):
     def test_failed_exchange_close_does_not_record_trade(self):
@@ -119,7 +126,11 @@ class PartialCloseExecutionTest(unittest.TestCase):
         engine = ExecutionEngine(exchange)
         engine._record_decision = lambda *args, **kwargs: None
         results = []
-        history = {"strategy_source": "alpha", "protected_profit": 5.0}
+        history = {
+            "strategy_source": "alpha",
+            "protected_profit": 5.0,
+            "current_stop_loss": 95.0,
+        }
 
         with patch("shared.db.get_position_history", return_value=history), \
              patch("shared.db.record_trade"), \
@@ -137,7 +148,63 @@ class PartialCloseExecutionTest(unittest.TestCase):
             )
 
         self.assertTrue(succeeded)
-        self.assertAlmostEqual(update.call_args.kwargs["protected_profit"], 10.0)
+        protection_updates = [
+            call.kwargs
+            for call in update.call_args_list
+            if "protected_stop" in call.kwargs
+        ]
+        self.assertAlmostEqual(
+            next(
+                call.kwargs["protected_profit"]
+                for call in update.call_args_list
+                if "protected_profit" in call.kwargs
+            ),
+            10.0,
+        )
+        self.assertEqual(len(protection_updates), 1)
+        self.assertEqual(protection_updates[0]["quantity"], 7.5)
+        self.assertAlmostEqual(protection_updates[0]["protected_stop"], 100.15)
+        self.assertEqual(
+            exchange.events[-2:],
+            [("new_stop", 7.5, 100.15), ("cancel_old", "new-stop-1")],
+        )
+
+    def test_normal_tp1_moves_remaining_exchange_stop_to_break_even(self):
+        exchange = PartialCloseExchange()
+        engine = ExecutionEngine(exchange)
+        engine._record_decision = lambda *args, **kwargs: None
+        history = {
+            "strategy_source": "normal",
+            "current_stop_loss": 95.0,
+            "initial_stop_loss": 95.0,
+        }
+
+        with patch("shared.db.get_position_history", return_value=history), \
+             patch("shared.db.record_trade"), \
+             patch("shared.db.update_position_management") as update:
+            succeeded = engine._execute_partial_close(
+                {
+                    "action": "partial_close",
+                    "symbol": "B2USDT",
+                    "side": "SELL",
+                    "strategy_source": "normal",
+                    "close_pct": 0.25,
+                    "reason": "TP1 r>=1",
+                },
+                [],
+            )
+
+        self.assertTrue(succeeded)
+        protection_updates = [
+            call.kwargs for call in update.call_args_list
+            if "protected_stop" in call.kwargs
+        ]
+        self.assertEqual(len(protection_updates), 1)
+        self.assertAlmostEqual(protection_updates[0]["protected_stop"], 100.15)
+        self.assertEqual(
+            exchange.events[-2:],
+            [("new_stop", 7.5, 100.15), ("cancel_old", "new-stop-1")],
+        )
 
 
 if __name__ == "__main__":

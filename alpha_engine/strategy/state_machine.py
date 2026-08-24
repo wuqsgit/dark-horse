@@ -26,6 +26,8 @@ class StateMachineConfig:
     armed_ttl_hours: float = 4
     acceptance_ttl_bars: int = 2
     wait_retest_ttl_hours: float = 4
+    trigger_pending_bars: int = 2
+    early_probe_stage_cap: float = 0.15
 
 
 WATCH_STATES = {
@@ -36,6 +38,7 @@ WATCH_STATES = {
 
 ACTIVE_SETUP_STATES = WATCH_STATES | {
     AlphaSignalState.ARMED,
+    AlphaSignalState.TRIGGER_PENDING,
     AlphaSignalState.PROBE_READY,
     AlphaSignalState.WAIT_RETEST,
     AlphaSignalState.ACCEPTANCE_PENDING,
@@ -107,6 +110,17 @@ class AlphaStrategyStateMachine:
                 next_expires = now + timedelta(hours=ttl_hours)
             else:
                 next_expires = expires_at
+            position_factor = observation.max_position_factor
+            if (
+                from_state == AlphaSignalState.TRIGGER_PENDING
+                and action == ActionType.PROBE_LONG
+            ):
+                position_factor = min(
+                    max(0.0, float(position_factor or 0.0)),
+                    self.config.early_probe_stage_cap,
+                )
+                if position_factor <= 0:
+                    position_factor = self.config.early_probe_stage_cap
             return TransitionResult(
                 from_state=from_state,
                 to_state=to_state,
@@ -127,7 +141,7 @@ class AlphaStrategyStateMachine:
                 followthrough_probability=observation.followthrough_probability,
                 fakeout_probability=observation.fakeout_probability,
                 expected_r=observation.expected_r,
-                max_position_factor=observation.max_position_factor,
+                max_position_factor=position_factor,
                 reasons=reasons or observation.reasons,
                 model_versions=dict(observation.model_versions),
                 previous_version=previous_version,
@@ -191,6 +205,14 @@ class AlphaStrategyStateMachine:
                 reasons=("state_ttl_expired",),
             )
 
+        trigger_quality_ready = bool(
+            observation.setup_probability >= self.config.setup_arm_threshold
+            and observation.followthrough_probability
+            >= self.config.trigger_followthrough_threshold
+            and observation.fakeout_probability
+            <= self.config.trigger_fakeout_max
+        )
+
         if from_state == AlphaSignalState.IDLE:
             if (
                 setup_type == "sentiment_reversal"
@@ -211,6 +233,31 @@ class AlphaStrategyStateMachine:
                     + ("sentiment_reversal_probe_confirmed",),
                 )
             if (
+                setup_type != "sentiment_reversal"
+                and observation.setup_detected
+                and observation.trigger_detected
+                and trigger_quality_ready
+            ):
+                setup_id = _setup_id(observation)
+                if observation.overheated:
+                    return result(
+                        AlphaSignalState.WAIT_RETEST,
+                        ttl_hours=self.config.wait_retest_ttl_hours,
+                        reasons=tuple(observation.reasons)
+                        + ("same_bar_overheated_wait_retest",),
+                    )
+                return result(
+                    AlphaSignalState.PROBE_READY,
+                    action=ActionType.PROBE_LONG,
+                    ttl_hours=max(
+                        1,
+                        int(self.config.acceptance_ttl_bars),
+                    )
+                    * 0.25,
+                    reasons=tuple(observation.reasons)
+                    + ("same_bar_probe_trigger_confirmed",),
+                )
+            if (
                 observation.setup_detected
                 and observation.setup_probability >= self.config.setup_watch_threshold
             ):
@@ -223,6 +270,25 @@ class AlphaStrategyStateMachine:
             return result(from_state, force_changed=False)
 
         if from_state in WATCH_STATES:
+            if observation.trigger_detected and trigger_quality_ready:
+                if observation.overheated:
+                    return result(
+                        AlphaSignalState.WAIT_RETEST,
+                        ttl_hours=self.config.wait_retest_ttl_hours,
+                        reasons=tuple(observation.reasons)
+                        + ("same_bar_overheated_wait_retest",),
+                    )
+                return result(
+                    AlphaSignalState.PROBE_READY,
+                    action=ActionType.PROBE_LONG,
+                    ttl_hours=max(
+                        1,
+                        int(self.config.acceptance_ttl_bars),
+                    )
+                    * 0.25,
+                    reasons=tuple(observation.reasons)
+                    + ("same_bar_probe_trigger_confirmed",),
+                )
             if observation.setup_probability >= self.config.setup_arm_threshold:
                 return result(
                     AlphaSignalState.ARMED,
@@ -255,6 +321,47 @@ class AlphaStrategyStateMachine:
                         * 0.25,
                         reasons=tuple(observation.reasons) + ("probe_trigger_confirmed",),
                     )
+            if observation.near_trigger_detected:
+                return result(
+                    AlphaSignalState.TRIGGER_PENDING,
+                    ttl_hours=(
+                        max(1, int(self.config.trigger_pending_bars)) + 1
+                    ) * 0.25,
+                    reasons=tuple(observation.reasons)
+                    + ("near_trigger_waiting_confirmation",),
+                )
+            return result(from_state, force_changed=False)
+
+        if from_state == AlphaSignalState.TRIGGER_PENDING:
+            if observation.overheated:
+                return result(
+                    AlphaSignalState.WAIT_RETEST,
+                    ttl_hours=self.config.wait_retest_ttl_hours,
+                    reasons=tuple(observation.reasons)
+                    + ("pending_trigger_overheated_wait_retest",),
+                )
+            if observation.trigger_detected and trigger_quality_ready:
+                return result(
+                    AlphaSignalState.PROBE_READY,
+                    action=ActionType.PROBE_LONG,
+                    ttl_hours=max(1, int(self.config.acceptance_ttl_bars)) * 0.25,
+                    reasons=tuple(observation.reasons)
+                    + ("pending_trigger_strictly_confirmed",),
+                )
+            if (
+                observation.acceptance_confirmed
+                and observation.followthrough_probability
+                >= self.config.trigger_followthrough_threshold
+                and observation.fakeout_probability
+                <= self.config.trigger_fakeout_max
+            ):
+                return result(
+                    AlphaSignalState.PROBE_READY,
+                    action=ActionType.PROBE_LONG,
+                    ttl_hours=max(1, int(self.config.acceptance_ttl_bars)) * 0.25,
+                    reasons=tuple(observation.reasons)
+                    + ("multi_bar_trigger_confirmed",),
+                )
             return result(from_state, force_changed=False)
 
         if from_state == AlphaSignalState.PROBE_READY:
@@ -262,6 +369,7 @@ class AlphaStrategyStateMachine:
                 return result(
                     AlphaSignalState.CONFIRMED,
                     action=ActionType.CONFIRM_LONG,
+                    clear_expiry=True,
                     reasons=tuple(observation.reasons) + ("breakout_accepted",),
                 )
             return result(
@@ -277,6 +385,7 @@ class AlphaStrategyStateMachine:
                 return result(
                     AlphaSignalState.CONFIRMED,
                     action=ActionType.CONFIRM_LONG,
+                    clear_expiry=True,
                     reasons=tuple(observation.reasons) + ("breakout_accepted",),
                 )
             return result(from_state, force_changed=False)

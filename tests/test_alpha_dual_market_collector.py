@@ -1,11 +1,28 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from alpha_pipeline.collector import AlphaCollector
+import shared.db as db
 
 
 class AlphaDualMarketCollectorTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(
+            db,
+            "DB_PATH",
+            str(Path(self.temp_dir.name) / "market.db"),
+        )
+        self.db_patch.start()
+        db.init_db()
+
+    def tearDown(self):
+        self.db_patch.stop()
+        self.temp_dir.cleanup()
+
     def test_mapped_futures_tables_never_use_normal_spot_tables(self):
         self.assertEqual(AlphaCollector.futures_table_for_interval("15m"), "futures_candles_15m")
         self.assertEqual(AlphaCollector.futures_table_for_interval("1h"), "futures_candles_1h")
@@ -33,6 +50,36 @@ class AlphaDualMarketCollectorTest(unittest.TestCase):
         self.assertEqual(row[9], 580.0)
         self.assertEqual(row[10], "mainnet")
         self.assertEqual(row[11], 1)
+
+    def test_history_counts_are_environment_and_symbol_scoped(self):
+        rows = [
+            (
+                f"2026-08-12T{i:02d}:00:00Z",
+                "AKEUSDT",
+                1, 1, 1, 1, 1, 1, 1, 1,
+                "mainnet",
+                1,
+            )
+            for i in range(3)
+        ]
+        rows.append(
+            (
+                "2026-08-12T04:00:00Z",
+                "AKEUSDT",
+                1, 1, 1, 1, 1, 1, 1, 1,
+                "testnet",
+                1,
+            )
+        )
+        db.insert_futures_candles("futures_candles_1h", rows)
+
+        counts = AlphaCollector.candle_history_counts(
+            "futures_candles_1h",
+            ["AKEUSDT", "MISSINGUSDT"],
+            source_env="mainnet",
+        )
+
+        self.assertEqual(counts, {"AKEUSDT": 3})
 
     def test_collect_all_uses_persisted_universe_when_refresh_fails(self):
         collector = AlphaCollector()

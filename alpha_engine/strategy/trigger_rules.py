@@ -20,6 +20,7 @@ def _num(features: Mapping, name: str, default=None):
 @dataclass(frozen=True)
 class TriggerEvaluation:
     trigger_detected: bool
+    near_trigger_detected: bool
     overheated: bool
     acceptance_confirmed: bool
     retest_confirmed: bool
@@ -67,6 +68,22 @@ def evaluate_trigger(
         and (price_efficiency is None or price_efficiency >= 60)
     )
     normal_ignition = ignition and not overheated and ret_15m <= 8
+    # A marginal first ignition should be remembered instead of discarded.
+    # These relaxed bounds never open a position on their own: the state
+    # machine requires a later closed candle to hold the breakout before it
+    # emits a deliberately smaller probe.
+    near_ignition = bool(
+        not ignition
+        and not overheated
+        and 2.0 <= ret_15m <= 8.0
+        and volume_ratio >= 1.5
+        and close_location >= 0.58
+        and upper_wick <= 0.42
+        and breakout_distance > 0
+        and (price_efficiency is None or price_efficiency >= 50)
+    )
+    if near_ignition:
+        reasons.append("near_trigger_detected")
     sentiment_reversal = bool(
         str(setup_type or "").lower() == "sentiment_reversal"
         and ret_15m >= 0
@@ -92,7 +109,7 @@ def evaluate_trigger(
     if invalidated:
         reasons.append("price_below_invalidation")
 
-    acceptance = bool(
+    breakout_acceptance = bool(
         state
         and state.breakout_level is not None
         and current_price is not None
@@ -100,8 +117,20 @@ def evaluate_trigger(
         and close_location >= 0.55
         and upper_wick <= 0.45
     )
+    pending_hold = bool(
+        state
+        and state.state.value == "TRIGGER_PENDING"
+        and state.reference_price is not None
+        and current_price is not None
+        and current_price >= float(state.reference_price) * 0.995
+        and close_location >= 0.55
+        and upper_wick <= 0.45
+    )
+    acceptance = breakout_acceptance or pending_hold
     if acceptance:
         reasons.append("breakout_level_held")
+    if pending_hold:
+        reasons.append("near_trigger_price_held")
 
     retest = bool(
         state
@@ -117,6 +146,7 @@ def evaluate_trigger(
 
     return TriggerEvaluation(
         trigger_detected=ignition,
+        near_trigger_detected=near_ignition,
         overheated=overheated,
         acceptance_confirmed=acceptance,
         retest_confirmed=retest,

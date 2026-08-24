@@ -27,7 +27,7 @@ TRADING_CONFIG = {
     "total_capital": 5000,
     "position_size_pct": 0.20,          # 每仓占总资金 20%
     "position_multiplier": 1.0,        # 仓位倍数（基于评分动态调整）
-    "risk_per_trade_pct": 0.015,        # 每仓风险预算 1.5%
+    "risk_per_trade_pct": 0.005,        # 每仓最大初始风险 0.5%（1R）
     "max_positions": 5,
 
     # ── ATR 参数 ──
@@ -63,8 +63,9 @@ TRADING_CONFIG = {
     "tp2_target_pct": 0.10,             # TP2 止盈 10%
     "trailing_stop_atr_multiplier": 1.5,  # 移动止盈 = 最高点 - ATR×1.5
 
-    # ── 硬止损 ──
-    "hard_stop_pct": 0.12,             # 当前仓位保证金亏损 12% 强制平仓
+    # ── 兜底止损 ──
+    # 正常止损由开仓时的结构 1R 决定；该阈值只处理历史仓位/保护单异常。
+    "emergency_margin_stop_pct": 0.20,
 
     # ── 调度 ──
     "soft_exit_profit_pct": 2.0,
@@ -96,13 +97,14 @@ TRADING_CONFIG = {
             "leverage_max": 8,
             "atr_stop_multiplier": 2.0,
             "min_stop_pct": 0.025,
+            "max_stop_pct": 0.050,
             "hard_stop_pct": 0.12,
             "trailing_atr_multiplier": 1.5,
             "probe_margin_pct": 0.05,
             "confirmed_margin_pct": 0.07,
             "strong_margin_pct": 0.10,
             "max_margin_pct": 0.10,
-            "risk_per_trade_pct": 0.025,
+            "risk_per_trade_pct": 0.005,
             "min_effective_margin_pct": 0.05,
             "min_effective_stop_pct": 0.035
         },
@@ -110,13 +112,14 @@ TRADING_CONFIG = {
             "leverage_max": 5,
             "atr_stop_multiplier": 2.5,
             "min_stop_pct": 0.035,
+            "max_stop_pct": 0.060,
             "hard_stop_pct": 0.12,
             "trailing_atr_multiplier": 1.5,
             "probe_margin_pct": 0.05,
             "confirmed_margin_pct": 0.07,
             "strong_margin_pct": 0.10,
             "max_margin_pct": 0.10,
-            "risk_per_trade_pct": 0.020,
+            "risk_per_trade_pct": 0.005,
             "min_effective_margin_pct": 0.035,
             "min_effective_stop_pct": 0.040
         },
@@ -124,13 +127,14 @@ TRADING_CONFIG = {
             "leverage_max": 4,
             "atr_stop_multiplier": 2.5,
             "min_stop_pct": 0.035,
+            "max_stop_pct": 0.065,
             "hard_stop_pct": 0.12,
             "trailing_atr_multiplier": 1.5,
             "probe_margin_pct": 0.05,
             "confirmed_margin_pct": 0.07,
             "strong_margin_pct": 0.10,
             "max_margin_pct": 0.10,
-            "risk_per_trade_pct": 0.020,
+            "risk_per_trade_pct": 0.005,
             "min_effective_margin_pct": 0.025,
             "min_effective_stop_pct": 0.045
         },
@@ -138,13 +142,14 @@ TRADING_CONFIG = {
             "leverage_max": 3,
             "atr_stop_multiplier": 2.5,
             "min_stop_pct": 0.035,
+            "max_stop_pct": 0.075,
             "hard_stop_pct": 0.12,
             "trailing_atr_multiplier": 1.5,
             "probe_margin_pct": 0.05,
             "confirmed_margin_pct": 0.07,
             "strong_margin_pct": 0.10,
             "max_margin_pct": 0.10,
-            "risk_per_trade_pct": 0.020,
+            "risk_per_trade_pct": 0.0045,
             "min_effective_margin_pct": 0.020,
             "min_effective_stop_pct": 0.050
         },
@@ -152,13 +157,14 @@ TRADING_CONFIG = {
             "leverage_max": 3,
             "atr_stop_multiplier": 3.5,
             "min_stop_pct": 0.070,
+            "max_stop_pct": 0.100,
             "hard_stop_pct": 0.12,
             "trailing_atr_multiplier": 2.0,
             "probe_margin_pct": 0.05,
             "confirmed_margin_pct": 0.07,
             "strong_margin_pct": 0.10,
             "max_margin_pct": 0.10,
-            "risk_per_trade_pct": 0.015,
+            "risk_per_trade_pct": 0.0035,
             "min_effective_margin_pct": 0.010,
             "min_effective_stop_pct": 0.055
         },
@@ -166,13 +172,15 @@ TRADING_CONFIG = {
             "leverage_max": 3,
             "atr_stop_multiplier": 3.0,
             "min_stop_pct": 0.050,
+            "max_stop_pct": 0.080,
             "hard_stop_pct": 0.10,
             "trailing_atr_multiplier": 2.0,
             "probe_margin_pct": 0.05,
             "confirmed_margin_pct": 0.07,
             "strong_margin_pct": 0.10,
             "max_margin_pct": 0.10,
-            "risk_per_trade_pct": 0.015,
+            "risk_per_trade_pct": 0.005,
+            "probe_risk_per_trade_pct": 0.003,
             "min_effective_margin_pct": 0.018,
             "min_effective_stop_pct": 0.050
         },
@@ -264,6 +272,7 @@ TRADING_CONFIG = {
         "position_soft_exit_profit_pct": 2.0,
         "position_profit_protect_close_pct": 0.25,
         "position_hard_stop_pct": 0.10,  # 当前仓位保证金亏损 10% 强制平仓
+        "emergency_margin_stop_pct": 0.20,
         "trend_management": {
             "enabled": True,
             # Only fully closed 15m bars can trigger these rules.
@@ -327,6 +336,9 @@ TRADING_CONFIG = {
         "armed_ttl_hours": 4,
         "acceptance_ttl_bars": 2,
         "wait_retest_ttl_hours": 4,
+        "trigger_pending_bars": 2,
+        "early_probe_stage_cap": 0.15,
+        "recovery_max_bars": 96,
         "probe_stage_cap": 0.30,
         "sentiment_reversal_stage_cap": 0.50,
         "confirmed_stage_cap": 0.70,

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import shared.db as db
@@ -30,6 +31,33 @@ class MarketDataHealthTest(unittest.TestCase):
         self.assertEqual(health["normal"]["ready"], 1)
         self.assertEqual(health["normal"]["unready"], 1)
         self.assertEqual(health["alpha"]["limit"], 80)
+
+    def test_readiness_batch_updates_pool_atomically(self):
+        db.upsert_market_universe([
+            {"pool_type": "normal", "source_symbol": "BTCUSDT", "spot_symbol": "BTCUSDT", "futures_symbol": "BTCUSDT", "selected": True},
+            {"pool_type": "normal", "source_symbol": "ETHUSDT", "spot_symbol": "ETHUSDT", "futures_symbol": "ETHUSDT", "selected": True},
+        ])
+
+        updated = db.update_market_readiness_batch(
+            "normal",
+            {
+                "BTCUSDT": SimpleNamespace(ready=True, error=None),
+                "ETHUSDT": SimpleNamespace(ready=False, error="stale"),
+            },
+            checked_at="2026-08-19T15:00:00Z",
+        )
+
+        rows = {
+            row["source_symbol"]: row
+            for row in db.fetch_market_universe("normal")
+        }
+        self.assertEqual(updated, 2)
+        self.assertEqual(rows["BTCUSDT"]["data_ready"], 1)
+        self.assertEqual(rows["ETHUSDT"]["data_error"], "stale")
+        self.assertEqual(
+            rows["ETHUSDT"]["data_checked_at"],
+            "2026-08-19T15:00:00Z",
+        )
 
 
 if __name__ == "__main__":

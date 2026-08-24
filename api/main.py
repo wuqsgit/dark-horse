@@ -2741,7 +2741,7 @@ async def get_alpha_strategy_status(
                 for row in event_rows
             ],
             "recent_consumptions": [dict(row) for row in consumption_rows],
-            "ai": await _ai_proxy.alpha_strategy_status(),
+            "ai": await _ai_proxy.alpha_strategy_status(env),
         }
     )
     alerts = []
@@ -2796,7 +2796,12 @@ async def get_alpha_strategy_status(
                 "rate": quality.get("ready_rate"),
             }
         )
+    # Only the champion is serving predictions. A drifting challenger should be
+    # visible in the registry, but must not duplicate the operational alert for
+    # the same target.
     for model in ai_status.get("models") or []:
+        if model.get("status") != "champion":
+            continue
         if (model.get("drift") or {}).get("status") == "drift":
             alerts.append(
                 {

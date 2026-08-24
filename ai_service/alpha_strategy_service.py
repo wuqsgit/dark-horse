@@ -233,8 +233,9 @@ class AlphaStrategyService:
             "duplicates": received - created,
         }
 
-    def status(self) -> dict:
-        models = self.store.list_alpha_strategy_models()
+    def status(self, market_env: str | None = None) -> dict:
+        env = str(market_env).lower() if market_env else None
+        models = self.store.list_alpha_strategy_models(env)
         model_status = []
         for model in models:
             item = dict(model)
@@ -260,18 +261,19 @@ class AlphaStrategyService:
             ),
             "execution_mode": self.execution_mode,
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
-            "samples": self.store.alpha_strategy_sample_counts(),
+            "market_env": env,
+            "samples": self.store.alpha_strategy_sample_counts(env),
             "training_requirements": {
                 "minimum_training_samples": self.min_training_samples,
                 "minimum_validation_samples": self.min_validation_samples,
             },
-            "feature_quality": self.store.alpha_strategy_quality_summary(),
+            "feature_quality": self.store.alpha_strategy_quality_summary(env),
             "execution_outcomes": (
                 self.store.alpha_strategy_execution_summary()
             ),
             "models": model_status,
             "recent_training_runs": (
-                self.store.list_alpha_strategy_model_runs(30)
+                self.store.list_alpha_strategy_model_runs(30, env)
             ),
         }
 

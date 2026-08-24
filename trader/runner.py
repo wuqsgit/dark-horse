@@ -98,6 +98,7 @@ async def _account_trading_loop(account):
         config=engine.cfg,
     )
     alpha_signal_recovered = False
+    protective_stops_reconciled = False
     last_income_sync = 0  # 上次 income 同步时间
     loop_interval = int(TRADING_CONFIG.get("rebalance_interval_min", 5) * 60)
 
@@ -113,6 +114,10 @@ async def _account_trading_loop(account):
             # 1. 检查账户状态
             balance = ex.get_balance()
             positions = engine.get_current_positions()
+            if not protective_stops_reconciled:
+                protection = engine.reconcile_exchange_protective_stops(positions)
+                logger.info("Exchange protective stop reconciliation: %s", protection)
+                protective_stops_reconciled = not bool(protection.get("errors"))
             if positions:
                 snap_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 insert_position_snapshot([

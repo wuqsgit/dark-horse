@@ -171,6 +171,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(actions[0]["market_data_env"], "mainnet")
         self.assertEqual(actions[0]["execution_env"], "testnet")
         self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.30)
+        self.assertLessEqual(
+            actions[0]["quantity"]
+            * (actions[0]["entry_price"] - actions[0]["stop_loss"]),
+            3.0,
+        )
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
         self.assertEqual(duplicate, [])
 

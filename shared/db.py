@@ -67,8 +67,24 @@ OPERATIONAL_RETENTION_TABLES = {
 _local = threading.local()
 _account_context = ContextVar("darkhorse_account_id", default=1)
 _init_lock = threading.RLock()
+_database_write_lock = threading.RLock()
 _initialized_databases = set()
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
+
+
+def _serialized_write(function):
+    """Serialize SQLite write transactions inside one service process.
+
+    WAL permits concurrent readers but SQLite still has a single writer.
+    Minute collection uses several worker threads, so without this guard the
+    process can spend the entire busy timeout competing with itself.
+    """
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with _database_write_lock:
+            return function(*args, **kwargs)
+
+    return wrapper
 
 
 class _AutoClosingConnection:
@@ -505,6 +521,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_decision_actions_symbol ON decision_actions(symbol, time DESC);
         CREATE INDEX IF NOT EXISTS idx_decision_actions_category ON decision_actions(category, time DESC);
         CREATE INDEX IF NOT EXISTS idx_decision_actions_type ON decision_actions(action_type, action_result, time DESC);
+        CREATE INDEX IF NOT EXISTS idx_decision_actions_source_decision ON decision_actions(source_decision_id);
+        CREATE INDEX IF NOT EXISTS idx_decision_actions_source_trade ON decision_actions(source_trade_id);
         CREATE TABLE IF NOT EXISTS decision_outcomes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action_id TEXT UNIQUE,
@@ -1796,6 +1814,9 @@ def _ensure_performance_indexes(conn):
         ("idx_signal_outcomes_symbol_time", "signal_outcomes", "symbol, signal_time DESC"),
         ("idx_signal_outcomes_complete_time", "signal_outcomes", "is_complete, signal_time DESC"),
         ("idx_signal_outcomes_scan", "signal_outcomes", "scan_id"),
+        ("idx_decision_actions_source_decision", "decision_actions", "source_decision_id"),
+        ("idx_decision_actions_source_trade", "decision_actions", "source_trade_id"),
+        ("idx_decision_outcomes_complete_time", "decision_outcomes", "is_complete, signal_time"),
         # Backtests, factors, and learning pages.
         ("idx_factor_effectiveness_bucket", "factor_effectiveness", "bucket, run_time DESC"),
         ("idx_policy_candidates_target_status", "strategy_policy_candidates", "target, status"),
@@ -2066,6 +2087,7 @@ def _minute_table(market_kind):
         ) from exc
 
 
+@_serialized_write
 def upsert_minute_candles(market_kind, rows):
     """Batch upsert fully normalized closed 1m candles."""
     if not rows:
@@ -2165,6 +2187,7 @@ def fetch_latest_minute_time(market_kind, symbol, source_env="mainnet"):
         conn.close()
 
 
+@_serialized_write
 def upsert_aggregated_candles(rows):
     if not rows:
         return 0
@@ -2253,6 +2276,7 @@ _AGGREGATE_LEGACY_TABLES = {
 }
 
 
+@_serialized_write
 def materialize_aggregated_candles(rows):
     """Publish complete unified aggregates to legacy strategy tables."""
     grouped = {}
@@ -2327,19 +2351,30 @@ def materialize_aggregated_candles(rows):
         conn.close()
 
 
-def materialize_stored_aggregates():
+def materialize_stored_aggregates(since_hours=None):
+    clauses = ["is_complete=1"]
+    params = []
+    if since_hours is not None:
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=max(1, int(since_hours)))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        clauses.append("time>=?")
+        params.append(cutoff)
     conn = get_conn()
     try:
         rows = conn.execute(
-            """SELECT * FROM aggregated_candles
-               WHERE is_complete=1
-               ORDER BY time"""
+            f"""SELECT * FROM aggregated_candles
+                WHERE {' AND '.join(clauses)}
+                ORDER BY time""",
+            params,
         ).fetchall()
     finally:
         conn.close()
     return materialize_aggregated_candles(rows)
 
 
+@_serialized_write
 def upsert_candle_gap(
     market_kind,
     symbol,
@@ -2383,6 +2418,7 @@ def upsert_candle_gap(
         conn.close()
 
 
+@_serialized_write
 def update_candle_gap(gap_id, status, error=None):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     resolved_at = now if status == "resolved" else None
@@ -2423,6 +2459,7 @@ def fetch_candle_gaps(status="pending", limit=200):
         conn.close()
 
 
+@_serialized_write
 def reset_stale_candle_repairs():
     conn = get_conn()
     try:
@@ -2437,6 +2474,7 @@ def reset_stale_candle_repairs():
         conn.close()
 
 
+@_serialized_write
 def upsert_candle_sync_runtime(collector_id, market_kind, **fields):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {
@@ -2545,6 +2583,7 @@ def fetch_candle_sync_status():
         conn.close()
 
 
+@_serialized_write
 def purge_minute_candle_data(days=4):
     cutoff = (
         datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
@@ -2573,7 +2612,7 @@ def purge_minute_candle_data(days=4):
         conn.close()
 
 
-def upsert_market_universe(rows):
+def upsert_market_universe(rows, *, conn=None):
     if not rows:
         return
     columns = (
@@ -2604,7 +2643,8 @@ def upsert_market_universe(rows):
         for column in columns[2:]
         if column not in readiness_columns
     )
-    conn = get_conn()
+    owns_connection = conn is None
+    conn = conn or get_conn()
     try:
         conn.executemany(
             f"""INSERT INTO market_universe ({', '.join(columns)})
@@ -2612,14 +2652,20 @@ def upsert_market_universe(rows):
                 ON CONFLICT(pool_type, source_symbol) DO UPDATE SET {assignments}""",
             values,
         )
-        conn.commit()
+        if owns_connection:
+            conn.commit()
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def replace_market_universe(pool_type, rows):
     conn = get_conn()
     try:
+        # Publish the new selection atomically. Scoring workers must never
+        # observe the short window where the old pool has been deselected but
+        # the refreshed rows have not yet been upserted.
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """UPDATE market_universe
                SET selected = 0, forced_position = 0,
@@ -2627,10 +2673,13 @@ def replace_market_universe(pool_type, rows):
                WHERE pool_type = ?""",
             (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), pool_type),
         )
+        upsert_market_universe(rows, conn=conn)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    upsert_market_universe(rows)
 
 
 def fetch_tracked_position_symbols():
@@ -2715,6 +2764,7 @@ def fetch_market_universe(pool_type=None, selected_only=False, ready_only=False)
         conn.close()
 
 
+@_serialized_write
 def update_market_readiness(pool_type, source_symbol, ready, error=None, checked_at=None):
     checked_at = checked_at or datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -2728,6 +2778,52 @@ def update_market_readiness(pool_type, source_symbol, ready, error=None, checked
             (int(bool(ready)), error, checked_at, pool_type, source_symbol),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+@_serialized_write
+def update_market_readiness_batch(pool_type, results, checked_at=None):
+    """Publish one pool's readiness in a single short write transaction.
+
+    The minute pipeline used to open and commit one SQLite connection for
+    every symbol.  A normal+Alpha refresh therefore created hundreds of
+    competing write transactions while candle batches were being stored.
+    Keeping the whole refresh in one executemany materially shortens the
+    lock window and makes the readiness snapshot atomic.
+    """
+    if not results:
+        return 0
+    checked_at = checked_at or datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    values = []
+    for source_symbol, result in results.items():
+        if isinstance(result, dict):
+            ready = result.get("ready")
+            error = result.get("error")
+        else:
+            ready = getattr(result, "ready")
+            error = getattr(result, "error", None)
+        values.append(
+            (
+                int(bool(ready)),
+                error,
+                checked_at,
+                str(pool_type),
+                str(source_symbol),
+            )
+        )
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """UPDATE market_universe
+               SET data_ready = ?, data_error = ?, data_checked_at = ?
+               WHERE pool_type = ? AND source_symbol = ?""",
+            values,
+        )
+        conn.commit()
+        return len(values)
     finally:
         conn.close()
 
@@ -3759,10 +3855,16 @@ def backfill_income_ledger_from_fills():
         rows = conn.execute(
             """SELECT *
                FROM fills
-               WHERE side='REALIZED_PNL'
-                 AND account_id=?
+               WHERE account_id=?
                  AND trade_id IS NOT NULL
-                 AND trade_id != ''""",
+                 AND trade_id != ''
+                 AND (
+                   side='REALIZED_PNL'
+                   OR (
+                     strategy_source='binance_user_trades'
+                     AND ABS(COALESCE(realized_pnl, 0)) > 0.000000000001
+                   )
+                 )""",
             (account_id,),
         ).fetchall()
         count = 0
@@ -3784,11 +3886,16 @@ def backfill_income_ledger_from_fills():
             if exists:
                 continue
             raw = dict(r)
+            source = (
+                "binance_user_trades_fallback"
+                if r["strategy_source"] == "binance_user_trades"
+                else "legacy_fills"
+            )
             conn.execute(
                 """INSERT INTO exchange_income_ledger
                    (account_id, income_id, symbol, income_type, income, asset, income_time,
                     trade_id, position_side, raw_json, source)
-                   VALUES (?, ?, ?, 'REALIZED_PNL', ?, ?, ?, ?, NULL, ?, 'legacy_fills')""",
+                   VALUES (?, ?, ?, 'REALIZED_PNL', ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     account_id,
                     income_id,
@@ -3797,7 +3904,9 @@ def backfill_income_ledger_from_fills():
                     r["fee_asset"] or "USDT",
                     r["created_at"],
                     stored_trade_id,
+                    r["position_side"],
                     json.dumps(raw, ensure_ascii=False),
+                    source,
                 ),
             )
             count += 1
@@ -3991,6 +4100,11 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
                 "exit_price": exit_notional / exit_qty,
                 "entry_time": entries[0]["created_at"],
                 "exit_time": exits[-1]["created_at"],
+                "trade_ids": {
+                    str(row["trade_id"] or "")
+                    for row in matching
+                    if row["trade_id"]
+                },
             }
 
         def consolidate_by_local_position_id():
@@ -4321,6 +4435,20 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
             if current:
                 groups.append(current)
 
+        # The Income API may expose only the closing trade id. Expand each
+        # realized-PnL group with its complete flat-to-flat user-trade cycle so
+        # opening commissions and the factual entry time/price stay attached.
+        for group in groups:
+            fill_meta = fill_metadata_for_group(
+                group["symbol"],
+                group.get("trade_ids") or set(),
+                group.get("first_dt"),
+                group.get("last_dt"),
+            )
+            if fill_meta:
+                group["fill_meta"] = fill_meta
+                group["trade_ids"].update(fill_meta.get("trade_ids") or set())
+
         unmatched_side_income = 0.0
         side_attach_gap = timedelta(minutes=max(group_gap_minutes * 2, 30))
         for dt, raw, income in side_income_rows:
@@ -4390,18 +4518,18 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
             entry_reason = meta["entry_reason"] if meta and "entry_reason" in meta.keys() else None
             exit_reason = meta["exit_reason"] if meta and "exit_reason" in meta.keys() else "REALIZED_PNL"
             entry_time = meta["entry_time"] if meta and "entry_time" in meta.keys() else None
-            fill_meta = fill_metadata_for_group(
+            fill_meta = g.get("fill_meta") or fill_metadata_for_group(
                 symbol,
                 g.get("trade_ids") or set(),
                 first_dt,
                 last_dt,
             )
             if fill_meta:
-                side = side or fill_meta["side"]
-                entry_price = entry_price or fill_meta["entry_price"]
-                exit_price = exit_price or fill_meta["exit_price"]
-                qty = qty or fill_meta["quantity"]
-                entry_time = entry_time or fill_meta["entry_time"]
+                side = fill_meta["side"]
+                entry_price = fill_meta["entry_price"]
+                exit_price = fill_meta["exit_price"]
+                qty = fill_meta["quantity"]
+                entry_time = fill_meta["entry_time"]
                 last_dt = _parse_db_time(fill_meta["exit_time"]) or last_dt
             open_order = latest_open_order_before(symbol, first_dt or last_dt)
             snapshot = latest_position_snapshot_before(symbol, last_dt or first_dt)
@@ -5599,8 +5727,7 @@ def label_signal_outcomes(max_rows=1000, min_age_minutes=30):
             continue
 
     if updates:
-        conn.executemany(
-            """INSERT INTO signal_outcomes
+        sql = """INSERT INTO signal_outcomes
                (decision_id, strategy_decision_id, run_id, scan_id, symbol,
                 signal_time, entry_price, side, return_1h, return_4h,
                 return_12h, return_24h, max_favorable_return,
@@ -5620,10 +5747,12 @@ def label_signal_outcomes(max_rows=1000, min_age_minutes=30):
                 hit_sl=excluded.hit_sl,
                 bars_observed=excluded.bars_observed,
                 is_complete=excluded.is_complete,
-                updated_at=datetime('now')""",
-            updates,
-        )
-        conn.commit()
+                updated_at=datetime('now')"""
+        # SQLite only has one writer.  Keep each write transaction short so
+        # live candle ingestion can acquire the writer slot between chunks.
+        for offset in range(0, len(updates), 100):
+            conn.executemany(sql, updates[offset:offset + 100])
+            conn.commit()
     return len(updates)
 
 

@@ -37,6 +37,16 @@ KLINES = "/bapi/defi/v1/public/alpha-trade/klines"
 TICKER = "/bapi/defi/v1/public/alpha-trade/ticker"
 FULL_DEPTH = "/bapi/defi/v1/public/alpha-trade/fullDepth"
 
+# The strategy readiness gate requires this much closed history. The unified
+# minute pipeline normally maintains current bars, while the Alpha collector
+# fills this initial history after a fresh install or market-env migration.
+READINESS_HISTORY = {
+    "alpha_candles_15m": 32,
+    "alpha_candles_1h": 50,
+    "futures_candles_15m": 32,
+    "futures_candles_1h": 50,
+}
+
 
 def _f(value, default=0.0):
     try:
@@ -137,6 +147,36 @@ class AlphaCollector:
             resolve_market_env(market_env),
             1 if is_closed_kline(row, now_ms=now_ms) else 0,
         )
+
+    @staticmethod
+    def candle_history_counts(table, symbols, *, source_env="mainnet"):
+        symbol_columns = {
+            "alpha_candles_15m": "alpha_symbol",
+            "alpha_candles_1h": "alpha_symbol",
+            "futures_candles_15m": "symbol",
+            "futures_candles_1h": "symbol",
+        }
+        symbol_column = symbol_columns.get(table)
+        normalized = sorted({str(symbol) for symbol in symbols if symbol})
+        if not symbol_column or not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                f"""SELECT {symbol_column} AS symbol, COUNT(*) AS count
+                    FROM {table}
+                    WHERE source_env=? AND is_closed=1
+                      AND {symbol_column} IN ({placeholders})
+                    GROUP BY {symbol_column}""",
+                (resolve_market_env(source_env), *normalized),
+            ).fetchall()
+            return {
+                str(row["symbol"]): int(row["count"] or 0)
+                for row in rows
+            }
+        finally:
+            conn.close()
 
     async def refresh_universe(self, limit=200):
         results = await asyncio.gather(
@@ -245,22 +285,35 @@ class AlphaCollector:
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         semaphore = asyncio.Semaphore(4)
 
-        interval_map = (
-            {}
-            if self.unified_candles
-            else {
-                "alpha_candles_15m": ("15m", 192),
-                "alpha_candles_1h": ("1h", 120),
-                "alpha_candles_6h": ("6h", 60),
-                "alpha_candles_24h": ("1d", 60),
-            }
-        )
+        interval_map = {
+            "alpha_candles_15m": ("15m", 192),
+            "alpha_candles_1h": ("1h", 120),
+            "alpha_candles_6h": ("6h", 60),
+            "alpha_candles_24h": ("1d", 60),
+        }
+        alpha_symbols = [item["source_symbol"] for item in selected]
+        history_counts = {
+            table: self.candle_history_counts(
+                table,
+                alpha_symbols,
+                source_env="mainnet",
+            )
+            for table in READINESS_HISTORY
+            if table.startswith("alpha_")
+        }
 
         async def fetch_one(item):
             symbol = item["source_symbol"]
             async with semaphore:
                 try:
                     for table, (interval, limit) in interval_map.items():
+                        minimum = READINESS_HISTORY.get(table)
+                        if self.unified_candles and (
+                            minimum is None
+                            or history_counts.get(table, {}).get(symbol, 0)
+                            >= minimum
+                        ):
+                            continue
                         async def request():
                             return await self._get_data(KLINES, {"symbol": symbol, "interval": interval, "limit": limit})
                         data = await retry_async(request, retries=2)
@@ -318,10 +371,16 @@ class AlphaCollector:
             selected,
             include_candles=not self.unified_candles,
         )
-        refresh_universe_readiness(
-            "alpha",
-            futures_source_env=self.market_env,
-        )
+        try:
+            refresh_universe_readiness(
+                "alpha",
+                futures_source_env=self.market_env,
+            )
+        except Exception as exc:
+            # Market/depth/futures collection has already succeeded.  A busy
+            # readiness metadata write must not mark the entire Alpha feed as
+            # failed; the minute pipeline and next pass will republish it.
+            logger.warning("alpha readiness publication deferred: %s", exc)
 
     @staticmethod
     def futures_table_for_interval(interval):
@@ -367,6 +426,15 @@ class AlphaCollector:
             "futures_candles_6h": ("6h", 60, 360),
             "futures_candles_24h": ("1d", 60, 1440),
         }
+        history_counts = {
+            table: self.candle_history_counts(
+                table,
+                futures_symbols,
+                source_env=self.market_env,
+            )
+            for table in READINESS_HISTORY
+            if table.startswith("futures_")
+        }
 
         try:
             premium_resp = await self.client.get(
@@ -381,35 +449,42 @@ class AlphaCollector:
         async def fetch_one(symbol):
             async with semaphore:
                 try:
-                    if include_candles:
-                        for table, (
-                            interval,
-                            limit,
-                            max_age_minutes,
-                        ) in interval_map.items():
-                            if futures_candles_current(
-                                symbol,
-                                max_age_minutes=max_age_minutes,
-                                source_env=self.market_env,
-                                table=table,
-                                closed_only=True,
-                            ):
-                                continue
-                            async def request():
-                                response = await self.client.get(
-                                    self.futures_base + "/fapi/v1/klines",
-                                    params={"symbol": symbol, "interval": interval, "limit": limit},
+                    for table, (
+                        interval,
+                        limit,
+                        max_age_minutes,
+                    ) in interval_map.items():
+                        minimum = READINESS_HISTORY.get(table)
+                        history_missing = bool(
+                            minimum is not None
+                            and history_counts.get(table, {}).get(symbol, 0)
+                            < minimum
+                        )
+                        if not include_candles and not history_missing:
+                            continue
+                        if not history_missing and futures_candles_current(
+                            symbol,
+                            max_age_minutes=max_age_minutes,
+                            source_env=self.market_env,
+                            table=table,
+                            closed_only=True,
+                        ):
+                            continue
+                        async def request():
+                            response = await self.client.get(
+                                self.futures_base + "/fapi/v1/klines",
+                                params={"symbol": symbol, "interval": interval, "limit": limit},
+                            )
+                            response.raise_for_status()
+                            return response.json()
+                        for o in await retry_async(request, retries=2):
+                            rows_by_table[table].append(
+                                self.normalize_kline_row(
+                                    symbol,
+                                    o,
+                                    market_env=self.market_env,
                                 )
-                                response.raise_for_status()
-                                return response.json()
-                            for o in await retry_async(request, retries=2):
-                                rows_by_table[table].append(
-                                    self.normalize_kline_row(
-                                        symbol,
-                                        o,
-                                        market_env=self.market_env,
-                                    )
-                                )
+                            )
 
                     prem = premium_map.get(symbol) or {}
                     funding = _f(prem.get("lastFundingRate"))

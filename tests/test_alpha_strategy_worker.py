@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import shared.db as db
 from alpha_engine.strategy.feature_builder import AlphaFeatureSnapshot
-from alpha_engine.strategy.models import AlphaSignalState
+from alpha_engine.strategy.models import ActionType, AlphaSignalState
+from alpha_engine.strategy.trigger_rules import evaluate_trigger
 from alpha_engine.strategy.worker import AlphaStrategyWorker
 
 
@@ -206,6 +207,114 @@ class AlphaStrategyWorkerTest(unittest.TestCase):
         self.assertTrue(result.applied)
         self.assertEqual(result.transition.action_type.value, "PROBE_LONG")
         self.assertEqual(result.transition.max_position_factor, 0.5)
+
+    def test_rule_fallback_emits_normal_probe_on_same_setup_bar(self):
+        base = _snapshot()
+        worker = AlphaStrategyWorker(
+            ai_evaluate=lambda _payload: {
+                "status": "collecting",
+                "p_setup_success": None,
+                "p_followthrough": None,
+                "p_fakeout": None,
+                "reasons": ["collecting Alpha Strategy V4 samples"],
+            },
+            mode="testnet_live",
+            market_env="mainnet",
+            testnet_live_rule_fallback=True,
+        )
+        features = {
+            **base.features,
+            "ret_15m": 3.0,
+            "quote_volume_ratio_15m": 2.2,
+            "close_location": 0.80,
+            "upper_wick_ratio": 0.10,
+            "breakout_distance_pct": 0.8,
+            "price_efficiency_score": 70,
+        }
+
+        result = worker.process_snapshot(replace(base, features=features))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.transition.to_state, AlphaSignalState.PROBE_READY)
+        self.assertEqual(result.transition.action_type.value, "PROBE_LONG")
+        self.assertEqual(result.transition.max_position_factor, 0.3)
+        self.assertIn(
+            "same_bar_probe_trigger_confirmed",
+            result.transition.reasons,
+        )
+
+    def test_ake_style_marginal_ignition_is_retained(self):
+        trigger = evaluate_trigger(
+            {
+                "ret_15m": 3.56,
+                "ret_1h": 2.90,
+                "ret_6h": 1.07,
+                "quote_volume_ratio_15m": 13.23,
+                "close_location": 0.602,
+                "upper_wick_ratio": 0.398,
+                "breakout_distance_pct": 1.86,
+                "price_efficiency_score": 72.3,
+            }
+        )
+
+        self.assertFalse(trigger.trigger_detected)
+        self.assertTrue(trigger.near_trigger_detected)
+        self.assertIn("near_trigger_detected", trigger.reasons)
+
+    def test_historical_recovery_never_emits_stale_entry(self):
+        worker = AlphaStrategyWorker(
+            ai_evaluate=lambda _payload: self.fail("AI must not run in recovery"),
+            mode="testnet_live",
+            market_env="mainnet",
+            testnet_live_rule_fallback=True,
+        )
+        snapshot = _snapshot()
+        features = {
+            **snapshot.features,
+            "ret_15m": 3.0,
+            "quote_volume_ratio_15m": 2.2,
+            "close_location": 0.80,
+            "upper_wick_ratio": 0.10,
+            "breakout_distance_pct": 0.8,
+            "price_efficiency_score": 70,
+        }
+
+        result = worker.process_snapshot(
+            replace(snapshot, features=features),
+            recovery=True,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.transition.to_state, AlphaSignalState.COOLDOWN)
+        self.assertEqual(result.transition.action_type, ActionType.NONE)
+        self.assertEqual(result.transition.max_position_factor, 0.0)
+        self.assertIn(
+            "historical_recovery_entry_suppressed",
+            result.transition.reasons,
+        )
+
+    def test_gap_recovery_leaves_latest_bar_for_live_evaluation(self):
+        start = datetime(2026, 8, 13, 8, 0, tzinfo=timezone.utc)
+        rows = [
+            {"time": (start + timedelta(minutes=15 * index)).isoformat()}
+            for index in range(4)
+        ]
+
+        cutoffs = AlphaStrategyWorker._recovery_cutoffs(
+            rows,
+            start,
+            start + timedelta(hours=2),
+            max_bars=96,
+        )
+
+        self.assertEqual(
+            cutoffs,
+            [
+                start + timedelta(minutes=15),
+                start + timedelta(minutes=30),
+                start + timedelta(minutes=45),
+            ],
+        )
 
 
 if __name__ == "__main__":

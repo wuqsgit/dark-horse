@@ -728,13 +728,20 @@ class AIStore:
         finally:
             conn.close()
 
-    def list_alpha_strategy_models(self) -> list[dict]:
+    def list_alpha_strategy_models(
+        self,
+        market_env: str | None = None,
+    ) -> list[dict]:
+        where = "WHERE market_env=?" if market_env else ""
+        params = (str(market_env).lower(),) if market_env else ()
         conn = self.connect()
         try:
             rows = conn.execute(
-                """SELECT * FROM alpha_strategy_models
+                f"""SELECT * FROM alpha_strategy_models
+                   {where}
                    ORDER BY market_env, model_key, target,
-                            datetime(trained_at) DESC"""
+                            datetime(trained_at) DESC""",
+                params,
             ).fetchall()
             result = []
             for row in rows:
@@ -745,13 +752,20 @@ class AIStore:
         finally:
             conn.close()
 
-    def list_alpha_strategy_model_runs(self, limit: int = 30) -> list[dict]:
+    def list_alpha_strategy_model_runs(
+        self,
+        limit: int = 30,
+        market_env: str | None = None,
+    ) -> list[dict]:
+        where = "WHERE market_env=?" if market_env else ""
+        params = [str(market_env).lower()] if market_env else []
+        params.append(int(limit))
         conn = self.connect()
         try:
             rows = conn.execute(
-                """SELECT * FROM alpha_strategy_model_runs
-                   ORDER BY id DESC LIMIT ?""",
-                (int(limit),),
+                f"""SELECT * FROM alpha_strategy_model_runs
+                   {where} ORDER BY id DESC LIMIT ?""",
+                params,
             ).fetchall()
             result = []
             for row in rows:

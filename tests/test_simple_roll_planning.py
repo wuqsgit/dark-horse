@@ -23,6 +23,18 @@ class OpenExchange:
         return {"orderId": "stop-1"}
 
 
+class FailedStopOpenExchange(OpenExchange):
+    def __init__(self):
+        self.flattened = []
+
+    def place_stop_order(self, symbol, side, quantity, stop_price):
+        raise RuntimeError("stop rejected")
+
+    def close_position_market(self, symbol, side, quantity):
+        self.flattened.append((symbol, side, quantity))
+        return {"orderId": "flatten-1", "executedQty": str(quantity)}
+
+
 class RecoveryExchange:
     def get_atr(self, symbol):
         return 2.0
@@ -373,6 +385,29 @@ class SimpleRollPlanningTest(unittest.TestCase):
         self.assertEqual(kwargs["stop_model"], "structure_atr")
         self.assertEqual(kwargs["trailing_atr_multiplier"], 2)
         entry_snapshot.assert_called_once()
+
+    def test_new_position_is_flattened_when_exchange_stop_is_rejected(self):
+        exchange = FailedStopOpenExchange()
+        engine = ExecutionEngine(exchange)
+        engine._record_decision = lambda *args, **kwargs: None
+        act = {
+            "action": "open", "symbol": "BTCUSDT", "side": "BUY",
+            "position_side": "LONG", "quantity": 10, "entry_price": 100,
+            "stop_loss": 95, "stop_model": "structure_atr", "stop_pct": 0.05,
+            "trailing_atr_multiplier": 2, "atr_value": 2, "leverage": 3,
+            "reason": "trend", "score": 80,
+        }
+
+        with patch("shared.db.new_position_id", return_value="p1"), \
+             patch("shared.db.insert_order"), \
+             patch("trader.execution.record_profit"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "opened position flattened",
+            ):
+                engine._execute_open(act, [])
+
+        self.assertEqual(exchange.flattened, [("BTCUSDT", "SELL", 10)])
 
 
 if __name__ == "__main__":

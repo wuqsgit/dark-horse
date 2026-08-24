@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+import time
 from collections import defaultdict
 from datetime import timedelta
 
@@ -102,7 +104,14 @@ def compare_with_legacy(
 
 
 class CandleBatchWriter:
-    def __init__(self, *, batch_size=1000, flush_seconds=0.25):
+    def __init__(
+        self,
+        *,
+        batch_size=1000,
+        flush_seconds=0.25,
+        retry_base_seconds=0.25,
+        retry_max_seconds=5.0,
+    ):
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=20000)
         self.batch_size = max(1, int(batch_size))
         self.flush_seconds = max(0.05, float(flush_seconds))
@@ -110,6 +119,14 @@ class CandleBatchWriter:
         self.written_count = 0
         self.aggregate_count = 0
         self.mismatch_count = 0
+        self.retry_count = 0
+        self.last_error = None
+        self.last_success_monotonic = time.monotonic()
+        self.retry_base_seconds = max(0.01, float(retry_base_seconds))
+        self.retry_max_seconds = max(
+            self.retry_base_seconds,
+            float(retry_max_seconds),
+        )
 
     async def put(self, market_kind: str, row: dict):
         await self.queue.put((market_kind, dict(row)))
@@ -131,11 +148,55 @@ class CandleBatchWriter:
                     batch.append(self.queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            await self._write_batch_resilient(batch)
+            for _ in batch:
+                self.queue.task_done()
+
+    async def _write_batch_resilient(self, batch):
+        """Never abandon a fetched candle batch because SQLite is busy.
+
+        Every write in a batch is idempotent.  Retrying the same batch is
+        therefore safer than letting the writer task terminate silently and
+        eventually blocking all collectors on a full queue.
+        """
+        attempts = 0
+        while True:
             try:
                 await self._write_batch(batch)
-            finally:
-                for _ in batch:
-                    self.queue.task_done()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempts += 1
+                self.retry_count += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+                transient = isinstance(exc, sqlite3.OperationalError) and any(
+                    marker in str(exc).lower()
+                    for marker in ("locked", "busy")
+                )
+                delay = min(
+                    self.retry_max_seconds,
+                    self.retry_base_seconds * (2 ** min(attempts - 1, 6)),
+                )
+                if attempts <= 3 or attempts % 12 == 0:
+                    log = logger.warning if transient else logger.exception
+                    log(
+                        "candle batch write failed attempt=%d queue=%d; "
+                        "retrying in %.2fs: %s",
+                        attempts,
+                        self.queue.qsize(),
+                        delay,
+                        self.last_error,
+                    )
+                await asyncio.sleep(delay)
+                continue
+            if attempts:
+                logger.info(
+                    "candle batch writer recovered after %d attempts",
+                    attempts,
+                )
+            self.last_error = None
+            self.last_success_monotonic = time.monotonic()
+            return
 
     async def _write_batch(self, batch):
         grouped = defaultdict(list)
