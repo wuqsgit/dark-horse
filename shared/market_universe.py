@@ -1,9 +1,10 @@
 """Deterministic market-universe selection and candle readiness checks."""
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 MIN_1H_CANDLES = 50
+CANDLE_CLOSE_INGESTION_GRACE_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -108,25 +109,30 @@ def _utc(value):
 def assess_dual_market_readiness(now, spot, futures):
     now = _utc(now)
 
-    def latest_closed_bucket_open(interval_minutes):
+    def expected_bucket_opens(interval_minutes):
         minute_index = int(now.timestamp() // 60)
         current_bucket = (
             minute_index // interval_minutes
         ) * interval_minutes
-        return datetime.fromtimestamp(
+        expected = datetime.fromtimestamp(
             (current_bucket - interval_minutes) * 60,
             tz=timezone.utc,
         )
+        seconds_into_bucket = now.timestamp() - current_bucket * 60
+        accepted = {expected}
+        if seconds_into_bucket <= CANDLE_CLOSE_INGESTION_GRACE_SECONDS:
+            accepted.add(expected - timedelta(minutes=interval_minutes))
+        return accepted
 
-    expected_15m = latest_closed_bucket_open(15)
-    expected_1h = latest_closed_bucket_open(60)
+    expected_15m = expected_bucket_opens(15)
+    expected_1h = expected_bucket_opens(60)
     checks = [
-        ("spot_15m_age", spot.latest_15m is not None and _utc(spot.latest_15m) == expected_15m),
-        ("spot_1h_age", spot.latest_1h is not None and _utc(spot.latest_1h) == expected_1h),
+        ("spot_15m_age", spot.latest_15m is not None and _utc(spot.latest_15m) in expected_15m),
+        ("spot_1h_age", spot.latest_1h is not None and _utc(spot.latest_1h) in expected_1h),
         ("spot_15m_count", spot.count_15m >= 32),
         ("spot_1h_count", spot.count_1h >= MIN_1H_CANDLES),
-        ("futures_15m_age", futures.latest_15m is not None and _utc(futures.latest_15m) == expected_15m),
-        ("futures_1h_age", futures.latest_1h is not None and _utc(futures.latest_1h) == expected_1h),
+        ("futures_15m_age", futures.latest_15m is not None and _utc(futures.latest_15m) in expected_15m),
+        ("futures_1h_age", futures.latest_1h is not None and _utc(futures.latest_1h) in expected_1h),
         ("futures_15m_count", futures.count_15m >= 32),
         ("futures_1h_count", futures.count_1h >= MIN_1H_CANDLES),
     ]
