@@ -3669,6 +3669,32 @@ class ExecutionEngine:
         results = []
         for act in actions:
             try:
+                if act.get("action") in {"open", "roll_add"}:
+                    account_id = getattr(self.ex, "account_id", None)
+                    if account_id is not None:
+                        from shared.accounts import account_allows_new_exposure
+
+                        if not account_allows_new_exposure(
+                            int(account_id),
+                            act.get("strategy_source", "normal"),
+                        ):
+                            reason = "account_entry_disabled"
+                            self._record_decision(
+                                act.get("symbol", "?"),
+                                run_id=act.get("run_id"),
+                                scan_id=act.get("scan_id"),
+                                side=act.get("position_side") or act.get("side"),
+                                decision_stage="execution",
+                                decision_result="blocked",
+                                filter_reason=reason,
+                                reason={"account_id": int(account_id)},
+                            )
+                            results.append({
+                                "status": "blocked",
+                                "error": reason,
+                                **act,
+                            })
+                            continue
                 if act["action"] == "open":
                     live_positions = self.ex.get_positions()
                     category_ok, category_reason = check_category_position_limit(

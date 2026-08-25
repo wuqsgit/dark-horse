@@ -2435,12 +2435,16 @@ async def update_trading_account(account_id: int, body: dict, user=Depends(requi
 
 @app.delete("/api/trading/accounts/{account_id}")
 async def delete_trading_account(account_id: int, user=Depends(require_admin)):
-    from shared.accounts import delete_account
+    from trader.account_lifecycle import close_positions_and_delete_account
     try:
-        delete_account(account_id)
+        result = await asyncio.to_thread(
+            close_positions_and_delete_account,
+            account_id,
+        )
         _clear_trading_caches()
-        return {"status": "ok"}
+        return {"status": "ok", **result}
     except Exception as exc:
+        _clear_trading_caches()
         return {"error": str(exc)}
 
 

@@ -355,6 +355,7 @@ class BinanceFutures:
         quantity: float,
         reduce_only: bool = False,
         client_order_id: str | None = None,
+        position_side: str | None = None,
     ) -> dict:
         qty = self.adjust_quantity(symbol, quantity)
         params = {
@@ -363,8 +364,13 @@ class BinanceFutures:
             "type": "MARKET",
             "quantity": qty,
         }
-        if reduce_only:
+        normalized_position_side = str(position_side or "").upper()
+        hedge_position = normalized_position_side in {"LONG", "SHORT"}
+        if hedge_position:
+            params["positionSide"] = normalized_position_side
+        if reduce_only and not hedge_position:
             params["reduceOnly"] = True
+        if reduce_only:
             params["newOrderRespType"] = "RESULT"
         if client_order_id:
             params["newClientOrderId"] = str(client_order_id)[:36]
@@ -376,6 +382,7 @@ class BinanceFutures:
         side: str,
         quantity: float,
         client_order_id: str | None = None,
+        position_side: str | None = None,
     ) -> dict:
         return self.place_market_order(
             symbol,
@@ -383,6 +390,7 @@ class BinanceFutures:
             quantity,
             reduce_only=True,
             client_order_id=client_order_id,
+            position_side=position_side,
         )
 
     def get_open_orders(self, symbol: str | None = None) -> list[dict]:
@@ -394,14 +402,40 @@ class BinanceFutures:
             params=params,
         )
 
-    def get_open_protective_stops(self, symbol: str | None = None) -> list[dict]:
+    def cancel_all_open_orders(self, symbol: str) -> dict:
+        return self._request(
+            "DELETE",
+            "/fapi/v1/allOpenOrders",
+            signed=True,
+            params={"symbol": str(symbol).upper()},
+        )
+
+    def get_open_algo_orders(self, symbol: str | None = None) -> list[dict]:
         params = {"symbol": symbol} if symbol else {}
-        orders = self._request(
+        return self._request(
             "GET",
             "/fapi/v1/openAlgoOrders",
             signed=True,
             params=params,
         )
+
+    def cancel_all_algo_orders(self, symbol: str) -> int:
+        cancelled = 0
+        for order in self.get_open_algo_orders(symbol):
+            order_id = order.get("algoId") or order.get("orderId")
+            if order_id is None:
+                continue
+            self._request(
+                "DELETE",
+                "/fapi/v1/algoOrder",
+                signed=True,
+                params={"symbol": str(symbol).upper(), "algoId": order_id},
+            )
+            cancelled += 1
+        return cancelled
+
+    def get_open_protective_stops(self, symbol: str | None = None) -> list[dict]:
+        orders = self.get_open_algo_orders(symbol)
         return [
             order
             for order in (orders or [])

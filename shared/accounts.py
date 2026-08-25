@@ -124,7 +124,63 @@ def account_open_position_count(account_id: int) -> int:
         conn.close()
 
 
-def delete_account(account_id: int) -> None:
+def account_allows_new_exposure(account_id: int, strategy_source: str = "normal") -> bool:
+    """Read the latest account switches immediately before increasing exposure."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT enabled, auto_trading_enabled,
+                      normal_trading_enabled, alpha_trading_enabled
+               FROM trading_accounts WHERE id=?""",
+            (int(account_id),),
+        ).fetchone()
+        if not row or not bool(row["enabled"]) or not bool(row["auto_trading_enabled"]):
+            return False
+        strategy_key = str(strategy_source or "normal").strip().lower()
+        if strategy_key == "alpha":
+            return bool(row["alpha_trading_enabled"])
+        return bool(row["normal_trading_enabled"])
+    finally:
+        conn.close()
+
+
+def prepare_account_deletion(account_id: int) -> dict:
+    """Validate deletion and freeze every switch that can increase exposure."""
+    ensure_default_account()
+    account_id = int(account_id)
+    conn = get_conn()
+    try:
+        current = conn.execute(
+            "SELECT * FROM trading_accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        if not current:
+            raise ValueError("账户不存在")
+        total = int(
+            conn.execute("SELECT COUNT(*) FROM trading_accounts").fetchone()[0]
+            or 0
+        )
+        if total <= 1:
+            raise ValueError("至少保留1个交易账户")
+        conn.execute(
+            """UPDATE trading_accounts
+               SET normal_trading_enabled=0,
+                   alpha_trading_enabled=0,
+                   auto_trading_enabled=0,
+                   updated_at=datetime('now')
+               WHERE id=?""",
+            (account_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    account = get_account(account_id, include_secrets=True)
+    if not account:
+        raise RuntimeError("账户删除准备失败：账户配置不可用")
+    return account
+
+
+def delete_account(account_id: int, *, exchange_flat_verified: bool = False) -> None:
     ensure_default_account()
     account_id = int(account_id)
     conn = get_conn()
@@ -140,8 +196,19 @@ def delete_account(account_id: int) -> None:
                WHERE account_id=? AND ABS(COALESCE(quantity, 0)) > 0""",
             (account_id,),
         ).fetchone()[0] or 0)
-        if open_count > 0:
+        if open_count > 0 and not exchange_flat_verified:
             raise ValueError(f"账户还有持仓，无法删除（{open_count}个）")
+        # Current-state rows and adjustments belong to the account being
+        # removed. Historical fills/trades deliberately remain available for
+        # audit and PnL reconstruction after the credentials are gone.
+        conn.execute(
+            "DELETE FROM account_position_history WHERE account_id=?",
+            (account_id,),
+        )
+        conn.execute(
+            "DELETE FROM account_capital_adjustments WHERE account_id=?",
+            (account_id,),
+        )
         conn.execute("DELETE FROM trading_accounts WHERE id=?", (account_id,))
         if int(current["is_default"] or 0):
             row = conn.execute("SELECT id FROM trading_accounts ORDER BY id LIMIT 1").fetchone()

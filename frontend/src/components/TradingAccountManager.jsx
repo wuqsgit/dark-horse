@@ -49,7 +49,9 @@ export default function TradingAccountManager({ accounts, onChanged }) {
   };
 
   const remove = async (account) => {
-    const ok = window.confirm(`确认删除账户「${account.name}」？有持仓的账户会被系统拒绝删除。`);
+    const ok = window.confirm(
+      `确认删除账户「${account.name}」？\n\n系统会先停止该账户开仓、撤销挂单，并按市价平掉所有合约仓位。市价平仓可能产生滑点；只有交易所确认无持仓和挂单后才会删除账户。`,
+    );
     if (!ok) return;
     setSaving(true);
     setMessage('');
@@ -57,7 +59,10 @@ export default function TradingAccountManager({ accounts, onChanged }) {
       const res = await adminFetch(`/api/trading/accounts/${account.id}`, { method: 'DELETE' });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-      setMessage('账户已删除，交易进程会自动重新加载。');
+      const closed = Number(data.closed || 0);
+      const cancelled = Number(data.cancelled_regular_orders || 0) + Number(data.cancelled_algo_orders || 0);
+      const warning = Array.isArray(data.warnings) && data.warnings.length ? `；${data.warnings.join('；')}` : '';
+      setMessage(`账户已删除；市价平仓 ${closed} 个，撤销挂单 ${cancelled} 个${warning}。`);
       if (mode.type === 'edit' && Number(mode.accountId) === Number(account.id)) resetForm();
       await onChanged();
     } catch (error) { setMessage(`删除失败：${error.message}`); } finally { setSaving(false); }
