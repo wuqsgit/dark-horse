@@ -1,6 +1,8 @@
 import asyncio
 import os
+import statistics
 import subprocess
+import sys
 import threading
 import time
 import tempfile
@@ -478,9 +480,74 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.assertNotEqual(runtime_threads["accounts"][0], event_loop_thread)
 
     def test_local_read_routes_remain_responsive_during_exchange_timeout(self):
+        child_flag = "DARK_HORSE_TIMEOUT_ISOLATION_CHILD"
+        if os.environ.get(child_flag) != "1":
+            environment = os.environ.copy()
+            environment[child_flag] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "unittest",
+                    (
+                        "tests.test_trading_api_split."
+                        "TradingApiReplacementRoutesTest."
+                        "test_local_read_routes_remain_responsive_during_exchange_timeout"
+                    ),
+                    "-q",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + result.stderr,
+            )
+            return
+
         entered_margin_call = threading.Event()
         release_margin_call = threading.Event()
         margin_call_threads = []
+        replacement_paths = (
+            "/api/trading/accounts",
+            "/api/trading/accounts/status",
+            f"/api/trading/accounts/{self.account_id}/history",
+            f"/api/trading/accounts/{self.account_id}/decisions",
+            "/api/trading/runtime/status",
+        )
+        expected_paths = {
+            "/api/trading/accounts",
+            "/api/trading/accounts/status",
+            f"/api/trading/accounts/{self.account_id}/history",
+            f"/api/trading/accounts/{self.account_id}/decisions",
+            "/api/trading/runtime/status",
+        }
+
+        self.assertEqual(set(replacement_paths), expected_paths)
+
+        async def measure_routes(*, warm_up=False):
+            measurements = {}
+            transport = httpx.ASGITransport(app=self.main.app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                for path in replacement_paths:
+                    if warm_up:
+                        response = await client.get(path)
+                        self.assertEqual(response.status_code, 200, path)
+                    samples = []
+                    for _ in range(3):
+                        started = time.perf_counter()
+                        response = await client.get(path)
+                        samples.append(time.perf_counter() - started)
+                        self.assertEqual(response.status_code, 200, path)
+                    measurements[path] = samples
+            return measurements
 
         def delayed_timeout(_exchange):
             margin_call_threads.append(threading.get_ident())
@@ -495,6 +562,8 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
             "last_error": None,
         })
         try:
+            baseline_measurements = asyncio.run(measure_routes(warm_up=True))
+
             with patch(
                 "trader.exchange.BinanceFutures.get_margin_balance",
                 new=delayed_timeout,
@@ -503,21 +572,24 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
                 self.assertTrue(entered_margin_call.wait(timeout=2))
                 background_thread = margin_call_threads[0]
 
-                started = time.monotonic()
-                responses = [
-                    self.client.get("/api/trading/accounts/status"),
-                    self.client.get(
-                        f"/api/trading/accounts/{self.account_id}/history"
-                    ),
-                    self.client.get(
-                        f"/api/trading/accounts/{self.account_id}/decisions"
-                    ),
-                    self.client.get("/api/trading/runtime/status"),
-                ]
-                elapsed = time.monotonic() - started
+                timeout_measurements = asyncio.run(measure_routes())
 
-                self.assertTrue(all(response.status_code == 200 for response in responses))
-                self.assertLess(elapsed, 1.0)
+                self.timeout_latency_measurements = {}
+                for path in replacement_paths:
+                    baseline_median = statistics.median(baseline_measurements[path])
+                    timeout_median = statistics.median(timeout_measurements[path])
+                    self.timeout_latency_measurements[path] = {
+                        "baseline_median_ms": baseline_median * 1000,
+                        "timeout_median_ms": timeout_median * 1000,
+                        "timeout_max_ms": max(timeout_measurements[path]) * 1000,
+                    }
+                    for elapsed in timeout_measurements[path]:
+                        self.assertLess(elapsed, 0.1, path)
+                        self.assertLessEqual(
+                            elapsed,
+                            baseline_median + 0.03,
+                            path,
+                        )
                 self.assertEqual(margin_call_threads, [background_thread])
                 release_margin_call.set()
                 with self.assertRaisesRegex(RuntimeError, "refresh failed"):

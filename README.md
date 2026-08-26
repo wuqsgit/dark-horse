@@ -201,7 +201,7 @@ GET  /api/trading/runtime/status
 - `GET /api/trading/accounts/{account_id}/decisions` 按账户延迟加载最近的策略决策和过滤原因。
 - `GET /api/trading/runtime/status` 从本地状态读取交易开关和各账户的 runner 诊断信息，不返回账户密钥。
 
-前端只在用户展开对应区域时请求 `history` 和 `decisions`。历史过滤在聚合前执行，`stats` 统计过滤后的完整周期集合，不受当前分页影响。每个汇总结果严格对应一条 `(account_id, symbol, direction)` 记录；同组多个周期会合并数量、加权价格和盈亏，并通过按字典序排列且去重的 `strategy_sources` 标明来源。
+前端只在选中具体账户后请求 `history` 和 `decisions`：切换账户时两者都会重新加载，历史请求还会随来源、交易对、方向、游标或重试条件变化而更新。历史过滤在聚合前执行，`stats` 统计过滤后的完整周期集合，不受当前分页影响。每个汇总结果严格对应一条 `(account_id, symbol, direction)` 记录；同组多个周期会合并数量、加权价格和盈亏，并通过按字典序排列且去重的 `strategy_sources` 标明来源。
 
 ## 当前策略原则 🧠
 
