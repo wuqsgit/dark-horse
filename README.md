@@ -186,10 +186,22 @@ GET  /api/alpha/scan/by_symbol/{alpha_symbol}
 GET  /api/backtest/summary
 GET  /api/backtest/review
 GET  /api/backtest/factor_analysis
-GET  /api/trading/status
-GET  /api/trading/controls
-POST /api/trading/controls
+GET  /api/trading/accounts
+GET  /api/trading/accounts/status
+GET  /api/trading/accounts/{account_id}/history
+GET  /api/trading/accounts/{account_id}/decisions
+GET  /api/trading/runtime/status
 ```
+
+实盘读取接口按用途拆开，避免一次请求同时等待交易所、历史统计和决策明细：
+
+- `GET /api/trading/accounts` 返回账户配置列表，不包含 API 密钥。
+- `GET /api/trading/accounts/status` 返回后台刷新并持久化的账户快照。快照目标新鲜度为 30 秒；HTTP 请求只读取当前快照，不直接访问交易所。响应中的 `snapshot_at` 标识快照时间，`X-Cache` 标识当前缓存状态。
+- `GET /api/trading/accounts/{account_id}/history` 按账户延迟加载历史汇总。支持 `symbol`、`direction=LONG|SHORT`、`source`、`from`、`to`、`limit=1..100` 和不透明的 `cursor` 过滤；响应包含 `items`、`next_cursor`、`stats` 与 `reconcile_status`。下一页把上一次的 `next_cursor` 原样传回 `cursor`。
+- `GET /api/trading/accounts/{account_id}/decisions` 按账户延迟加载最近的策略决策和过滤原因。
+- `GET /api/trading/runtime/status` 从本地状态读取交易开关和各账户的 runner 诊断信息，不返回账户密钥。
+
+前端只在用户展开对应区域时请求 `history` 和 `decisions`。历史过滤在聚合前执行，`stats` 统计过滤后的完整周期集合，不受当前分页影响。每个汇总结果严格对应一条 `(account_id, symbol, direction)` 记录；同组多个周期会合并数量、加权价格和盈亏，并通过按字典序排列且去重的 `strategy_sources` 标明来源。
 
 ## 当前策略原则 🧠
 

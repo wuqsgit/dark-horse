@@ -286,6 +286,7 @@ def _summary_from_cycles(cycles):
                 "close_count": 0,
                 "entry_time": cycle["entry_time"],
                 "exit_time": cycle["exit_time"],
+                "strategy_sources": set(),
             },
         )
         summary["quantity"] += cycle["entry_quantity"]
@@ -305,6 +306,9 @@ def _summary_from_cycles(cycles):
             summary["margin"] += margin
         summary["position_count"] += 1
         summary["close_count"] += cycle.get("close_count", len(cycle["exit_fills"]))
+        source = _cycle_source(cycle)
+        if source is not None:
+            summary["strategy_sources"].add(source)
         summary["entry_time"] = min(summary["entry_time"], cycle["entry_time"])
         summary["exit_time"] = max(summary["exit_time"], cycle["exit_time"])
 
@@ -315,6 +319,7 @@ def _summary_from_cycles(cycles):
         exit_notional = summary.pop("exit_notional")
         margin = summary.pop("margin")
         has_exact_margin = summary.pop("has_exact_margin")
+        summary["strategy_sources"] = sorted(summary["strategy_sources"])
         summary["quantity"] = int(quantity) if quantity.is_integer() else quantity
         summary["entry_price"] = entry_notional / quantity if quantity else None
         summary["exit_price"] = exit_notional / quantity if quantity else None
@@ -386,7 +391,11 @@ def _fallback_cycles(rows, direction=None, source=None, from_time=None, to_time=
                 "account_id": int(item["account_id"]),
                 "symbol": str(item["symbol"]).upper(),
                 "direction": side,
-                "entry_fills": [{"quantity": quantity, "price": item.get("entry_price") or 0}],
+                "entry_fills": [{
+                    "quantity": quantity,
+                    "price": item.get("entry_price") or 0,
+                    "strategy_source": item.get("strategy_source"),
+                }],
                 "exit_fills": [{"quantity": quantity, "price": item.get("exit_price") or 0}],
                 "entry_quantity": quantity,
                 "entry_time": item.get("entry_time"),

@@ -80,6 +80,7 @@ class TradeHistorySummaryTest(unittest.TestCase):
         self.assertAlmostEqual(row["pnl"], 33.0)
         self.assertEqual(row["position_count"], 2)
         self.assertEqual(row["close_count"], 3)
+        self.assertEqual(row["strategy_sources"], ["ake"])
         self.assertEqual(result["stats"]["total_cycles"], 2)
         self.assertEqual(result["stats"]["win_count"], 2)
         self.assertAlmostEqual(result["stats"]["total_pnl"], 33.0)
@@ -112,11 +113,19 @@ class TradeHistorySummaryTest(unittest.TestCase):
         finally:
             conn.close()
 
+        all_sources = fetch_trade_history_summaries(account_id=2)
         result = fetch_trade_history_summaries(account_id=2, source="alpha")
 
+        self.assertEqual(len(all_sources["items"]), 1)
+        self.assertEqual(
+            all_sources["items"][0]["strategy_sources"],
+            ["alpha", "normal"],
+        )
+        self.assertEqual(all_sources["stats"]["total_cycles"], 2)
         self.assertEqual(len(result["items"]), 1)
         self.assertEqual(result["items"][0]["quantity"], 10)
         self.assertAlmostEqual(result["items"][0]["pnl"], 1.0)
+        self.assertEqual(result["items"][0]["strategy_sources"], ["alpha"])
         self.assertEqual(result["stats"]["total_cycles"], 1)
         self.assertEqual(result["stats"]["win_count"], 1)
         self.assertEqual(result["stats"]["loss_count"], 0)
@@ -146,6 +155,7 @@ class TradeHistorySummaryTest(unittest.TestCase):
         self.assertEqual(result["items"][0]["side"], "SHORT")
         self.assertEqual(result["items"][0]["position_count"], 1)
         self.assertEqual(result["items"][0]["close_count"], 3)
+        self.assertEqual(result["items"][0]["strategy_sources"], ["alpha"])
         self.assertEqual(result["stats"]["total_cycles"], 1)
         with self.assertRaisesRegex(ValueError, "^invalid_history_cursor$"):
             fetch_trade_history_summaries(account_id=2, cursor="not-a-cursor")
