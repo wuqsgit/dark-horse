@@ -147,6 +147,15 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         from shared.accounts import ensure_default_account, save_account
 
         self.main = main
+        self.original_runtime_snapshot = dict(main._runtime_status_snapshot)
+        self.original_runtime_refresh_task = main._runtime_status_refresh_task
+        main._runtime_status_snapshot.clear()
+        main._runtime_status_snapshot.update({
+            "data": None,
+            "time": 0.0,
+            "last_error": None,
+        })
+        main._runtime_status_refresh_task = None
         self.original_db_path = db.DB_PATH
         self.temp = tempfile.TemporaryDirectory()
         db.DB_PATH = os.path.join(self.temp.name, "trading-api.db")
@@ -207,6 +216,12 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+        task = self.main._runtime_status_refresh_task
+        if task is not None and not task.done():
+            task.cancel()
+        self.main._runtime_status_snapshot.clear()
+        self.main._runtime_status_snapshot.update(self.original_runtime_snapshot)
+        self.main._runtime_status_refresh_task = self.original_runtime_refresh_task
         db.DB_PATH = self.original_db_path
         self.temp.cleanup()
 
@@ -345,6 +360,12 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
                 self.assertEqual(detail["code"], "account_not_found")
 
     def test_decisions_and_runtime_status_return_local_account_data(self):
+        runtime_data = self.main._trading_runtime_status_payload()
+        self.main._runtime_status_snapshot.update({
+            "data": runtime_data,
+            "time": time.time(),
+            "last_error": None,
+        })
         decisions = self.client.get(
             f"/api/trading/accounts/{self.account_id}/decisions"
         )
@@ -677,6 +698,190 @@ class AccountStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         saved_data = save.call_args.args[1]["data"]
         _assert_slim_snapshot(self, payload)
         _assert_slim_snapshot(self, saved_data)
+
+
+class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import api.main as main
+
+        self.main = main
+        self.original_snapshot = dict(getattr(
+            main,
+            "_runtime_status_snapshot",
+            {"data": None, "time": 0.0, "last_error": None},
+        ))
+        self.original_refresh_task = getattr(
+            main,
+            "_runtime_status_refresh_task",
+            None,
+        )
+        main._runtime_status_snapshot = {
+            "data": None,
+            "time": 0.0,
+            "last_error": None,
+        }
+        main._runtime_status_refresh_task = None
+
+    async def asyncTearDown(self):
+        task = self.main._runtime_status_refresh_task
+        if task is not None and not task.done():
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.main._runtime_status_snapshot = self.original_snapshot
+        self.main._runtime_status_refresh_task = self.original_refresh_task
+
+    async def test_stale_snapshot_returns_before_slow_background_refresh(self):
+        old_data = {
+            "trading_controls": {"normal_trading_enabled": True},
+            "accounts": [{"account_id": 1, "runtime_diagnostics": {"status": "healthy"}}],
+        }
+        new_data = {
+            "trading_controls": {"normal_trading_enabled": False},
+            "accounts": [{"account_id": 1, "runtime_diagnostics": {"status": "degraded"}}],
+        }
+        self.main._runtime_status_snapshot.update({
+            "data": old_data,
+            "time": time.time() - 31,
+            "last_error": "previous refresh failed",
+        })
+        entered = threading.Event()
+
+        def slow_payload():
+            entered.set()
+            time.sleep(0.15)
+            return new_data
+
+        response = Response()
+        with patch.object(
+            self.main,
+            "_trading_runtime_status_payload",
+            side_effect=slow_payload,
+        ):
+            started = time.perf_counter()
+            payload = await self.main.get_trading_runtime_status(
+                response,
+                user="viewer",
+            )
+            elapsed = time.perf_counter() - started
+            refresh_task = self.main._runtime_status_refresh_task
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            await refresh_task
+
+        self.assertLess(elapsed, 0.05)
+        self.assertEqual(response.headers["X-Cache"], "STALE")
+        self.assertEqual(payload["accounts"], old_data["accounts"])
+        self.assertFalse(payload["fresh"])
+        self.assertGreaterEqual(payload["age_seconds"], 31)
+        self.assertIsNotNone(payload["snapshot_at"])
+        self.assertEqual(payload["last_error"], "previous refresh failed")
+        self.assertIs(self.main._runtime_status_snapshot["data"], new_data)
+        self.assertTrue(self.main._runtime_status_snapshot["time"] > 0)
+        self.assertIsNone(self.main._runtime_status_snapshot["last_error"])
+
+    async def test_stale_requests_share_one_background_refresh(self):
+        self.main._runtime_status_snapshot.update({
+            "data": {"trading_controls": {}, "accounts": []},
+            "time": time.time() - 31,
+            "last_error": None,
+        })
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def blocked_payload():
+            calls.append(threading.get_ident())
+            entered.set()
+            release.wait(timeout=2)
+            return {"trading_controls": {}, "accounts": []}
+
+        try:
+            with patch.object(
+                self.main,
+                "_trading_runtime_status_payload",
+                side_effect=blocked_payload,
+            ):
+                await self.main.get_trading_runtime_status(Response(), user="viewer")
+                first_task = self.main._runtime_status_refresh_task
+                await self.main.get_trading_runtime_status(Response(), user="viewer")
+                second_task = self.main._runtime_status_refresh_task
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                self.assertIs(first_task, second_task)
+                self.assertEqual(len(calls), 1)
+                release.set()
+                await first_task
+        finally:
+            release.set()
+
+    async def test_refresh_failure_preserves_last_good_runtime_snapshot(self):
+        old_data = {
+            "trading_controls": {"normal_trading_enabled": True},
+            "accounts": [{"account_id": 1}],
+        }
+        self.main._runtime_status_snapshot.update({
+            "data": old_data,
+            "time": time.time() - 31,
+            "last_error": None,
+        })
+
+        with self.assertLogs("api", level="ERROR"), patch.object(
+            self.main,
+            "_trading_runtime_status_payload",
+            side_effect=RuntimeError("diagnostics unavailable"),
+        ):
+            payload = await self.main.get_trading_runtime_status(
+                Response(),
+                user="viewer",
+            )
+            refresh_task = self.main._runtime_status_refresh_task
+            await refresh_task
+
+        self.assertEqual(payload["accounts"], old_data["accounts"])
+        self.assertIs(self.main._runtime_status_snapshot["data"], old_data)
+        self.assertEqual(
+            self.main._runtime_status_snapshot["last_error"],
+            "diagnostics unavailable",
+        )
+
+    async def test_runtime_refresh_uses_only_local_account_data(self):
+        account = {
+            "id": 1,
+            "name": "local-only",
+            "environment": "testnet",
+        }
+        worker_threads = []
+        event_loop_thread = threading.get_ident()
+
+        def local_accounts(*_args, **_kwargs):
+            worker_threads.append(threading.get_ident())
+            return [account]
+
+        def local_diagnostics(item):
+            worker_threads.append(threading.get_ident())
+            return {"status": "healthy", "account_id": item["id"]}
+
+        with patch(
+            "shared.accounts.list_accounts",
+            side_effect=local_accounts,
+        ), patch(
+            "shared.live_diagnostics.build_live_diagnostics",
+            side_effect=local_diagnostics,
+        ), patch.object(
+            self.main,
+            "_safe_trading_runtime_controls",
+            return_value={"normal_trading_enabled": True},
+        ), patch(
+            "shared.accounts.account_exchange_config",
+            side_effect=AssertionError("runtime must not validate credentials"),
+        ), patch(
+            "trader.exchange.BinanceFutures",
+            side_effect=AssertionError("runtime must not instantiate Binance"),
+        ):
+            payload = await self.main._run_trading_runtime_status_refresh()
+
+        self.assertEqual(payload["accounts"][0]["account_id"], 1)
+        self.assertEqual(worker_threads[0], worker_threads[1])
+        self.assertNotEqual(worker_threads[0], event_loop_thread)
 
 
 if __name__ == "__main__":

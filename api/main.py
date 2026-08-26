@@ -219,11 +219,14 @@ _ACCOUNT_STATUS_SNAPSHOT_PATH = os.path.join(
 _account_status_snapshot = {"data": None, "time": 0.0, "last_error": None}
 _account_status_refresh_task = None
 _account_status_refresher_task = None
+_runtime_status_snapshot = {"data": None, "time": 0.0, "last_error": None}
+_runtime_status_refresh_task = None
 
 
 _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
 _TRADING_ACCOUNT_STATUS_CACHE_TTL = 30
+_TRADING_RUNTIME_STATUS_CACHE_TTL = 30
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _FAST_CACHE_PATHS = {
     "/api/scan/latest",
@@ -437,6 +440,7 @@ async def startup():
     _load_persisted_trading_account_status_snapshot()
     if _account_status_refresher_task is None:
         _account_status_refresher_task = asyncio.create_task(_account_status_snapshot_refresher())
+    _ensure_trading_runtime_status_refresh()
     try:
         await asyncio.to_thread(_refresh_scan_payload_sync)
         if _scan_refresh_task is None:
@@ -2045,9 +2049,64 @@ def _trading_runtime_status_payload() -> dict:
     }
 
 
+async def _run_trading_runtime_status_refresh() -> dict:
+    global _runtime_status_refresh_task
+    try:
+        data = await asyncio.to_thread(_trading_runtime_status_payload)
+        snapshot_at = time.time()
+        _runtime_status_snapshot.update({
+            "data": data,
+            "time": snapshot_at,
+            "last_error": None,
+        })
+        return data
+    except Exception as exc:
+        logger.exception("Trading runtime status refresh failed")
+        _runtime_status_snapshot["last_error"] = str(exc)
+        return _runtime_status_snapshot.get("data") or {
+            "trading_controls": {},
+            "accounts": [],
+        }
+    finally:
+        if asyncio.current_task() is _runtime_status_refresh_task:
+            _runtime_status_refresh_task = None
+
+
+def _ensure_trading_runtime_status_refresh() -> asyncio.Task:
+    global _runtime_status_refresh_task
+    if _runtime_status_refresh_task is None or _runtime_status_refresh_task.done():
+        _runtime_status_refresh_task = asyncio.create_task(_run_trading_runtime_status_refresh())
+    return _runtime_status_refresh_task
+
+
+async def _get_trading_runtime_status_snapshot() -> tuple[dict, str]:
+    data = _runtime_status_snapshot.get("data")
+    snapshot_at = float(_runtime_status_snapshot.get("time") or 0)
+    age = max(0.0, time.time() - snapshot_at)
+    cache_status = (
+        "MISS"
+        if data is None
+        else "STALE"
+        if age >= _TRADING_RUNTIME_STATUS_CACHE_TTL
+        else "HIT"
+    )
+    payload = dict(data or {})
+    payload["trading_controls"] = payload.get("trading_controls") or {}
+    payload["accounts"] = payload.get("accounts") or []
+    payload["snapshot_at"] = snapshot_at or None
+    payload["age_seconds"] = round(age, 1) if snapshot_at else None
+    payload["fresh"] = cache_status == "HIT"
+    payload["last_error"] = _runtime_status_snapshot.get("last_error")
+    if cache_status != "HIT":
+        _ensure_trading_runtime_status_refresh()
+    return payload, cache_status
+
+
 @app.get("/api/trading/runtime/status")
-async def get_trading_runtime_status(user=Depends(get_user)):
-    return await asyncio.to_thread(_trading_runtime_status_payload)
+async def get_trading_runtime_status(response: Response, user=Depends(get_user)):
+    payload, cache_status = await _get_trading_runtime_status_snapshot()
+    response.headers["X-Cache"] = cache_status
+    return payload
 
 
 @app.get("/api/trading/positions_history")
