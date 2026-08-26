@@ -1422,6 +1422,8 @@ def init_db():
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_account_position_history_key ON account_position_history(account_id, symbol)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_account_time ON orders(account_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_account_time ON fills(account_id, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_account_symbol_time ON fills(account_id, symbol, created_at, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_income_account_symbol_time ON exchange_income_ledger(account_id, symbol, income_time, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_history_account_time ON positions_history(account_id, time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_position_trades_account_exit ON position_trades(account_id, exit_time DESC)")
     for column, ddl in {
@@ -4664,6 +4666,50 @@ def rebuild_position_trades_from_income(group_gap_minutes=12, account_pnl=None, 
         ).fetchone()[0]
     finally:
         conn.close()
+
+
+def _fetch_history_rows(table, time_column, account_id, symbol=None, from_time=None, to_time=None):
+    conditions = ["account_id=?"]
+    params = [int(account_id)]
+    if symbol:
+        conditions.append("symbol=?")
+        params.append(str(symbol).upper())
+    if from_time:
+        conditions.append(f"{time_column}>=?")
+        params.append(str(from_time))
+    if to_time:
+        conditions.append(f"{time_column}<=?")
+        params.append(str(to_time))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE {' AND '.join(conditions)} "
+            f"ORDER BY {time_column} ASC, id ASC",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def fetch_trade_history_fills(account_id, *, symbol=None, from_time=None, to_time=None):
+    return _fetch_history_rows(
+        "fills", "created_at", account_id, symbol, from_time, to_time
+    )
+
+
+def fetch_trade_history_income(account_id, *, symbol=None, from_time=None, to_time=None):
+    return _fetch_history_rows(
+        "exchange_income_ledger", "income_time", account_id, symbol, from_time, to_time
+    )
+
+
+def fetch_trade_history_position_trades(
+    account_id, *, symbol=None, from_time=None, to_time=None
+):
+    return _fetch_history_rows(
+        "position_trades", "exit_time", account_id, symbol, from_time, to_time
+    )
 
 
 def fetch_position_trade_groups(limit=100, account_id=None):

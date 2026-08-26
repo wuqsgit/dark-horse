@@ -1,6 +1,13 @@
+import os
+import tempfile
 import unittest
 
-from shared.trade_history import deduplicate_fills, reconstruct_position_cycles
+import shared.db as db
+from shared.trade_history import (
+    deduplicate_fills,
+    fetch_trade_history_summaries,
+    reconstruct_position_cycles,
+)
 
 
 def fill(account_id, symbol, side, quantity, price, trade_id, created_at, position_side="BOTH"):
@@ -17,6 +24,165 @@ def fill(account_id, symbol, side, quantity, price, trade_id, created_at, positi
 
 
 class TradeHistorySummaryTest(unittest.TestCase):
+    def setUp(self):
+        self.original_db_path = db.DB_PATH
+        self.temp = tempfile.TemporaryDirectory()
+        db.DB_PATH = os.path.join(self.temp.name, "trade-history.db")
+        db.init_db()
+
+    def tearDown(self):
+        db.DB_PATH = self.original_db_path
+        self.temp.cleanup()
+
+    def test_summary_aggregates_deduplicated_ake_long_cycles(self):
+        fills = [
+            ("A2:open-1", "BUY", 100000, 0.0085, "2026-08-22 01:00:00"),
+            ("open-1", "BUY", 100000, 0.0085, "2026-08-22 01:00:00"),
+            ("A2:open-2", "BUY", 30000, 0.009024709, "2026-08-22 01:01:00"),
+            ("A2:close-1", "SELL", 50000, 0.0090, "2026-08-22 02:00:00"),
+            ("A2:close-2", "SELL", 80000, 0.0092, "2026-08-22 03:00:00"),
+            ("A2:open-3", "BUY", 39001, 0.0091, "2026-08-23 01:00:00"),
+            ("A2:close-3", "SELL", 39001, 0.0095, "2026-08-23 02:00:00"),
+        ]
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price, trade_id,
+                    created_at, strategy_source)
+                   VALUES (2, 'AKEUSDT', ?, 'LONG', ?, ?, ?, ?, 'ake')""",
+                [(side, quantity, price, trade_id, created_at)
+                 for trade_id, side, quantity, price, created_at in fills],
+            )
+            conn.executemany(
+                """INSERT INTO exchange_income_ledger
+                   (account_id, income_id, symbol, income_type, income, trade_id, income_time)
+                   VALUES (2, ?, 'AKEUSDT', 'REALIZED_PNL', ?, ?, ?)""",
+                [
+                    ("income-1", 17.5, "close-1", "2026-08-22 02:00:00"),
+                    ("income-2", 11.5, "A2:close-2", "2026-08-22 03:00:00"),
+                    ("income-3", 3.0, "close-3", "2026-08-23 02:00:00"),
+                    ("income-4", 1.0, "unmatched", "2026-08-22 02:30:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(account_id=2, limit=20)
+
+        self.assertEqual(len(result["items"]), 1)
+        row = result["items"][0]
+        self.assertEqual((row["symbol"], row["side"]), ("AKEUSDT", "LONG"))
+        self.assertEqual(row["quantity"], 169001)
+        self.assertAlmostEqual(row["entry_price"], 0.00873160732776729)
+        self.assertAlmostEqual(row["exit_price"], 0.009210060887213685)
+        self.assertAlmostEqual(row["pnl"], 33.0)
+        self.assertEqual(row["position_count"], 2)
+        self.assertEqual(row["close_count"], 3)
+        self.assertEqual(result["stats"]["total_cycles"], 2)
+        self.assertEqual(result["stats"]["win_count"], 2)
+        self.assertAlmostEqual(result["stats"]["total_pnl"], 33.0)
+
+    def test_summary_filters_cycles_by_source_before_grouping_and_stats(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price, trade_id,
+                    created_at, strategy_source)
+                   VALUES (2, 'AKEUSDT', ?, 'LONG', 10, ?, ?, ?, ?)""",
+                [
+                    ("BUY", 10, "alpha-open", "2026-08-22 01:00:00", "alpha"),
+                    ("SELL", 11, "alpha-close", "2026-08-22 02:00:00", "alpha"),
+                    ("BUY", 20, "normal-open", "2026-08-23 01:00:00", "normal"),
+                    ("SELL", 19, "normal-close", "2026-08-23 02:00:00", "normal"),
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO exchange_income_ledger
+                   (account_id, income_id, symbol, income_type, income, trade_id, income_time)
+                   VALUES (2, ?, 'AKEUSDT', 'REALIZED_PNL', ?, ?, ?)""",
+                [
+                    ("alpha-income", 1.0, "alpha-close", "2026-08-22 02:00:00"),
+                    ("normal-income", -1.0, "normal-close", "2026-08-23 02:00:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(account_id=2, source="alpha")
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["quantity"], 10)
+        self.assertAlmostEqual(result["items"][0]["pnl"], 1.0)
+        self.assertEqual(result["stats"]["total_cycles"], 1)
+        self.assertEqual(result["stats"]["win_count"], 1)
+        self.assertEqual(result["stats"]["loss_count"], 0)
+        self.assertAlmostEqual(result["stats"]["win_rate"], 100.0)
+
+    def test_summary_validates_cursor_and_falls_back_to_position_trades(self):
+        conn = db.get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO position_trades
+                   (account_id, position_trade_id, symbol, side, strategy_source, entry_time,
+                    exit_time, entry_price, exit_price, quantity, net_pnl, income_count)
+                   VALUES (2, 'fallback-1', 'BTCUSDT', 'SHORT', 'alpha',
+                           '2026-08-24 01:00:00', '2026-08-24 02:00:00',
+                           100, 90, 2, 20, 3)"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(
+            account_id=2, symbol="BTCUSDT", source="alpha"
+        )
+
+        self.assertEqual(result["reconcile_status"], "incomplete")
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["side"], "SHORT")
+        self.assertEqual(result["items"][0]["position_count"], 1)
+        self.assertEqual(result["items"][0]["close_count"], 3)
+        self.assertEqual(result["stats"]["total_cycles"], 1)
+        with self.assertRaisesRegex(ValueError, "^invalid_history_cursor$"):
+            fetch_trade_history_summaries(account_id=2, cursor="not-a-cursor")
+
+    def test_summary_paginates_lifetime_rows_by_exit_time_and_date_filter(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price, trade_id,
+                    created_at, strategy_source)
+                   VALUES (2, ?, ?, 'LONG', 1, ?, ?, ?, 'alpha')""",
+                [
+                    ("ETHUSDT", "BUY", 100, "eth-open", "2026-08-22 01:00:00"),
+                    ("ETHUSDT", "SELL", 101, "eth-close", "2026-08-22 02:00:00"),
+                    ("BTCUSDT", "BUY", 200, "btc-open", "2026-08-23 01:00:00"),
+                    ("BTCUSDT", "SELL", 201, "btc-close", "2026-08-23 02:00:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        first_page = fetch_trade_history_summaries(account_id=2, limit=1)
+        second_page = fetch_trade_history_summaries(
+            account_id=2, limit=1, cursor=first_page["next_cursor"]
+        )
+        filtered = fetch_trade_history_summaries(
+            account_id=2, from_time="2026-08-23 00:00:00"
+        )
+
+        self.assertEqual([row["symbol"] for row in first_page["items"]], ["BTCUSDT"])
+        self.assertIsNotNone(first_page["next_cursor"])
+        self.assertEqual([row["symbol"] for row in second_page["items"]], ["ETHUSDT"])
+        self.assertIsNone(second_page["next_cursor"])
+        self.assertEqual([row["symbol"] for row in filtered["items"]], ["BTCUSDT"])
+
     def test_same_second_fills_use_numeric_id_order(self):
         first = fill(1, "AKEUSDT", "BUY", 1, 10, "t2", "2026-08-22 01:00:00")
         second = fill(1, "AKEUSDT", "SELL", 1, 12, "t10", "2026-08-22 01:00:00")

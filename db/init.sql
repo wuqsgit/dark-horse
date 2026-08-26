@@ -1199,6 +1199,8 @@ CREATE INDEX idx_trade_entry_reviews_status ON trade_entry_reviews(position_stat
 CREATE UNIQUE INDEX idx_account_position_history_key ON account_position_history(account_id, symbol);
 CREATE INDEX idx_orders_account_time ON orders(account_id, created_at DESC);
 CREATE INDEX idx_fills_account_time ON fills(account_id, created_at DESC);
+CREATE INDEX idx_fills_account_symbol_time ON fills(account_id, symbol, created_at, id);
+CREATE INDEX idx_income_account_symbol_time ON exchange_income_ledger(account_id, symbol, income_time, id);
 CREATE INDEX idx_positions_history_account_time ON positions_history(account_id, time DESC);
 CREATE INDEX idx_position_trades_account_exit ON position_trades(account_id, exit_time DESC);
 CREATE INDEX idx_market_universe_pool_ready ON market_universe(pool_type, selected, data_ready, universe_rank);
