@@ -191,7 +191,12 @@ class MultiAccountTradingTest(unittest.TestCase):
 
         self.assertNotIn("/api/trading/accounts/status", _FAST_CACHE_PATHS)
         self.assertEqual(_cache_ttl_for_path("/api/trading/accounts/status"), 30)
-        self.assertEqual(_cache_ttl_for_path("/api/trading/status"), 10)
+        for legacy_path in (
+            "/api/trading/status",
+            "/api/trading/statu",
+            "/api/trading/stats",
+        ):
+            self.assertNotIn(legacy_path, _FAST_CACHE_PATHS)
 
     def test_recent_trades_are_position_level_groups_with_score_and_pct(self):
         conn = db.get_conn()

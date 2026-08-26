@@ -3,8 +3,10 @@ import asyncio
 import hmac
 import logging
 import os, sys, json, time
+from contextlib import closing
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, Header, HTTPException, Response
+from typing import Annotated
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from api.ai_proxy import AIServiceProxy
 from ai_service.config import AI_DB_PATH, MAIN_DB_PATH
@@ -221,7 +223,6 @@ _account_status_refresher_task = None
 
 _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
-_TRADING_CACHE_TTL = 10
 _TRADING_ACCOUNT_STATUS_CACHE_TTL = 30
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _FAST_CACHE_PATHS = {
@@ -235,16 +236,12 @@ _FAST_CACHE_PATHS = {
     "/api/backtest/review",
     "/api/backtest/factor_weights",
     "/api/strategy/learning",
-    "/api/trading/status",
-    "/api/trading/statu",
 }
 
 
 def _cache_ttl_for_path(path: str) -> int:
     if path == "/api/trading/accounts/status":
         return _TRADING_ACCOUNT_STATUS_CACHE_TTL
-    if path.startswith("/api/trading/"):
-        return _TRADING_CACHE_TTL
     if path.startswith("/api/scan/"):
         return _SCAN_CACHE_TTL
     if path in {"/api/backtest/review", "/api/backtest/factor_analysis"}:
@@ -420,10 +417,6 @@ async def fast_path_cache(request, call_next):
             "headers": cache_headers,
         }
         _response_cache[key] = payload
-        if request.url.path == "/api/trading/status":
-            _response_cache[key.replace("/api/trading/status", "/api/trading/statu")] = payload
-        elif request.url.path == "/api/trading/statu":
-            _response_cache[key.replace("/api/trading/statu", "/api/trading/status")] = payload
     response_headers = {
         k: v for k, v in response.headers.items()
         if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}
@@ -456,9 +449,6 @@ async def startup():
             seed_response_cache("/api/backtest/factor_weights", json.load(f))
         await get_latest_alpha_scan(user="admin")
         await get_alpha_trade_candidates(user="admin")
-        trading_status = await get_trading_status(user="admin")
-        seed_response_cache("/api/trading/status", trading_status)
-        seed_response_cache("/api/trading/statu", trading_status)
     except Exception:
         pass
 
@@ -1260,10 +1250,6 @@ async def update_strategy_learning_status(candidate_id: int, body: dict, user=De
         return {"error": str(e)}
 
 
-_trading_status_cache = {"data": None, "time": 0}
-_CACHE_TTL = 10  # 10绉掔紦瀛?
-
-
 def _safe_trading_runtime_controls():
     try:
         return get_trading_runtime_controls()
@@ -1276,9 +1262,7 @@ def _safe_trading_runtime_controls():
         }
 
 
-def _clear_trading_caches():
-    _trading_status_cache["data"] = None
-    _trading_status_cache["time"] = 0
+def _clear_api_caches():
     _response_cache.clear()
     _api_cache.clear()
 
@@ -1368,588 +1352,12 @@ async def update_trading_controls(body: dict, user=Depends(require_admin)):
             source,
             f"manual_{source}_trading_switch_off: 页面关闭{label}交易",
         )
-    _clear_trading_caches()
+    _clear_api_caches()
     return {
         "ok": True,
         "controls": controls,
         "close_result": close_result,
     }
-
-
-def _build_local_trading_status(error=None):
-    from shared.db import fetch_position_trade_groups, get_conn, rebuild_position_trades_from_income
-    from trader.config import TRADING_CONFIG
-
-    controls = _safe_trading_runtime_controls()
-    conn = get_conn()
-    try:
-        excluded = ("historical_import", "閸樺棗褰剁悰銉ョ秿(閹靛濮╅獮鍏呯波)")
-        latest_snapshot = conn.execute("SELECT MAX(time) AS t FROM positions_history").fetchone()["t"]
-        position_rows = []
-        if latest_snapshot:
-            position_rows = conn.execute(
-                "SELECT * FROM positions_history WHERE time = ? ORDER BY symbol",
-                (latest_snapshot,),
-            ).fetchall()
-        recent_trades = [
-            r for r in fetch_position_trade_groups(150)
-            if r.get("symbol") != "ACCOUNT"
-        ][:100]
-        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
-        total_trades = grouped_stats["total_trades"]
-        total_pnl = grouped_stats["total_pnl"]
-        total_closed = grouped_stats["total_closed"]
-        win_count = grouped_stats["win_count"]
-        loss_count = grouped_stats["loss_count"]
-        win_rate = grouped_stats["win_rate"]
-        profit_ratio = grouped_stats["profit_ratio"]
-        reason_stats = grouped_stats["reason_stats"]
-        positions = []
-        for p in position_rows:
-            entry_price = p["entry_price"] or 0
-            qty = p["quantity"] or 0
-            leverage = p["leverage"] or 1
-            margin = entry_price * qty / max(leverage, 1) if entry_price and qty else 0
-            unrealized = p["unrealized_pnl"] or 0
-            positions.append({
-                "symbol": p["symbol"],
-                "side": p["position_side"] or p["side"],
-                "position_side": p["position_side"],
-                "quantity": qty,
-                "entry_price": entry_price,
-                "mark_price": p["mark_price"],
-                "unrealized_pnl": unrealized,
-                "leverage": leverage,
-                "margin": round(margin, 2),
-                "margin_ratio": None,
-                "pnl_pct": round(unrealized / margin * 100, 2) if margin else 0,
-                "invested": round(entry_price * qty, 2),
-                "entry_reason": None,
-                "snapshot_time": p["time"],
-            })
-        realized = round(total_pnl, 2)
-        unrealized_total = round(sum(p["unrealized_pnl"] or 0 for p in positions), 2)
-        initial_capital = TRADING_CONFIG.get("total_capital", 5000)
-        return {
-            "data_source": "local_fallback",
-            "warning": str(error) if error else None,
-            "balance": round(initial_capital + realized + unrealized_total, 2),
-            "total_trades": total_trades,
-            "positions": positions,
-            "recent_trades": recent_trades,
-            "total_pnl": round(realized + unrealized_total, 2),
-            "realized_pnl": realized,
-            "trades_pnl": realized,
-            "income_pnl": round(conn.execute("SELECT SUM(realized_pnl) FROM fills WHERE side='REALIZED_PNL'").fetchone()[0] or 0, 2),
-            "current_positions": len(positions),
-            "total_opens": total_trades,
-            "total_closed": total_closed,
-            "win_count": win_count,
-            "loss_count": loss_count,
-            "win_rate": win_rate,
-            "profit_ratio": profit_ratio,
-            "reason_stats": reason_stats,
-            "latest_position_snapshot": latest_snapshot,
-            "trading_controls": controls,
-        }
-    finally:
-        conn.close()
-
-
-def _grouped_trade_stats(grouped_trades):
-    rows = [r for r in (grouped_trades or []) if r.get("exit_time")]
-    position_rows = [
-        r for r in rows
-        if not r.get("is_adjustment") and r.get("symbol") != "ACCOUNT"
-    ]
-    total_pnl = sum(float(r.get("pnl") or 0) for r in rows)
-    adjustment_pnl = sum(float(r.get("pnl") or 0) for r in rows if r not in position_rows)
-    position_pnl = sum(float(r.get("pnl") or 0) for r in position_rows)
-    wins = [r for r in position_rows if float(r.get("pnl") or 0) > 0]
-    losses = [r for r in position_rows if float(r.get("pnl") or 0) <= 0]
-    total_win = sum(float(r.get("pnl") or 0) for r in wins)
-    total_loss = abs(sum(float(r.get("pnl") or 0) for r in losses))
-    reason_stats = {}
-    for r in position_rows:
-        reason = r.get("exit_reason") or "unknown"
-        reason_stats.setdefault(reason, {"count": 0, "total_pnl": 0.0, "wins": 0})
-        reason_stats[reason]["count"] += 1
-        reason_stats[reason]["total_pnl"] += float(r.get("pnl") or 0)
-        if float(r.get("pnl") or 0) > 0:
-            reason_stats[reason]["wins"] += 1
-    return {
-        "total_trades": len(position_rows),
-        "total_closed": len(position_rows),
-        "total_pnl": total_pnl,
-        "position_pnl": position_pnl,
-        "adjustment_pnl": adjustment_pnl,
-        "win_count": len(wins),
-        "loss_count": len(losses),
-        "win_rate": round(len(wins) / len(position_rows) * 100, 2) if position_rows else 0,
-        "profit_ratio": round(total_win / total_loss, 2) if total_loss else 0,
-        "reason_stats": {
-            k: {
-                "count": v["count"],
-                "total_pnl": round(v["total_pnl"], 2),
-                "win_rate": round(v["wins"] / v["count"] * 100, 1) if v["count"] else 0,
-            }
-            for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
-        },
-    }
-
-
-@app.get("/api/trading/statu")
-@app.get("/api/trading/status")
-async def get_trading_status(user=Depends(get_user)):
-    """Merge live status and stats with cache."""
-    import time
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from shared.accounts import account_exchange_config, get_default_account
-    from shared.live_diagnostics import build_live_diagnostics
-    from shared.db import (
-        fetch_position_trade_groups,
-        get_conn,
-        rebuild_position_trades_from_income,
-        reset_account_context,
-        set_account_context,
-    )
-
-    # Check cache.
-    if _trading_status_cache["data"] and time.time() - _trading_status_cache["time"] < _CACHE_TTL:
-        return _trading_status_cache["data"]
-
-    account = get_default_account(include_secrets=True)
-    try:
-        exchange_config = account_exchange_config(account, require_credentials=True)
-    except ValueError as exc:
-        return {
-            "error": str(exc),
-            "data_source": "binance_live",
-            "account_id": account["id"],
-            "account_name": account["name"],
-            "balance": 0,
-            "positions": [],
-            "recent_trades": [],
-            "total_pnl": 0,
-            "trading_controls": _safe_trading_runtime_controls(),
-            "runtime_diagnostics": build_live_diagnostics(account, exchange_error=str(exc)),
-        }
-
-    EXCLUDED_REASONS = ("historical_import", "鍘嗗彶琛ュ綍(鎵嬪姩骞充粨)")
-
-    from trader.exchange import BinanceFutures
-    from trader.config import TRADING_CONFIG
-    INITIAL_CAPITAL = float(account.get("initial_capital") or TRADING_CONFIG.get("total_capital", 5000))
-    controls = _safe_trading_runtime_controls()
-    account_token = set_account_context(account["id"])
-    ex = BinanceFutures(
-        config=exchange_config,
-        account_id=account["id"],
-        account_name=account["name"],
-    )
-    conn = None
-    try:
-        margin_data = ex.get_margin_balance()
-        balance = margin_data["totalWalletBalance"]
-        margin_balance = margin_data.get("totalMarginBalance") or balance
-        total_maint_margin = float(margin_data.get("totalMaintMargin") or 0)
-        cross_margin_ratio = (total_maint_margin / margin_balance * 100) if margin_balance else None
-        positions = ex.get_positions()
-        unrealized_total = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
-        rebuild_position_trades_from_income(
-            account_pnl=(float(balance) - float(INITIAL_CAPITAL)) if isinstance(balance, (int, float)) else None,
-            unrealized_pnl=unrealized_total,
-        )
-        conn = get_conn()
-        recent_trades = [
-            r for r in fetch_position_trade_groups(150)
-            if r.get("symbol") != "ACCOUNT"
-        ][:100]
-        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
-        total_trades = grouped_stats["total_trades"]
-        total_closed = grouped_stats["total_closed"]
-        total_pnl = grouped_stats["total_pnl"]
-        position_pnl = grouped_stats.get("position_pnl", total_pnl)
-        adjustment_pnl = grouped_stats.get("adjustment_pnl", 0)
-        win_count = grouped_stats["win_count"]
-        loss_count = grouped_stats["loss_count"]
-        win_rate = grouped_stats["win_rate"]
-        profit_ratio = grouped_stats["profit_ratio"]
-        reason_stats = grouped_stats["reason_stats"]
-
-        def parse_position_time(value):
-            if not value:
-                return None
-            try:
-                from datetime import datetime, timezone
-
-                text = str(value).strip()
-                if text.endswith("Z"):
-                    text = text[:-1] + "+00:00"
-                dt = datetime.fromisoformat(text)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone.utc)
-            except Exception:
-                return None
-
-        def format_holding_time(seconds):
-            if seconds is None:
-                return "-"
-            seconds = max(0, int(seconds))
-            days, rem = divmod(seconds, 86400)
-            hours, rem = divmod(rem, 3600)
-            minutes, secs = divmod(rem, 60)
-            if days:
-                return f"{days}天{hours}小时"
-            if hours:
-                return f"{hours}小时{minutes}分钟"
-            if minutes:
-                return f"{minutes}分钟"
-            return f"{secs}秒"
-
-        def holding_fields(entry_time):
-            dt = parse_position_time(entry_time)
-            if not dt:
-                return {
-                    "entry_time": entry_time,
-                    "holding_seconds": None,
-                    "holding_time": "-",
-                }
-            from datetime import datetime, timezone
-
-            seconds = (datetime.now(timezone.utc) - dt).total_seconds()
-            return {
-                "entry_time": entry_time,
-                "holding_seconds": max(0, int(seconds)),
-                "holding_time": format_holding_time(seconds),
-            }
-
-        def entry_time_from_position_id(position_id):
-            try:
-                import re
-
-                match = re.search(r"(\d{8}T\d{6}Z)", str(position_id or ""))
-                if not match:
-                    return None
-                raw = match.group(1)
-                return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}T{raw[9:11]}:{raw[11:13]}:{raw[13:15]}Z"
-            except Exception:
-                return None
-
-        def fallback_entry_time(symbol, side):
-            if side not in ("LONG", "SHORT"):
-                return None
-            open_side = "BUY" if side == "LONG" else "SELL"
-            row = conn.execute(
-                """SELECT created_at FROM orders
-                   WHERE symbol=? AND side=? AND order_type='MARKET'
-                   ORDER BY created_at DESC
-                   LIMIT 1""",
-                (symbol, open_side),
-            ).fetchone()
-            return row["created_at"] if row else None
-
-        def position_management_fields(symbol, side=None):
-            r = conn.execute("SELECT * FROM position_history WHERE symbol=?", (symbol,)).fetchone()
-            if not r:
-                return {
-                    **holding_fields(fallback_entry_time(symbol, side)),
-                    "entry_reason": None,
-                    "entry_score": 0,
-                    "tp1_hit": False,
-                    "tp2_hit": False,
-                    "highest_price": None,
-                    "lowest_price": None,
-                    "stop_model": None,
-                    "initial_stop_loss": None,
-                    "stop_pct": None,
-                    "current_stop_loss": None,
-                    "trailing_stop_price": None,
-                    "trailing_enabled": False,
-                    "trailing_atr_multiplier": None,
-                    "r_multiple": 0,
-                    "initial_quantity": None,
-                    "last_exit_reason": None,
-                    "last_exit_plain": None,
-                    "strategy_source": "normal",
-                    "signal_source": None,
-                    "alpha_symbol": None,
-                    "alpha_profile": None,
-                    "alpha_entry_level": None,
-                    "alpha_score": None,
-                    "alpha_suggested_position_pct": None,
-                    "roll_layer": 0,
-                    "roll_max_layers": _roll_max_layers(),
-                    "roll_status": "state_incomplete",
-                    "roll_price": None,
-                    "protected_stop": None,
-                    "last_roll_time": None,
-                    "protected_profit": 0,
-                    "max_floating_pnl": 0,
-                    "max_floating_roi": 0,
-                    "alpha_profit_lock_stage": 0,
-                    "alpha_locked_roi": 0,
-                    "alpha_stall_protect_price": None,
-                    "alpha_stall_protect_time": None,
-                    "roll_enabled": False,
-                    "roll_block_reason": None,
-                    "alpha_current_score": None,
-                    "alpha_volume_price_state": None,
-                    "alpha_volume_price_action": None,
-                    "alpha_volume_price_reason": None,
-                }
-            alpha_context = {}
-            if "strategy_source" in r.keys() and r["strategy_source"] == "alpha":
-                try:
-                    from shared.db import fetch_latest_alpha_position_context
-
-                    alpha_context = fetch_latest_alpha_position_context(
-                        symbol=symbol,
-                        alpha_symbol=r["alpha_symbol"] if "alpha_symbol" in r.keys() else None,
-                    ) or {}
-                except Exception:
-                    alpha_context = {}
-            alpha_reasons = _parse_json(alpha_context.get("volume_price_reasons_json"), [])
-            entry_time = r["entry_time"] if "entry_time" in r.keys() else None
-            if not entry_time and "position_id" in r.keys():
-                entry_time = entry_time_from_position_id(r["position_id"])
-            if not entry_time:
-                entry_time = fallback_entry_time(symbol, side)
-            initial_quantity = float(r["initial_quantity"] or 0) if "initial_quantity" in r.keys() else 0
-            initial_stop = float(r["initial_stop_loss"] or 0) if "initial_stop_loss" in r.keys() else 0
-            atr_value = float(r["atr_value"] or 0) if "atr_value" in r.keys() else 0
-            roll_layer = int(r["roll_layer"] or 0) if "roll_layer" in r.keys() else 0
-            protected_stop = float(r["protected_stop"] or 0) if "protected_stop" in r.keys() else 0
-            roll_block_reason = r["roll_block_reason"] if "roll_block_reason" in r.keys() else None
-            if not initial_quantity or not initial_stop or not atr_value:
-                roll_status = "state_incomplete"
-            elif roll_block_reason:
-                roll_status = roll_block_reason
-            elif roll_layer >= 1:
-                roll_status = "rolled_protected" if protected_stop else "protection_missing"
-            elif not bool(r["tp1_hit"] if "tp1_hit" in r.keys() else 0):
-                roll_status = "waiting_tp1"
-            else:
-                roll_status = "waiting_1_5r"
-            return {
-                **holding_fields(entry_time),
-                "entry_reason": r["entry_reason"],
-                "entry_score": float(r["entry_score"] or 0),
-                "tp1_hit": bool(r["tp1_hit"]) if "tp1_hit" in r.keys() else False,
-                "tp2_hit": bool(r["tp2_hit"]) if "tp2_hit" in r.keys() else False,
-                "highest_price": float(r["highest_price"] or 0) if "highest_price" in r.keys() else None,
-                "lowest_price": float(r["lowest_price"] or 0) if "lowest_price" in r.keys() else None,
-                "stop_model": r["stop_model"] if "stop_model" in r.keys() else None,
-                "initial_stop_loss": float(r["initial_stop_loss"] or 0) if "initial_stop_loss" in r.keys() else None,
-                "stop_pct": float(r["stop_pct"] or 0) if "stop_pct" in r.keys() else None,
-                "current_stop_loss": float(r["current_stop_loss"] or 0) if "current_stop_loss" in r.keys() else None,
-                "trailing_stop_price": float(r["trailing_stop_price"] or 0) if "trailing_stop_price" in r.keys() else None,
-                "trailing_enabled": bool(r["trailing_enabled"]) if "trailing_enabled" in r.keys() else False,
-                "trailing_atr_multiplier": float(r["trailing_atr_multiplier"] or 0) if "trailing_atr_multiplier" in r.keys() else None,
-                "r_multiple": float(r["r_multiple"] or 0) if "r_multiple" in r.keys() else 0,
-                "initial_quantity": initial_quantity or None,
-                "last_exit_reason": r["last_exit_reason"] if "last_exit_reason" in r.keys() else None,
-                "last_exit_plain": plain_reason(r["last_exit_reason"]) if "last_exit_reason" in r.keys() else None,
-                "strategy_source": r["strategy_source"] if "strategy_source" in r.keys() else "normal",
-                "signal_source": r["signal_source"] if "signal_source" in r.keys() else None,
-                "alpha_symbol": r["alpha_symbol"] if "alpha_symbol" in r.keys() else None,
-                "alpha_profile": r["alpha_profile"] if "alpha_profile" in r.keys() else None,
-                "alpha_entry_level": r["alpha_entry_level"] if "alpha_entry_level" in r.keys() else None,
-                "alpha_score": float(r["alpha_score"] or 0) if "alpha_score" in r.keys() else None,
-                "alpha_suggested_position_pct": float(r["alpha_suggested_position_pct"] or 0) if "alpha_suggested_position_pct" in r.keys() else None,
-                "roll_layer": roll_layer,
-                "roll_max_layers": _roll_max_layers(),
-                "roll_status": roll_status,
-                "roll_price": float(r["roll_price"] or 0) if "roll_price" in r.keys() else None,
-                "protected_stop": protected_stop or None,
-                "last_roll_time": r["last_roll_time"] if "last_roll_time" in r.keys() else None,
-                "protected_profit": float(r["protected_profit"] or 0) if "protected_profit" in r.keys() else 0,
-                "max_floating_pnl": float(r["max_floating_pnl"] or 0) if "max_floating_pnl" in r.keys() else 0,
-                "max_floating_roi": float(r["max_floating_roi"] or 0) if "max_floating_roi" in r.keys() else 0,
-                "alpha_profit_lock_stage": int(r["alpha_profit_lock_stage"] or 0) if "alpha_profit_lock_stage" in r.keys() else 0,
-                "alpha_locked_roi": float(r["alpha_locked_roi"] or 0) if "alpha_locked_roi" in r.keys() else 0,
-                "alpha_stall_protect_price": float(r["alpha_stall_protect_price"] or 0) if "alpha_stall_protect_price" in r.keys() else None,
-                "alpha_stall_protect_time": r["alpha_stall_protect_time"] if "alpha_stall_protect_time" in r.keys() else None,
-                "roll_enabled": bool(r["roll_enabled"]) if "roll_enabled" in r.keys() else False,
-                "roll_block_reason": roll_block_reason,
-                "alpha_current_score": float(alpha_context.get("alpha_score") or 0) if alpha_context else None,
-                "alpha_volume_price_state": alpha_context.get("volume_price_state") if alpha_context else None,
-                "alpha_volume_price_action": alpha_context.get("volume_price_action") if alpha_context else None,
-                "alpha_volume_price_reason": alpha_reasons[0] if alpha_reasons else None,
-            }
-
-        decision_panel = {
-            "latest_run_id": None,
-            "latest_time": None,
-            "top_reasons": [],
-            "recent": [],
-            "entry_gate_mode": "per_symbol_entry_profile",
-            "entry_gate_plain": "开仓线已改为按币种模板判断；全局60分不再提前拦截试探仓。",
-            "legacy_global_score_gate": "disabled_for_live_entry",
-            "regime_effect_plain": "行情状态只调整开仓名额和仓位，不再直接抬高综合分门槛。",
-        }
-        try:
-            from shared.strategy_learning import load_entry_policy
-            active_policy = load_entry_policy()
-            decision_panel["active_entry_policy_count"] = len(active_policy.get("rules") or [])
-            decision_panel["active_entry_policy_version"] = active_policy.get("version")
-        except Exception:
-            decision_panel["active_entry_policy_count"] = 0
-            decision_panel["active_entry_policy_version"] = None
-        latest_decision = conn.execute(
-            """SELECT run_id, time
-               FROM strategy_decisions
-               ORDER BY time DESC, id DESC
-               LIMIT 1"""
-        ).fetchone()
-        if latest_decision:
-            run_id = latest_decision["run_id"]
-            decision_panel["latest_run_id"] = run_id
-            decision_panel["latest_time"] = latest_decision["time"]
-            decision_panel["last_execution_time"] = latest_decision["time"]
-            decision_panel["top_reasons"] = [
-                {"reason": r["reason"], "plain": plain_reason(r["reason"]), "count": r["count"]}
-                for r in conn.execute(
-                    """SELECT filter_reason AS reason, COUNT(*) AS count
-                       FROM strategy_decisions
-                       WHERE run_id = ?
-                         AND filter_reason IS NOT NULL
-                         AND filter_reason != ''
-                       GROUP BY filter_reason
-                       ORDER BY count DESC
-                       LIMIT 6""",
-                    (run_id,),
-                ).fetchall()
-            ]
-            decision_panel["recent"] = [
-                {
-                    "time": r["time"],
-                    "symbol": r["symbol"],
-                    "side": r["side"],
-                    "stage": r["decision_stage"],
-                    "result": r["decision_result"],
-                    "score": float(r["composite_score"] or 0),
-                    "reason": r["filter_reason"],
-                    "plain": plain_reason(r["filter_reason"]),
-                }
-                for r in conn.execute(
-                    """SELECT time, symbol, side, decision_stage, decision_result,
-                              filter_reason, composite_score
-                       FROM strategy_decisions
-                       WHERE run_id = ?
-                       ORDER BY id DESC
-                       LIMIT 10""",
-                    (run_id,),
-                ).fetchall()
-            ]
-        result = {
-            "data_source": "binance_live",
-            "warning": None,
-            "balance": balance,
-            "total_trades": total_trades,
-            "positions": [
-                {
-                    "symbol": p["symbol"], "side": p["side"],
-                    "quantity": p["quantity"], "entry_price": p["entry_price"],
-                    "mark_price": p["mark_price"],
-                    "unrealized_pnl": p["unrealized_pnl"],
-                    "leverage": p["leverage"],
-                    "margin": round(p.get("margin") or 0, 2),
-                    "margin_ratio": (
-                        round(cross_margin_ratio, 4)
-                        if str(p.get("margin_type") or "").lower() in {"cross", "crossed"} and cross_margin_ratio is not None
-                        else round(
-                            (p.get("maint_margin") or 0)
-                            / ((p.get("isolated_margin") or 0) + (p.get("unrealized_pnl") or 0))
-                            * 100,
-                            4,
-                        )
-                        if ((p.get("isolated_margin") or 0) + (p.get("unrealized_pnl") or 0)) > 0
-                        else None
-                    ),
-                    "pnl_pct": round(p["unrealized_pnl"] / p["margin"] * 100, 2) if p.get("margin") else 0,
-                    "invested": round(p.get("notional") or (p["entry_price"] * p["quantity"]), 2),
-                    "initial_margin": round(p.get("initial_margin") or 0, 2),
-                    "maint_margin": round(p.get("maint_margin") or 0, 2),
-                    "position_initial_margin": round(p.get("position_initial_margin") or 0, 2),
-                    "open_order_initial_margin": round(p.get("open_order_initial_margin") or 0, 2),
-                    "isolated_margin": round(p.get("isolated_margin") or 0, 2),
-                    "notional": round(p.get("notional") or 0, 2),
-                    "margin_asset": p.get("margin_asset"),
-                    "margin_type": p.get("margin_type"),
-                    "liquidation_price": p.get("liquidation_price"),
-                    "break_even_price": p.get("break_even_price"),
-                    "risk_api_version": p.get("risk_api_version"),
-                    **position_management_fields(p["symbol"], p.get("side")),
-                }
-                for p in positions
-            ],
-            "recent_trades": recent_trades,
-            "account_margin_balance": round(margin_balance, 2),
-            # stats 瀛楁
-            "total_pnl": round(balance - INITIAL_CAPITAL, 2) if isinstance(balance, (int, float)) else 0,
-            "trades_pnl": round(total_pnl, 2),
-            "realized_pnl": round(total_pnl, 2),
-            "position_pnl": round(position_pnl, 2),
-            "adjustment_pnl": round(adjustment_pnl, 2),
-            "income_pnl": round(conn.execute("SELECT COALESCE(SUM(income),0) FROM exchange_income_ledger").fetchone()[0] or 0, 2),
-            "reconcile_diff": round((balance - INITIAL_CAPITAL) - total_pnl - unrealized_total, 2) if isinstance(balance, (int, float)) else 0,
-            "current_positions": len(positions),
-            "total_opens": total_trades,
-            "total_closed": total_closed,
-            "win_count": win_count,
-            "loss_count": loss_count,
-            "win_rate": win_rate,
-            "profit_ratio": profit_ratio,
-            "reason_stats": {
-                k: {
-                    "count": v["count"],
-                    "total_pnl": round(v["total_pnl"], 2),
-                    "win_rate": v.get("win_rate", 0),
-                    "plain": plain_reason(k),
-                }
-                for k, v in sorted(reason_stats.items(), key=lambda x: -x[1]["count"])
-            },
-            "decision_panel": decision_panel,
-            "trading_controls": controls,
-            "runtime_diagnostics": build_live_diagnostics(account),
-        }
-        # 淇濆瓨缂撳瓨
-        _trading_status_cache["data"] = result
-        _trading_status_cache["time"] = time.time()
-        return result
-    except Exception as e:
-        stale = _trading_status_cache.get("data")
-        if stale:
-            fallback = dict(stale)
-            fallback["stale"] = True
-            fallback["binance_warning"] = f"Binance 查询暂时超时，当前展示最近成功数据: {e}"
-            fallback["stale_age_seconds"] = round(max(0, time.time() - _trading_status_cache.get("time", 0)), 1)
-            fallback["runtime_diagnostics"] = build_live_diagnostics(
-                account,
-                exchange_error=f"{type(e).__name__}: {e}",
-            )
-            return fallback
-        return {
-            "error": str(e),
-            "data_source": "binance_live",
-            "balance": 0,
-            "positions": [],
-            "recent_trades": [],
-            "total_pnl": 0,
-            "trading_controls": _safe_trading_runtime_controls(),
-            "runtime_diagnostics": build_live_diagnostics(
-                account,
-                exchange_error=f"{type(e).__name__}: {e}",
-            ),
-        }
-    finally:
-        if conn is not None:
-            conn.close()
-        ex.close()
-        reset_account_context(account_token)
 
 
 def _live_holding_fields(entry_time):
@@ -2428,7 +1836,7 @@ async def create_trading_account(body: dict, user=Depends(require_admin)):
     from shared.accounts import save_account
     try:
         account = save_account(body)
-        _clear_trading_caches()
+        _clear_api_caches()
         return {"status": "ok", "account": account}
     except Exception as exc:
         return {"error": str(exc)}
@@ -2439,7 +1847,7 @@ async def update_trading_account(account_id: int, body: dict, user=Depends(requi
     from shared.accounts import save_account
     try:
         account = save_account(body, account_id=account_id)
-        _clear_trading_caches()
+        _clear_api_caches()
         return {"status": "ok", "account": account}
     except Exception as exc:
         return {"error": str(exc)}
@@ -2453,10 +1861,10 @@ async def delete_trading_account(account_id: int, user=Depends(require_admin)):
             close_positions_and_delete_account,
             account_id,
         )
-        _clear_trading_caches()
+        _clear_api_caches()
         return {"status": "ok", **result}
     except Exception as exc:
-        _clear_trading_caches()
+        _clear_api_caches()
         return {"error": str(exc)}
 
 
@@ -2497,65 +1905,112 @@ async def get_all_trading_account_status(response: Response, user=Depends(get_us
     return payload
 
 
-@app.get("/api/trading/stats")
-async def get_trading_stats(user=Depends(get_user)):
-    from shared.accounts import account_exchange_config, get_default_account
-    from shared.db import (
-        fetch_position_trade_groups,
-        get_conn,
-        reset_account_context,
-        set_account_context,
-    )
-    account = get_default_account(include_secrets=True)
-    account_token = set_account_context(account["id"])
-    conn = get_conn()
-    ex = None
-    try:
-        grouped_stats = _grouped_trade_stats(fetch_position_trade_groups(10000))
-        total_closed = grouped_stats["total_closed"]
-        total_pnl = grouped_stats["total_pnl"]
-        position_pnl = grouped_stats.get("position_pnl", total_pnl)
-        adjustment_pnl = grouped_stats.get("adjustment_pnl", 0)
-        win_count = grouped_stats["win_count"]
-        loss_count = grouped_stats["loss_count"]
-        win_rate = grouped_stats["win_rate"]
-        profit_ratio = grouped_stats["profit_ratio"]
-        
-        # 褰撳墠鎸佷粨鏁?        import sys, os
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-        from trader.exchange import BinanceFutures
-        ex = BinanceFutures(
-            config=account_exchange_config(account, require_credentials=True),
-            account_id=account["id"],
-            account_name=account["name"],
+def _trading_account_or_404(account_id: int) -> dict:
+    from shared.accounts import get_account
+
+    account = get_account(account_id)
+    if not account:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "account_not_found"},
         )
-        pos = ex.get_positions()
-        current_pos = len(pos)
-        
-        reason_stats = grouped_stats["reason_stats"]
-        total_opens = grouped_stats["total_trades"]
-        
-        return {
-            "total_pnl": round(total_pnl, 2),
-            "realized_pnl": round(total_pnl, 2),
-            "position_pnl": round(position_pnl, 2),
-            "adjustment_pnl": round(adjustment_pnl, 2),
-            "current_positions": current_pos,
-            "total_opens": total_opens,
-            "total_closed": total_closed,
-            "win_count": win_count,
-            "loss_count": loss_count,
-            "win_rate": win_rate,
-            "profit_ratio": profit_ratio,
-            "reason_stats": reason_stats,
-        }
-    except Exception as e:
-        return {"error": str(e), "total_pnl": 0, "current_positions": 0, "total_opens": 0}
-    finally:
-        conn.close()
-        if ex is not None:
-            ex.close()
-        reset_account_context(account_token)
+    return account
+
+
+def _parse_history_timestamp(value: str | None):
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_date"},
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@app.get("/api/trading/accounts/{account_id}/history")
+async def get_account_history(
+    account_id: int,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    symbol: str | None = None,
+    direction: str | None = None,
+    source: str | None = None,
+    from_time: Annotated[str | None, Query(alias="from")] = None,
+    to_time: Annotated[str | None, Query(alias="to")] = None,
+    user=Depends(get_user),
+):
+    from shared.trade_history import fetch_trade_history_summaries
+
+    _trading_account_or_404(account_id)
+    normalized_direction = str(direction).strip().upper() if direction else None
+    if normalized_direction not in {None, "LONG", "SHORT"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_direction"},
+        )
+    parsed_from = _parse_history_timestamp(from_time)
+    parsed_to = _parse_history_timestamp(to_time)
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_date"},
+        )
+    try:
+        return fetch_trade_history_summaries(
+            account_id,
+            cursor=cursor,
+            limit=limit,
+            symbol=symbol,
+            direction=normalized_direction,
+            source=source,
+            from_time=from_time,
+            to_time=to_time,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        if code == "invalid_history_cursor":
+            raise HTTPException(
+                status_code=400,
+                detail={"code": code},
+            ) from None
+        raise
+
+
+@app.get("/api/trading/accounts/{account_id}/decisions")
+async def get_account_decisions(account_id: int, user=Depends(get_user)):
+    from shared.db import get_conn
+
+    _trading_account_or_404(account_id)
+    with closing(get_conn()) as conn:
+        return _account_decision_panel(conn, account_id)
+
+
+@app.get("/api/trading/runtime/status")
+async def get_trading_runtime_status(user=Depends(get_user)):
+    from shared.accounts import list_accounts
+    from shared.live_diagnostics import build_live_diagnostics
+
+    accounts = list_accounts()
+    return {
+        "trading_controls": _safe_trading_runtime_controls(),
+        "accounts": [
+            {
+                "account_id": int(account["id"]),
+                "account_name": account["name"],
+                "environment": account["environment"],
+                "runtime_diagnostics": build_live_diagnostics(account),
+            }
+            for account in accounts
+        ],
+    }
 
 
 @app.get("/api/trading/positions_history")
