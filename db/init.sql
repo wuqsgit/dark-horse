@@ -659,6 +659,17 @@ CREATE TABLE position_trades (
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         , account_id INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE trade_history_page_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            query_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            cursor_secret TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+CREATE INDEX idx_trade_history_snapshots_expiry
+            ON trade_history_page_snapshots(expires_at);
 CREATE TABLE trade_exit_reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             position_trade_id TEXT UNIQUE,

@@ -781,6 +781,17 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_position_trades_exit ON position_trades(exit_time DESC);
         CREATE INDEX IF NOT EXISTS idx_position_trades_symbol ON position_trades(symbol, exit_time DESC);
         CREATE INDEX IF NOT EXISTS idx_position_trades_source ON position_trades(source, exit_time DESC);
+        CREATE TABLE IF NOT EXISTS trade_history_page_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            query_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            cursor_secret TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_trade_history_snapshots_expiry
+            ON trade_history_page_snapshots(expires_at);
         CREATE TABLE IF NOT EXISTS trade_exit_reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             position_trade_id TEXT UNIQUE,
@@ -3788,13 +3799,36 @@ def _is_position_open_order(row):
     return "roll" not in reason and "reduce" not in reason and "close" not in reason
 
 
+def _income_transaction_id(item):
+    for field in ("tranId", "tran_id", "incomeId", "income_id"):
+        value = item.get(field)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
 def _income_id_from_payload(item):
-    trade_id = str(item.get("tradeId") or item.get("tranId") or item.get("incomeId") or "").strip()
-    income_type = str(item.get("incomeType") or item.get("income_type") or "").strip()
-    symbol = str(item.get("symbol") or "").strip().upper()
-    income = str(item.get("income") or "0")
-    ts = str(item.get("time") or item.get("income_time") or "").strip()
-    return trade_id or f"{income_type}:{symbol}:{ts}:{income}"
+    transaction_id = _income_transaction_id(item)
+    if transaction_id:
+        return f"transaction:{transaction_id}"
+    identity = {
+        "income_type": str(
+            item.get("incomeType") or item.get("income_type") or "UNKNOWN"
+        ).strip().upper(),
+        "symbol": str(item.get("symbol") or "").strip().upper(),
+        "trade_id": str(item.get("tradeId") or item.get("trade_id") or "").strip(),
+        "order_id": str(item.get("orderId") or item.get("order_id") or "").strip(),
+        "income_time": str(item.get("time") or item.get("income_time") or "").strip(),
+        "asset": str(item.get("asset") or "USDT").strip().upper(),
+        "position_side": str(
+            item.get("positionSide") or item.get("position_side") or ""
+        ).strip().upper(),
+    }
+    stable_uuid = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        json.dumps(identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+    )
+    return f"fallback:{stable_uuid.hex}"
 
 
 def upsert_exchange_income(item, source="binance_income"):
@@ -3813,7 +3847,35 @@ def upsert_exchange_income(item, source="binance_income"):
         trade_id = f"A{current_account_id()}:{raw_trade_id}" if raw_trade_id else None
         order_id = str(item.get("orderId") or item.get("order_id") or "") or None
         position_side = str(item.get("positionSide") or item.get("position_side") or "") or None
-        income_id = f"A{current_account_id()}:{_income_id_from_payload(item)}"
+        account_id = current_account_id()
+        income_id = f"A{account_id}:{_income_id_from_payload(item)}"
+        if _income_transaction_id(item) is None:
+            replay = conn.execute(
+                """SELECT income_id
+                   FROM exchange_income_ledger
+                   WHERE account_id=?
+                     AND symbol=?
+                     AND income_type=?
+                     AND COALESCE(trade_id, '')=COALESCE(?, '')
+                     AND COALESCE(order_id, '')=COALESCE(?, '')
+                     AND COALESCE(income_time, '')=COALESCE(?, '')
+                     AND COALESCE(asset, '')=COALESCE(?, '')
+                     AND COALESCE(position_side, '')=COALESCE(?, '')
+                   ORDER BY id ASC
+                   LIMIT 1""",
+                (
+                    account_id,
+                    symbol,
+                    income_type,
+                    trade_id,
+                    order_id,
+                    income_time,
+                    asset,
+                    position_side,
+                ),
+            ).fetchone()
+            if replay:
+                income_id = replay["income_id"]
         conn.execute(
             """INSERT INTO exchange_income_ledger
                (account_id, income_id, symbol, income_type, income, asset, income_time, trade_id,
@@ -3831,7 +3893,7 @@ def upsert_exchange_income(item, source="binance_income"):
                  raw_json=excluded.raw_json,
                  source=excluded.source""",
             (
-                current_account_id(), income_id,
+                account_id, income_id,
                 symbol,
                 income_type,
                 income,
@@ -4738,6 +4800,76 @@ def fetch_trade_history_snapshot(account_id, *, symbol=None, watermarks=None):
             ),
             "orders": fetch("orders", "created_at", "orders"),
         }
+    finally:
+        conn.close()
+
+
+def save_trade_history_page_snapshot(
+    account_id, query_hash, payload, *, ttl_seconds=1800, max_per_account=32
+):
+    snapshot_id = uuid.uuid4().hex
+    cursor_secret = uuid.uuid4().hex + uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    expires_at = _format_db_time(now + timedelta(seconds=ttl_seconds))
+    conn = get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM trade_history_page_snapshots WHERE expires_at < ?",
+            (_format_db_time(now),),
+        )
+        conn.execute(
+            """INSERT INTO trade_history_page_snapshots
+               (snapshot_id, account_id, query_hash, payload_json,
+                cursor_secret, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_id,
+                int(account_id),
+                str(query_hash),
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                cursor_secret,
+                expires_at,
+            ),
+        )
+        conn.execute(
+            """DELETE FROM trade_history_page_snapshots
+               WHERE snapshot_id IN (
+                   SELECT snapshot_id
+                   FROM trade_history_page_snapshots
+                   WHERE account_id=?
+                   ORDER BY datetime(created_at) DESC, rowid DESC
+                   LIMIT -1 OFFSET ?
+               )""",
+            (int(account_id), max(1, int(max_per_account))),
+        )
+        conn.commit()
+        return {"snapshot_id": snapshot_id, "cursor_secret": cursor_secret}
+    finally:
+        conn.close()
+
+
+def fetch_trade_history_page_snapshot(account_id, snapshot_id, query_hash):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT payload_json, cursor_secret
+               FROM trade_history_page_snapshots
+               WHERE snapshot_id=? AND account_id=? AND query_hash=?
+                 AND expires_at >= ?""",
+            (
+                str(snapshot_id),
+                int(account_id),
+                str(query_hash),
+                _format_db_time(datetime.now(timezone.utc)),
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return {"payload": payload, "cursor_secret": row["cursor_secret"]}
     finally:
         conn.close()
 

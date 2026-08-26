@@ -1,12 +1,17 @@
 """Pure helpers for reconstructing position cycles from exchange fills."""
 
 import base64
+import hashlib
+import hmac
 import json
 import math
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 
 from . import db
+
+
+_MAX_HISTORY_CURSOR_LENGTH = 512
 
 
 def _is_execution_fill(row):
@@ -493,6 +498,12 @@ def _cycle_matches(cycle, direction=None, source=None, from_time=None, to_time=N
     )
 
 
+def _worst_reconcile_status(statuses):
+    ranking = {"ok": 0, "incomplete": 1, "mismatch": 2}
+    normalized = [status if status in ranking else "incomplete" for status in statuses]
+    return max(normalized, key=ranking.get, default="ok")
+
+
 def _summary_from_cycles(cycles):
     grouped = {}
     for cycle in cycles:
@@ -519,6 +530,7 @@ def _summary_from_cycles(cycles):
                 "entry_time": cycle["entry_time"],
                 "exit_time": cycle["exit_time"],
                 "strategy_sources": set(),
+                "reconcile_status": cycle.get("reconcile_status"),
             },
         )
         entry_quantity = _positive_number(cycle.get("entry_quantity"))
@@ -557,6 +569,12 @@ def _summary_from_cycles(cycles):
         source = _cycle_source(cycle)
         if source is not None:
             summary["strategy_sources"].add(source)
+        summary["reconcile_status"] = _worst_reconcile_status(
+            (
+                summary.get("reconcile_status"),
+                cycle.get("reconcile_status"),
+            )
+        )
         entry_times = [
             value for value in (summary["entry_time"], cycle["entry_time"])
             if value
@@ -628,54 +646,78 @@ def _stats_from_cycles(cycles):
 
 
 def _reconcile_status(cycles):
-    statuses = {cycle.get("reconcile_status") for cycle in cycles}
-    if "mismatch" in statuses:
-        return "mismatch"
-    if "incomplete" in statuses:
-        return "incomplete"
-    return "ok"
+    return _worst_reconcile_status(
+        cycle.get("reconcile_status") for cycle in cycles
+    )
 
 
 def _decode_cursor(cursor):
     if cursor is None:
         return None
     try:
-        encoded = str(cursor).encode("ascii")
+        cursor_text = str(cursor)
+        if (
+            not 1 <= len(cursor_text) <= _MAX_HISTORY_CURSOR_LENGTH
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                for character in cursor_text
+            )
+        ):
+            raise ValueError
+        encoded = cursor_text.encode("ascii")
         encoded += b"=" * (-len(encoded) % 4)
         value = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
         if (
             not isinstance(value, dict)
-            or value.get("version") != 1
-            or not isinstance(value.get("after"), list)
-            or len(value["after"]) != 3
-            or not all(isinstance(item, str) for item in value["after"])
-            or not isinstance(value.get("as_of"), dict)
-            or set(value["as_of"]) != {
-                "fills",
-                "income",
-                "position_trades",
-                "orders",
-            }
-            or not all(
-                isinstance(item, int) and not isinstance(item, bool) and item >= 0
-                for item in value["as_of"].values()
-            )
+            or set(value) != {"version", "snapshot_id", "offset", "signature"}
+            or value.get("version") != 2
+            or not isinstance(value.get("snapshot_id"), str)
+            or len(value["snapshot_id"]) != 32
+            or any(character not in "0123456789abcdef" for character in value["snapshot_id"])
+            or not isinstance(value.get("offset"), int)
+            or isinstance(value["offset"], bool)
+            or not 1 <= value["offset"] <= 100000
+            or not isinstance(value.get("signature"), str)
+            or len(value["signature"]) != 64
+            or any(character not in "0123456789abcdef" for character in value["signature"])
         ):
             raise ValueError
-        return tuple(value["after"]), value["as_of"]
+        return value
     except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("invalid_history_cursor") from None
 
 
-def _encode_cursor(row, watermarks):
+def _cursor_signature(cursor_secret, snapshot_id, offset):
+    message = f"{snapshot_id}:{int(offset)}".encode("ascii")
+    return hmac.new(
+        str(cursor_secret).encode("ascii"), message, hashlib.sha256
+    ).hexdigest()
+
+
+def _encode_cursor(snapshot_id, offset, cursor_secret):
     value = {
-        "version": 1,
-        "as_of": watermarks,
-        "after": [str(row["exit_time"] or ""), row["symbol"], row["side"]],
+        "version": 2,
+        "snapshot_id": snapshot_id,
+        "offset": int(offset),
+        "signature": _cursor_signature(cursor_secret, snapshot_id, offset),
     }
     return base64.urlsafe_b64encode(
         json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
     ).decode().rstrip("=")
+
+
+def _history_query_hash(account_id, symbol, direction, source, from_time, to_time):
+    value = [
+        int(account_id),
+        str(symbol or "").upper(),
+        str(direction or ""),
+        str(source or ""),
+        str(from_time or ""),
+        str(to_time or ""),
+    ]
+    return hashlib.sha256(
+        json.dumps(value, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _legacy_cycle_identity(item):
@@ -706,12 +748,184 @@ def _legacy_cycle_identity(item):
     return ("row", account_id, int(item.get("id") or 0))
 
 
+def _legacy_trade_evidence(item):
+    evidence = set()
+
+    def add(prefix, value):
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                add(prefix, nested)
+            return
+        text = str(value or "").strip()
+        if not text:
+            return
+        if text.startswith("["):
+            try:
+                add(prefix, json.loads(text))
+                return
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        for part in text.split(","):
+            normalized = _normalized_trade_id(part.strip())
+            if normalized:
+                evidence.add((prefix, normalized))
+
+    def walk(value, depth=0):
+        if depth > 6:
+            return
+        if isinstance(value, list):
+            for nested in value:
+                walk(nested, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        for key, nested in value.items():
+            normalized_key = str(key).replace("_", "").lower()
+            if normalized_key in {"tradeid", "tradeids"}:
+                add("trade", nested)
+            elif normalized_key in {"fillid", "fillids"}:
+                add("fill", nested)
+            elif normalized_key in {"incomeid", "incomeids"}:
+                add("income", nested)
+            elif isinstance(nested, (dict, list)):
+                walk(nested, depth + 1)
+
+    try:
+        payload = json.loads(item.get("raw_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = []
+    walk(payload)
+    return frozenset(evidence)
+
+
+def _legacy_trade_count(item, evidence):
+    counts = [int(item.get("income_count") or 0), len(evidence)]
+    try:
+        payload = json.loads(item.get("raw_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = []
+    values = payload if isinstance(payload, list) else [payload]
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key in ("trade_count", "tradeCount", "income_count", "incomeCount"):
+            try:
+                counts.append(int(value.get(key) or 0))
+            except (TypeError, ValueError):
+                pass
+    return max(counts)
+
+
+def _legacy_rows_share_cycle(left, right, left_evidence, right_evidence):
+    if (
+        int(left.get("account_id") or 0),
+        str(left.get("symbol") or "").upper(),
+        str(left.get("side") or "").upper(),
+    ) != (
+        int(right.get("account_id") or 0),
+        str(right.get("symbol") or "").upper(),
+        str(right.get("side") or "").upper(),
+    ):
+        return False
+    if left_evidence and right_evidence and left_evidence & right_evidence:
+        return True
+    left_entry = str(left.get("entry_time") or "")
+    left_exit = str(left.get("exit_time") or "")
+    right_entry = str(right.get("entry_time") or "")
+    right_exit = str(right.get("exit_time") or "")
+    return bool(
+        left_entry
+        and left_exit
+        and right_entry
+        and right_exit
+        and max(left_entry, right_entry) < min(left_exit, right_exit)
+    )
+
+
+def _select_legacy_snapshot(rows):
+    if len(rows) == 1:
+        return rows[0]
+    semantic_identities = {_legacy_cycle_identity(row) for row in rows}
+    evidence = {id(row): _legacy_trade_evidence(row) for row in rows}
+    counts = {
+        id(row): _legacy_trade_count(row, evidence[id(row)])
+        for row in rows
+    }
+    best = max(
+        rows,
+        key=lambda row: (
+            len(evidence[id(row)]),
+            counts[id(row)],
+            str(row.get("exit_time") or ""),
+            sum(
+                row.get(field) not in (None, "")
+                for field in ("quantity", "entry_price", "exit_price", "net_pnl")
+            ),
+            int(row.get("id") or 0),
+        ),
+    )
+    evidence_sets = [evidence[id(row)] for row in rows if evidence[id(row)]]
+    evidence_is_chain = all(
+        left <= right or right <= left
+        for index, left in enumerate(evidence_sets)
+        for right in evidence_sets[index + 1:]
+    )
+    best_is_complete = all(
+        current <= evidence[id(best)] for current in evidence_sets
+    )
+    count_values = [counts[id(row)] for row in rows]
+    unique_highest_count = (
+        count_values.count(max(count_values)) == 1
+        and counts[id(best)] == max(count_values)
+    )
+    reliable = (
+        len(semantic_identities) == 1
+        or bool(evidence_sets) and evidence_is_chain and best_is_complete
+        or not evidence_sets and unique_highest_count
+    )
+    selected = dict(best)
+    selected["_legacy_values_reliable"] = reliable
+    return selected
+
+
 def _deduplicate_legacy_rows(rows):
-    unique = {}
+    exact = {}
     for original in rows:
         row = dict(original)
-        unique.setdefault(_legacy_cycle_identity(row), row)
-    return list(unique.values())
+        exact.setdefault(
+            (_legacy_cycle_identity(row), row.get("raw_json") or ""),
+            row,
+        )
+    candidates = list(exact.values())
+    evidence = [_legacy_trade_evidence(row) for row in candidates]
+    parents = list(range(len(candidates)))
+
+    def find(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left, right):
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left_index, left in enumerate(candidates):
+        for right_index in range(left_index + 1, len(candidates)):
+            if _legacy_rows_share_cycle(
+                left,
+                candidates[right_index],
+                evidence[left_index],
+                evidence[right_index],
+            ):
+                union(left_index, right_index)
+
+    grouped = {}
+    for index, row in enumerate(candidates):
+        grouped.setdefault(find(index), []).append(row)
+    return [_select_legacy_snapshot(items) for items in grouped.values()]
 
 
 def _fallback_cycles(rows, direction=None, source=None, from_time=None, to_time=None):
@@ -732,10 +946,11 @@ def _fallback_cycles(rows, direction=None, source=None, from_time=None, to_time=
             to_time is not None and exit_time > to_time
         ):
             continue
-        quantity = _positive_number(item.get("quantity"))
-        entry_price = _positive_number(item.get("entry_price"))
-        exit_price = _positive_number(item.get("exit_price"))
-        pnl = _optional_number(item.get("net_pnl"))
+        values_reliable = item.get("_legacy_values_reliable", True)
+        quantity = _positive_number(item.get("quantity")) if values_reliable else None
+        entry_price = _positive_number(item.get("entry_price")) if values_reliable else None
+        exit_price = _positive_number(item.get("exit_price")) if values_reliable else None
+        pnl = _optional_number(item.get("net_pnl")) if values_reliable else None
         cycles.append(
             {
                 "account_id": int(item["account_id"]),
@@ -777,60 +992,101 @@ def fetch_trade_history_summaries(
     source = str(source) if source else None
     from_time = str(from_time) if from_time else None
     to_time = str(to_time) if to_time else None
+    query_hash = _history_query_hash(
+        account_id, symbol, direction, source, from_time, to_time
+    )
     cursor_data = _decode_cursor(cursor)
-    if cursor_data is None:
-        cursor_value = None
-        watermarks = None
-    else:
-        cursor_value, watermarks = cursor_data
-
-    snapshot = db.fetch_trade_history_snapshot(
-        account_id, symbol=symbol, watermarks=watermarks
-    )
-    watermarks = snapshot["watermarks"]
-    fills = snapshot["fills"]
-    income_rows = snapshot["income"]
-    legacy_rows = snapshot["position_trades"]
-    orders = snapshot["orders"]
-
-    fill_cycles = reconstruct_position_cycles(fills)
-    legacy_cycles = _fallback_cycles(legacy_rows)
-    _recover_cycle_sources(fill_cycles, legacy_cycles, orders)
-    _allocate_income(fill_cycles, income_rows)
-
-    selected_fill_cycles = [
-        cycle for cycle in fill_cycles
-        if _cycle_matches(cycle, direction, source, from_time, to_time)
-    ]
-    selected_legacy_cycles = [
-        cycle for cycle in legacy_cycles
-        if not any(
-            _cycle_is_covered(cycle, fill_cycle)
-            for fill_cycle in fill_cycles
+    if cursor_data is not None:
+        stored = db.fetch_trade_history_page_snapshot(
+            account_id, cursor_data["snapshot_id"], query_hash
         )
-        and _cycle_matches(cycle, direction, source, from_time, to_time)
-    ]
-    cycles = selected_fill_cycles + selected_legacy_cycles
-    reconcile_status = _reconcile_status(cycles)
+        if stored is None or not hmac.compare_digest(
+            cursor_data["signature"],
+            _cursor_signature(
+                stored["cursor_secret"],
+                cursor_data["snapshot_id"],
+                cursor_data["offset"],
+            ),
+        ):
+            raise ValueError("invalid_history_cursor")
+        payload = stored["payload"]
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("summaries"), list)
+            or not isinstance(payload.get("stats"), dict)
+            or payload.get("reconcile_status") not in {
+                "ok", "incomplete", "mismatch"
+            }
+        ):
+            raise ValueError("invalid_history_cursor")
+        summaries = payload["summaries"]
+        stats = payload["stats"]
+        reconcile_status = payload["reconcile_status"]
+        offset = cursor_data["offset"]
+        snapshot_identity = {
+            "snapshot_id": cursor_data["snapshot_id"],
+            "cursor_secret": stored["cursor_secret"],
+        }
+    else:
+        snapshot = db.fetch_trade_history_snapshot(account_id, symbol=symbol)
+        fills = snapshot["fills"]
+        income_rows = snapshot["income"]
+        legacy_rows = snapshot["position_trades"]
+        orders = snapshot["orders"]
 
-    summaries = _summary_from_cycles(cycles)
-    summaries.sort(
-        key=lambda row: (str(row["exit_time"] or ""), row["symbol"], row["side"]),
-        reverse=True,
-    )
-    if cursor_value is not None:
-        summaries = [
-            row for row in summaries
-            if (str(row["exit_time"] or ""), row["symbol"], row["side"]) < cursor_value
+        fill_cycles = reconstruct_position_cycles(fills)
+        legacy_cycles = _fallback_cycles(legacy_rows)
+        _recover_cycle_sources(fill_cycles, legacy_cycles, orders)
+        _allocate_income(fill_cycles, income_rows)
+
+        selected_fill_cycles = [
+            cycle for cycle in fill_cycles
+            if _cycle_matches(cycle, direction, source, from_time, to_time)
         ]
-    items = summaries[:limit]
+        selected_legacy_cycles = [
+            cycle for cycle in legacy_cycles
+            if not any(
+                _cycle_is_covered(cycle, fill_cycle)
+                for fill_cycle in fill_cycles
+            )
+            and _cycle_matches(cycle, direction, source, from_time, to_time)
+        ]
+        cycles = selected_fill_cycles + selected_legacy_cycles
+        reconcile_status = _reconcile_status(cycles)
+        stats = _stats_from_cycles(cycles)
+        summaries = _summary_from_cycles(cycles)
+        summaries.sort(
+            key=lambda row: (
+                str(row["exit_time"] or ""), row["symbol"], row["side"]
+            ),
+            reverse=True,
+        )
+        offset = 0
+        snapshot_identity = None
+
+    page_end = offset + limit
+    items = summaries[offset:page_end]
+    if page_end < len(summaries) and snapshot_identity is None:
+        snapshot_identity = db.save_trade_history_page_snapshot(
+            account_id,
+            query_hash,
+            {
+                "summaries": summaries,
+                "stats": stats,
+                "reconcile_status": reconcile_status,
+            },
+        )
     return {
         "items": items,
         "next_cursor": (
-            _encode_cursor(items[-1], watermarks)
-            if len(summaries) > len(items)
+            _encode_cursor(
+                snapshot_identity["snapshot_id"],
+                page_end,
+                snapshot_identity["cursor_secret"],
+            )
+            if page_end < len(summaries)
             else None
         ),
-        "stats": _stats_from_cycles(cycles),
+        "stats": stats,
         "reconcile_status": reconcile_status,
     }
