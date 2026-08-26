@@ -150,6 +150,11 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.main = main
         self.original_runtime_snapshot = dict(main._runtime_status_snapshot)
         self.original_runtime_refresh_task = main._runtime_status_refresh_task
+        self.original_runtime_refresh_future = getattr(
+            main,
+            "_runtime_status_refresh_future",
+            None,
+        )
         main._runtime_status_snapshot.clear()
         main._runtime_status_snapshot.update({
             "data": None,
@@ -157,6 +162,7 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
             "last_error": None,
         })
         main._runtime_status_refresh_task = None
+        main._runtime_status_refresh_future = None
         self.original_db_path = db.DB_PATH
         self.temp = tempfile.TemporaryDirectory()
         db.DB_PATH = os.path.join(self.temp.name, "trading-api.db")
@@ -220,9 +226,13 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         task = self.main._runtime_status_refresh_task
         if task is not None and not task.done():
             task.cancel()
+        worker_future = self.main._runtime_status_refresh_future
+        if worker_future is not None and not worker_future.done():
+            worker_future.result(timeout=2)
         self.main._runtime_status_snapshot.clear()
         self.main._runtime_status_snapshot.update(self.original_runtime_snapshot)
         self.main._runtime_status_refresh_task = self.original_runtime_refresh_task
+        self.main._runtime_status_refresh_future = self.original_runtime_refresh_future
         db.DB_PATH = self.original_db_path
         self.temp.cleanup()
 
@@ -522,6 +532,9 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
                     "/api/trading/runtime/status"
                 )
             )
+            worker_future = self.main._runtime_status_refresh_future
+            self.assertIsNotNone(worker_future)
+            worker_future.result(timeout=2)
 
         self.assertEqual(slow.status_code, 200)
         self.assertEqual(snapshot.status_code, 200)
@@ -744,12 +757,18 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
             "_runtime_status_refresh_task",
             None,
         )
+        self.original_refresh_future = getattr(
+            main,
+            "_runtime_status_refresh_future",
+            None,
+        )
         main._runtime_status_snapshot = {
             "data": None,
             "time": 0.0,
             "last_error": None,
         }
         main._runtime_status_refresh_task = None
+        main._runtime_status_refresh_future = None
 
     async def asyncTearDown(self):
         task = self.main._runtime_status_refresh_task
@@ -759,6 +778,7 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
                 await task
         self.main._runtime_status_snapshot = self.original_snapshot
         self.main._runtime_status_refresh_task = self.original_refresh_task
+        self.main._runtime_status_refresh_future = self.original_refresh_future
 
     async def test_stale_snapshot_returns_before_slow_background_refresh(self):
         old_data = {
@@ -925,11 +945,13 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker_threads[0], worker_threads[1])
         self.assertNotEqual(worker_threads[0], event_loop_thread)
 
-    async def test_shutdown_cancels_and_clears_runtime_refresh_task(self):
+    async def test_shutdown_keeps_worker_owned_until_runtime_build_finishes(self):
         entered = threading.Event()
         release = threading.Event()
+        calls = []
 
         def blocked_payload():
+            calls.append(threading.get_ident())
             entered.set()
             release.wait(timeout=2)
             return {"trading_controls": {}, "accounts": []}
@@ -942,7 +964,32 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
             ):
                 task = self.main._ensure_trading_runtime_status_refresh()
                 self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                worker_future = self.main._runtime_status_refresh_future
                 await self.main.shutdown_runtime_status_refresh()
+
+                self.assertTrue(task.cancelled())
+                self.assertIsNone(self.main._runtime_status_refresh_task)
+                self.assertIs(
+                    self.main._runtime_status_refresh_future,
+                    worker_future,
+                )
+                self.assertFalse(worker_future.done())
+
+                await self.main.get_trading_runtime_status(
+                    Response(),
+                    user="viewer",
+                )
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(calls), 1)
+
+                release.set()
+                await asyncio.wrap_future(worker_future)
+                await asyncio.sleep(0)
+                self.assertIsNone(self.main._runtime_status_refresh_future)
+
+                next_refresh = self.main._ensure_trading_runtime_status_refresh()
+                await next_refresh
+                self.assertEqual(len(calls), 2)
         finally:
             release.set()
 
@@ -950,52 +997,91 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
             self.main.shutdown_runtime_status_refresh,
             self.main.app.router.on_shutdown,
         )
-        self.assertTrue(task.cancelled())
-        self.assertIsNone(self.main._runtime_status_refresh_task)
 
-    async def test_new_event_loop_does_not_reuse_foreign_refresh_task(self):
+    async def test_foreign_shutdown_does_not_release_active_runtime_worker(self):
         ready = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
         owner_state = {}
+        calls = []
+
+        def blocked_payload():
+            calls.append(threading.get_ident())
+            entered.set()
+            release.wait(timeout=2)
+            return {"trading_controls": {}, "accounts": []}
 
         def run_owner_loop():
             loop = asyncio.new_event_loop()
 
-            async def wait_forever():
-                await asyncio.Event().wait()
+            def start_refresh():
+                task = self.main._ensure_trading_runtime_status_refresh()
+                owner_state.update({"loop": loop, "task": task})
+                ready.set()
 
-            task = loop.create_task(wait_forever())
-            owner_state.update({"loop": loop, "task": task})
-            ready.set()
+            loop.call_soon(start_refresh)
             try:
                 loop.run_forever()
             finally:
-                if not task.done():
+                task = owner_state.get("task")
+                if task is not None and not task.done():
                     task.cancel()
-                loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+                    loop.run_until_complete(
+                        asyncio.gather(task, return_exceptions=True)
+                    )
                 loop.close()
 
         owner_thread = threading.Thread(target=run_owner_loop)
-        owner_thread.start()
-        self.assertTrue(await asyncio.to_thread(ready.wait, 1))
-        owner_loop = owner_state["loop"]
-        foreign_task = owner_state["task"]
-        self.main._runtime_status_refresh_task = foreign_task
-
         try:
             with patch.object(
                 self.main,
                 "_trading_runtime_status_payload",
-                return_value={"trading_controls": {}, "accounts": []},
+                side_effect=blocked_payload,
             ):
+                owner_thread.start()
+                self.assertTrue(await asyncio.to_thread(ready.wait, 1))
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                owner_loop = owner_state["loop"]
+                foreign_task = owner_state["task"]
+
+                started = time.perf_counter()
+                await self.main.shutdown_runtime_status_refresh()
+                self.assertLess(time.perf_counter() - started, 0.05)
+
+                await self.main.get_trading_runtime_status(
+                    Response(),
+                    user="viewer",
+                )
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(calls), 1)
+                self.assertIs(
+                    self.main._runtime_status_refresh_task,
+                    foreign_task,
+                )
+                worker_future = self.main._runtime_status_refresh_future
+                self.assertIsNotNone(worker_future)
+                self.assertFalse(worker_future.done())
+
+                release.set()
+                await asyncio.wrap_future(worker_future)
+                for _ in range(20):
+                    if self.main._runtime_status_refresh_future is None:
+                        break
+                    await asyncio.sleep(0)
+                self.assertIsNone(self.main._runtime_status_refresh_future)
+
                 replacement = self.main._ensure_trading_runtime_status_refresh()
                 self.assertIsNot(replacement, foreign_task)
                 self.assertIs(replacement.get_loop(), asyncio.get_running_loop())
                 await replacement
+                self.assertEqual(len(calls), 2)
         finally:
-            owner_loop.call_soon_threadsafe(owner_loop.stop)
-            await asyncio.to_thread(owner_thread.join, 1)
-            if self.main._runtime_status_refresh_task is foreign_task:
-                self.main._runtime_status_refresh_task = None
+            release.set()
+            owner_loop = owner_state.get("loop")
+            if owner_loop is not None and owner_loop.is_running():
+                owner_loop.call_soon_threadsafe(owner_loop.stop)
+            if owner_thread.is_alive():
+                await asyncio.to_thread(owner_thread.join, 1)
 
         self.assertFalse(owner_thread.is_alive())
 

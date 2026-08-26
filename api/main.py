@@ -3,6 +3,8 @@ import asyncio
 import hmac
 import logging
 import os, sys, json, time
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from typing import Annotated
@@ -221,6 +223,12 @@ _account_status_refresh_task = None
 _account_status_refresher_task = None
 _runtime_status_snapshot = {"data": None, "time": 0.0, "last_error": None}
 _runtime_status_refresh_task = None
+_runtime_status_refresh_future = None
+_runtime_status_refresh_lock = threading.Lock()
+_runtime_status_refresh_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="runtime-status-refresh",
+)
 
 
 _SCAN_CACHE_TTL = 5
@@ -2055,10 +2063,9 @@ def _trading_runtime_status_payload() -> dict:
     }
 
 
-async def _run_trading_runtime_status_refresh() -> dict:
-    global _runtime_status_refresh_task
+def _build_trading_runtime_status_snapshot() -> dict:
     try:
-        data = await asyncio.to_thread(_trading_runtime_status_payload)
+        data = _trading_runtime_status_payload()
         snapshot_at = time.time()
         _runtime_status_snapshot.update({
             "data": data,
@@ -2073,31 +2080,55 @@ async def _run_trading_runtime_status_refresh() -> dict:
             "trading_controls": {},
             "accounts": [],
         }
+
+
+def _release_trading_runtime_status_worker(future: Future) -> None:
+    global _runtime_status_refresh_future
+    with _runtime_status_refresh_lock:
+        if _runtime_status_refresh_future is future:
+            _runtime_status_refresh_future = None
+
+
+def _ensure_trading_runtime_status_worker() -> tuple[Future, bool]:
+    global _runtime_status_refresh_future
+    with _runtime_status_refresh_lock:
+        future = _runtime_status_refresh_future
+        if future is not None and not future.done():
+            return future, False
+        future = _runtime_status_refresh_executor.submit(
+            _build_trading_runtime_status_snapshot
+        )
+        _runtime_status_refresh_future = future
+    future.add_done_callback(_release_trading_runtime_status_worker)
+    return future, True
+
+
+async def _await_trading_runtime_status_refresh(future: Future) -> dict:
+    global _runtime_status_refresh_task
+    try:
+        return await asyncio.wrap_future(future)
     finally:
         if asyncio.current_task() is _runtime_status_refresh_task:
             _runtime_status_refresh_task = None
 
 
-def _cancel_trading_runtime_status_refresh(task: asyncio.Task) -> None:
-    if task.done():
-        return
-    owner_loop = task.get_loop()
-    if owner_loop.is_running():
-        owner_loop.call_soon_threadsafe(task.cancel)
-    elif not owner_loop.is_closed():
-        task.cancel()
+async def _run_trading_runtime_status_refresh() -> dict:
+    future, _ = _ensure_trading_runtime_status_worker()
+    return await _await_trading_runtime_status_refresh(future)
 
 
-def _ensure_trading_runtime_status_refresh() -> asyncio.Task:
+def _ensure_trading_runtime_status_refresh() -> asyncio.Task | None:
     global _runtime_status_refresh_task
     current_loop = asyncio.get_running_loop()
+    future, worker_started = _ensure_trading_runtime_status_worker()
     task = _runtime_status_refresh_task
     if task is not None and not task.done():
         if task.get_loop() is current_loop:
             return task
-        _cancel_trading_runtime_status_refresh(task)
+        if not worker_started:
+            return None
     _runtime_status_refresh_task = current_loop.create_task(
-        _run_trading_runtime_status_refresh()
+        _await_trading_runtime_status_refresh(future)
     )
     return _runtime_status_refresh_task
 
@@ -2107,15 +2138,14 @@ async def _shutdown_trading_runtime_status_refresh() -> None:
     task = _runtime_status_refresh_task
     if task is None:
         return
-    if task.get_loop() is asyncio.get_running_loop():
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    else:
-        _cancel_trading_runtime_status_refresh(task)
+    if task.get_loop() is not asyncio.get_running_loop():
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     if _runtime_status_refresh_task is task:
         _runtime_status_refresh_task = None
 
