@@ -24,10 +24,10 @@ class StructureRiskStopTest(unittest.TestCase):
         self.assertEqual(result["stop_model"], "structure_atr_1r")
         self.assertAlmostEqual(result["stop_pct"], 0.06, places=6)
         self.assertAlmostEqual(result["stop_loss"], 6.0, places=6)
-        self.assertAlmostEqual(result["risk_budget"], 15.0, places=6)
-        self.assertLessEqual(result["position_value"] * result["stop_pct"], 15.0)
+        self.assertAlmostEqual(result["risk_budget"], 22.5, places=6)
+        self.assertLessEqual(result["position_value"] * result["stop_pct"], 22.5)
 
-    def test_normal_exchange_stop_uses_atr_structure_and_half_percent_risk(self):
+    def test_normal_exchange_stop_uses_atr_structure_and_three_quarter_percent_risk(self):
         with patch("trader.risk._dynamic_leverage", return_value=3):
             result = calculate_position(
                 FixedAtrExchange(), "AAVEUSDT", 100.0, 5000.0,
@@ -37,8 +37,8 @@ class StructureRiskStopTest(unittest.TestCase):
         self.assertEqual(result["stop_model"], "structure_atr_1r")
         self.assertAlmostEqual(result["stop_pct"], 0.05, places=6)
         self.assertAlmostEqual(result["stop_loss"], 5.0, places=6)
-        self.assertAlmostEqual(result["risk_budget"], 25.0, places=6)
-        self.assertLessEqual(result["position_value"] * result["stop_pct"], 25.0)
+        self.assertAlmostEqual(result["risk_budget"], 37.5, places=6)
+        self.assertLessEqual(result["position_value"] * result["stop_pct"], 37.5)
 
     def test_bluechip_closes_when_price_crosses_recorded_structure_stop(self):
         engine = ExecutionEngine(FixedAtrExchange())
