@@ -141,7 +141,17 @@ button:disabled {
   font-weight: 700;
 }
 
-.terminal-status.degraded { color: #fbbf24; border-color: #92400e; }
+.trading-env-status.degraded {
+  color: #fcd34d;
+  border-color: #a16207;
+  background: rgba(69, 45, 12, 0.85);
+}
+
+.trading-env-status.degraded .live-dot {
+  background: #f59e0b;
+  box-shadow: none;
+  animation: none;
+}
 .account-manager-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .account-manager-head h3 { margin-bottom: 4px; }
 .account-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }

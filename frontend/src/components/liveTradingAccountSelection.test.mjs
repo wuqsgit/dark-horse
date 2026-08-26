@@ -15,6 +15,17 @@ const environmentStatusSource = readFileSync(
   new URL('./TradingEnvironmentStatus.jsx', import.meta.url),
   'utf8',
 );
+const stylesSource = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 const accounts = [
   { account_id: 3, account_name: '账户A' },
@@ -49,6 +60,23 @@ test('environment display degrades stale and failed snapshots', () => {
   );
 });
 
+test('degraded environment status removes the green container and live-dot treatment', () => {
+  assert.match(environmentStatusSource, /terminal-status trading-env-status/);
+
+  const containerRule = stylesSource.match(/\.trading-env-status\.degraded\s*\{([^}]*)\}/);
+  assert.ok(containerRule, 'expected an explicit degraded environment container rule');
+  assert.match(containerRule[1], /color:\s*#fcd34d;/);
+  assert.match(containerRule[1], /border-color:\s*#a16207;/);
+  assert.match(containerRule[1], /background:\s*rgba\(69, 45, 12, 0\.85\);/);
+
+  const dotRule = stylesSource.match(/\.trading-env-status\.degraded \.live-dot\s*\{([^}]*)\}/);
+  assert.ok(dotRule, 'expected a degraded environment live-dot override');
+  assert.match(dotRule[1], /background:\s*#f59e0b;/);
+  assert.match(dotRule[1], /box-shadow:\s*none;/);
+  assert.match(dotRule[1], /animation:\s*none;/);
+  assert.doesNotMatch(dotRule[1], /var\(--green\)|pulseDot/);
+});
+
 test('strategy source label uses distinct row sources and supports mixed history', () => {
   assert.equal(typeof tradingSelection.strategySourcesLabel, 'function');
   assert.equal(tradingSelection.strategySourcesLabel(['normal', 'normal']), '普通策略');
@@ -76,9 +104,23 @@ test('history cursor transitions can recover from a failed next cursor', () => {
   assert.deepEqual(tradingSelection.retreatHistoryNavigation(failedNextPage), firstPage);
 });
 
-test('empty account-scoped state clears history decisions errors and loading', () => {
-  assert.equal(typeof tradingSelection.emptyAccountScopedTradingState, 'function');
-  assert.deepEqual(tradingSelection.emptyAccountScopedTradingState('no-account'), {
+test('populated account-scoped state resets immediately when the account becomes null', () => {
+  assert.equal(typeof tradingSelection.resetAccountScopedTradingState, 'function');
+  const populated = {
+    historyPage: { items: [{ id: 1 }], next_cursor: 'next', stats: { total: 8 } },
+    historyNavigation: {
+      queryKey: 'account-3',
+      cursor: 'cursor-2',
+      historyCursorStack: [null, 'cursor-1'],
+    },
+    historyError: 'old error',
+    historyLoading: true,
+    decisionsData: { recent: [{ id: 2 }] },
+    decisionsError: 'decision error',
+    decisionsLoading: true,
+  };
+
+  assert.deepEqual(tradingSelection.resetAccountScopedTradingState(populated, 'no-account'), {
     historyPage: { items: [], next_cursor: null, stats: {} },
     historyNavigation: {
       queryKey: 'no-account',
@@ -93,22 +135,93 @@ test('empty account-scoped state clears history decisions errors and loading', (
   });
 });
 
-test('latest request generation rejects stale completion and survives overlap attempts', () => {
-  assert.equal(typeof tradingSelection.startLatestRequest, 'function');
-  assert.equal(typeof tradingSelection.isLatestRequest, 'function');
-  assert.equal(typeof tradingSelection.finishLatestRequest, 'function');
-  assert.equal(typeof tradingSelection.invalidateLatestRequest, 'function');
+test('initial resources invoke snapshot callbacks without waiting for deferred peers', async () => {
+  assert.equal(typeof tradingSelection.settleIndependentLoads, 'function');
+  const accountsLoad = deferred();
+  const snapshotLoad = deferred();
+  const runtimeLoad = deferred();
+  const calls = [];
 
-  const first = tradingSelection.startLatestRequest({ generation: 0, inFlight: false });
-  const second = tradingSelection.startLatestRequest(first);
-  assert.equal(tradingSelection.isLatestRequest(second, first.generation), false);
-  assert.equal(tradingSelection.isLatestRequest(second, second.generation), true);
-  assert.deepEqual(tradingSelection.finishLatestRequest(second, first.generation), second);
-  assert.equal(tradingSelection.finishLatestRequest(second, second.generation).inFlight, false);
+  const loads = tradingSelection.settleIndependentLoads({
+    accounts: () => accountsLoad.promise,
+    snapshot: () => snapshotLoad.promise,
+    runtime: () => runtimeLoad.promise,
+  }, {
+    accounts: { onFulfilled: () => calls.push('accounts') },
+    snapshot: {
+      onFulfilled: (value) => calls.push(`snapshot:${value.fresh}`),
+      onSettled: () => calls.push('snapshot-settled'),
+    },
+    runtime: { onFulfilled: () => calls.push('runtime') },
+  });
 
-  const invalidated = tradingSelection.invalidateLatestRequest(second);
-  assert.equal(invalidated.inFlight, false);
-  assert.equal(tradingSelection.isLatestRequest(invalidated, second.generation), false);
+  snapshotLoad.resolve({ fresh: true });
+  await loads.snapshot;
+  assert.deepEqual(calls, ['snapshot:true', 'snapshot-settled']);
+
+  accountsLoad.resolve({ accounts: [] });
+  runtimeLoad.resolve({ accounts: [] });
+  await Promise.all([loads.accounts, loads.runtime]);
+  assert.deepEqual(calls, ['snapshot:true', 'snapshot-settled', 'accounts', 'runtime']);
+});
+
+test('runtime controller suppresses overlap and stale completion cannot overwrite', async () => {
+  assert.equal(typeof tradingSelection.createSingleFlightRequest, 'function');
+  const requests = [];
+  const applied = [];
+  const controller = tradingSelection.createSingleFlightRequest(({ signal }) => {
+    const request = deferred();
+    requests.push({ ...request, signal });
+    return request.promise;
+  });
+
+  const first = controller.run({ onSuccess: (value) => applied.push(value) });
+  const suppressed = controller.run({ onSuccess: () => applied.push('overlap') });
+  assert.strictEqual(suppressed, first);
+  assert.equal(requests.length, 1);
+  assert.equal(controller.inFlight, true);
+
+  controller.invalidate();
+  assert.equal(requests[0].signal.aborted, true);
+  const latest = controller.run({ onSuccess: (value) => applied.push(value) });
+  assert.equal(requests.length, 2);
+
+  requests[0].resolve('stale');
+  await first;
+  assert.deepEqual(applied, []);
+  assert.equal(controller.inFlight, true);
+
+  requests[1].resolve('latest');
+  await latest;
+  assert.deepEqual(applied, ['latest']);
+  assert.equal(controller.inFlight, false);
+});
+
+test('history failure transition retains rows stats and cursor for retry recovery', () => {
+  assert.equal(typeof tradingSelection.historyFailureTransition, 'function');
+  const historyPage = {
+    items: [{ trade_id: 7 }],
+    next_cursor: 'cursor-3',
+    stats: { total_trades: 22, total_pnl: 18.5 },
+  };
+  const historyNavigation = {
+    queryKey: 'account-3',
+    cursor: 'cursor-2',
+    historyCursorStack: [null, 'cursor-1'],
+  };
+  const failed = tradingSelection.historyFailureTransition({
+    historyPage,
+    historyNavigation,
+    historyError: null,
+    historyLoading: true,
+    retryable: false,
+  }, '历史交易加载失败：timeout');
+
+  assert.strictEqual(failed.historyPage, historyPage);
+  assert.strictEqual(failed.historyNavigation, historyNavigation);
+  assert.equal(failed.historyError, '历史交易加载失败：timeout');
+  assert.equal(failed.historyLoading, false);
+  assert.equal(failed.retryable, true);
 });
 
 test('live trading consumers use only the split trading data client', () => {
@@ -131,6 +244,10 @@ test('components wire the tested environment and strategy source helpers', () =>
   assert.match(environmentStatusSource, /tradingEnvironmentDisplay\(data\)/);
   assert.match(environmentStatusSource, /display\.degraded/);
   assert.match(liveTradingSource, /strategySourcesLabel\(t\.strategy_sources\)/);
+  assert.match(liveTradingSource, /settleIndependentLoads\(/);
+  assert.match(liveTradingSource, /createSingleFlightRequest\(/);
+  assert.match(liveTradingSource, /historyFailureTransition\(/);
+  assert.match(liveTradingSource, /resetAccountScopedTradingState\(/);
   assert.doesNotMatch(
     liveTradingSource,
     /sourceText\(t\.strategy_source \|\| \(tradeFilter/,
@@ -150,15 +267,10 @@ test('live trading polls only account snapshots and runtime status', () => {
 });
 
 test('live trading settles initial resources independently and snapshot controls loading', () => {
-  assert.doesNotMatch(liveTradingSource, /Promise\.allSettled\(\[initialAccounts/);
-  assert.match(
-    liveTradingSource,
-    /fetchTradingAccountsStatus\(\)[\s\S]*?\.finally\(\(\) => \{ if \(active\) setLoading\(false\); \}\)/,
-  );
-  assert.match(liveTradingSource, /const loadRuntimeStatus = useCallback/);
-  assert.match(liveTradingSource, /runtimeRequestRef\.current\.inFlight/);
-  assert.match(liveTradingSource, /isLatestRequest\(/);
-  assert.match(liveTradingSource, /invalidateLatestRequest\(/);
+  assert.match(liveTradingSource, /settleIndependentLoads\(\{/);
+  assert.match(liveTradingSource, /snapshot:[\s\S]*?onSettled:[\s\S]*?setLoading\(false\)/);
+  assert.match(liveTradingSource, /runtimeControllerRef\.current\.run\(/);
+  assert.match(liveTradingSource, /runtimeControllerRef\.current\.invalidate\(\)/);
 });
 
 test('live trading clears a fatal snapshot error after a successful refresh', () => {
@@ -205,7 +317,7 @@ test('live trading keeps history recovery controls visible and clears null accou
   assert.match(liveTradingSource, /historyError &&/);
   assert.match(liveTradingSource, /retryHistoryPage/);
   assert.doesNotMatch(liveTradingSource, /: historyError \? \(/);
-  assert.match(liveTradingSource, /emptyAccountScopedTradingState\(historyQueryKey\)/);
+  assert.match(liveTradingSource, /resetAccountScopedTradingState\(/);
   assert.match(liveTradingSource, /setHistoryPage\(emptyState\.historyPage\)/);
   assert.match(liveTradingSource, /setDecisionsData\(emptyState\.decisionsData\)/);
 });

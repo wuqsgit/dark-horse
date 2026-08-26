@@ -69,27 +69,80 @@ export function emptyAccountScopedTradingState(queryKey = null) {
   };
 }
 
-export function startLatestRequest(state = { generation: 0, inFlight: false }) {
+export function resetAccountScopedTradingState(_currentState, queryKey = null) {
+  return emptyAccountScopedTradingState(queryKey);
+}
+
+export function historyFailureTransition(state, historyError) {
   return {
     ...state,
-    generation: Number(state.generation || 0) + 1,
-    inFlight: true,
+    historyError,
+    historyLoading: false,
+    retryable: true,
   };
 }
 
-export function isLatestRequest(state, generation) {
-  return Number(state?.generation) === Number(generation);
+export function settleIndependentLoads(loaders, handlers = {}) {
+  return Object.fromEntries(Object.entries(loaders).map(([key, load]) => {
+    let request;
+    try {
+      request = load();
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    const handler = handlers[key] || {};
+    const promise = Promise.resolve(request)
+      .then(handler.onFulfilled, handler.onRejected)
+      .finally(() => handler.onSettled?.());
+    return [key, promise];
+  }));
 }
 
-export function finishLatestRequest(state, generation) {
-  if (!isLatestRequest(state, generation)) return state;
-  return { ...state, inFlight: false };
-}
+export function createSingleFlightRequest(request) {
+  let generation = 0;
+  let activeRequest = null;
 
-export function invalidateLatestRequest(state = { generation: 0, inFlight: false }) {
   return {
-    ...state,
-    generation: Number(state.generation || 0) + 1,
-    inFlight: false,
+    run(handlers = {}) {
+      if (activeRequest) return activeRequest.promise;
+
+      const requestGeneration = ++generation;
+      const controller = new AbortController();
+      let pendingRequest;
+      try {
+        pendingRequest = request({ signal: controller.signal });
+      } catch (error) {
+        pendingRequest = Promise.reject(error);
+      }
+
+      const promise = Promise.resolve(pendingRequest)
+        .then(
+          (value) => {
+            if (generation === requestGeneration) handlers.onSuccess?.(value);
+            return value;
+          },
+          (error) => {
+            if (generation === requestGeneration && error?.name !== 'AbortError') {
+              handlers.onError?.(error);
+            }
+            return undefined;
+          },
+        )
+        .finally(() => {
+          if (activeRequest?.generation === requestGeneration) activeRequest = null;
+        });
+
+      activeRequest = { generation: requestGeneration, controller, promise };
+      return promise;
+    },
+    invalidate() {
+      generation += 1;
+      const requestToAbort = activeRequest;
+      activeRequest = null;
+      requestToAbort?.controller.abort();
+    },
+    get inFlight() {
+      return Boolean(activeRequest);
+    },
   };
 }

@@ -18,5 +18,5 @@ export default function TradingEnvironmentStatus() {
     const timer = setInterval(load, 30000);
     return () => { active = false; clearInterval(timer); };
   }, []);
-  return <div className={`terminal-status ${display.degraded ? 'degraded' : ''}`}><span className="live-dot" /><span>{display.label}</span></div>;
+  return <div className={`terminal-status trading-env-status ${display.degraded ? 'degraded' : ''}`}><span className="live-dot" /><span>{display.label}</span></div>;
 }

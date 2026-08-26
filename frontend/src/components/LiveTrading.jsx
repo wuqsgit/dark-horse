@@ -10,15 +10,14 @@ import { adminFetch } from '../api/adminFetch';
 import TradingAccountManager from './TradingAccountManager';
 import {
   advanceHistoryNavigation,
+  createSingleFlightRequest,
   createHistoryNavigation,
-  emptyAccountScopedTradingState,
   findSelectedAccount,
-  finishLatestRequest,
-  invalidateLatestRequest,
-  isLatestRequest,
+  historyFailureTransition,
   normalizeSelectedAccount,
+  resetAccountScopedTradingState,
   retreatHistoryNavigation,
-  startLatestRequest,
+  settleIndependentLoads,
   strategySourcesLabel,
 } from './liveTradingAccountSelection';
 
@@ -245,13 +244,12 @@ export default function LiveTrading() {
   const [decisionsData, setDecisionsData] = useState(null);
   const [decisionsLoading, setDecisionsLoading] = useState(false);
   const [decisionsError, setDecisionsError] = useState(null);
-  const mountedRef = useRef(false);
-  const runtimeRequestRef = useRef({
-    generation: 0,
-    inFlight: false,
-    controller: null,
-    promise: null,
-  });
+  const runtimeControllerRef = useRef(null);
+  if (!runtimeControllerRef.current) {
+    runtimeControllerRef.current = createSingleFlightRequest(
+      ({ signal }) => fetchTradingRuntimeStatus({ signal }),
+    );
+  }
 
   const applyAccountSnapshot = useCallback((data) => {
     setAccountsData(data || { accounts: [], summary: {} });
@@ -265,43 +263,15 @@ export default function LiveTrading() {
     }
   }, []);
 
-  const loadRuntimeStatus = useCallback(() => {
-    if (runtimeRequestRef.current.inFlight) return runtimeRequestRef.current.promise;
-    const currentRequest = runtimeRequestRef.current;
-
-    const startedRequest = startLatestRequest(currentRequest);
-    const controller = new AbortController();
-    const generation = startedRequest.generation;
-    const promise = fetchTradingRuntimeStatus({ signal: controller.signal })
-      .then((data) => {
-        if (!mountedRef.current || !isLatestRequest(runtimeRequestRef.current, generation)) return;
-        setRuntimeData(data || { accounts: [] });
-        setRuntimeWarning(null);
-      })
-      .catch((requestError) => {
-        if (
-          mountedRef.current
-          && requestError.name !== 'AbortError'
-          && isLatestRequest(runtimeRequestRef.current, generation)
-        ) {
-          setRuntimeWarning(`运行诊断刷新失败：${requestError.message}`);
-        }
-      })
-      .finally(() => {
-        if (!isLatestRequest(runtimeRequestRef.current, generation)) return;
-        runtimeRequestRef.current = {
-          ...finishLatestRequest(runtimeRequestRef.current, generation),
-          controller: null,
-          promise: null,
-        };
-      });
-    runtimeRequestRef.current = {
-      ...startedRequest,
-      controller,
-      promise,
-    };
-    return promise;
-  }, []);
+  const loadRuntimeStatus = useCallback(() => runtimeControllerRef.current.run({
+    onSuccess: (data) => {
+      setRuntimeData(data || { accounts: [] });
+      setRuntimeWarning(null);
+    },
+    onError: (requestError) => {
+      setRuntimeWarning(`运行诊断刷新失败：${requestError.message}`);
+    },
+  }), []);
 
   const refreshAccountData = useCallback(async () => {
     loadRuntimeStatus();
@@ -324,23 +294,29 @@ export default function LiveTrading() {
 
   useEffect(() => {
     let active = true;
-    mountedRef.current = true;
-    fetchTradingAccounts()
-      .then((data) => {
-        if (!active) return;
-        setAccountConfigs(data.accounts || []);
-        setAccountWarning(null);
-      })
-      .catch((requestError) => {
-        if (active) setAccountWarning(`账户配置加载失败：${requestError.message}`);
-      });
-    fetchTradingAccountsStatus()
-      .then((data) => { if (active) applyAccountSnapshot(data); })
-      .catch((requestError) => {
-        if (active) setError(`加载实盘数据失败: ${requestError.message}`);
-      })
-      .finally(() => { if (active) setLoading(false); });
-    loadRuntimeStatus();
+    settleIndependentLoads({
+      accounts: () => fetchTradingAccounts(),
+      snapshot: () => fetchTradingAccountsStatus(),
+      runtime: () => loadRuntimeStatus(),
+    }, {
+      accounts: {
+        onFulfilled: (data) => {
+          if (!active) return;
+          setAccountConfigs(data.accounts || []);
+          setAccountWarning(null);
+        },
+        onRejected: (requestError) => {
+          if (active) setAccountWarning(`账户配置加载失败：${requestError.message}`);
+        },
+      },
+      snapshot: {
+        onFulfilled: (data) => { if (active) applyAccountSnapshot(data); },
+        onRejected: (requestError) => {
+          if (active) setError(`加载实盘数据失败: ${requestError.message}`);
+        },
+        onSettled: () => { if (active) setLoading(false); },
+      },
+    });
 
     const pollLiveData = () => {
       fetchTradingAccountsStatus({ force: true })
@@ -353,14 +329,8 @@ export default function LiveTrading() {
     const id = setInterval(pollLiveData, 30000);
     return () => {
       active = false;
-      mountedRef.current = false;
       clearInterval(id);
-      runtimeRequestRef.current.controller?.abort();
-      runtimeRequestRef.current = {
-        ...invalidateLatestRequest(runtimeRequestRef.current),
-        controller: null,
-        promise: null,
-      };
+      runtimeControllerRef.current.invalidate();
     };
   }, [applyAccountSnapshot, loadRuntimeStatus]);
 
@@ -387,7 +357,15 @@ export default function LiveTrading() {
 
   useEffect(() => {
     if (selectedAccount !== null && selectedAccount !== undefined) return;
-    const emptyState = emptyAccountScopedTradingState(historyQueryKey);
+    const emptyState = resetAccountScopedTradingState({
+      historyPage,
+      historyNavigation,
+      historyError,
+      historyLoading,
+      decisionsData,
+      decisionsError,
+      decisionsLoading,
+    }, historyQueryKey);
     setHistoryPage(emptyState.historyPage);
     setHistoryNavigation(emptyState.historyNavigation);
     setHistoryError(emptyState.historyError);
@@ -427,7 +405,21 @@ export default function LiveTrading() {
       })
       .catch((requestError) => {
         if (active && requestError.name !== 'AbortError') {
-          setHistoryError(`历史交易加载失败：${requestError.message}`);
+          const failedState = historyFailureTransition({
+            historyPage,
+            historyNavigation: {
+              queryKey: historyQueryKey,
+              cursor: historyCursor,
+              historyCursorStack,
+            },
+            historyError,
+            historyLoading: true,
+            retryable: false,
+          }, `历史交易加载失败：${requestError.message}`);
+          setHistoryPage(failedState.historyPage);
+          setHistoryNavigation(failedState.historyNavigation);
+          setHistoryError(failedState.historyError);
+          setHistoryLoading(failedState.historyLoading);
         }
       })
       .finally(() => { if (active) setHistoryLoading(false); });
