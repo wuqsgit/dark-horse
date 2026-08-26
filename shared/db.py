@@ -4692,6 +4692,56 @@ def _fetch_history_rows(table, time_column, account_id, symbol=None, from_time=N
         conn.close()
 
 
+def _trade_history_watermarks(conn, account_id):
+    row = conn.execute(
+        """SELECT
+               COALESCE((SELECT MAX(id) FROM fills WHERE account_id=?), 0) AS fills,
+               COALESCE((SELECT MAX(id) FROM exchange_income_ledger
+                         WHERE account_id=?), 0) AS income,
+               COALESCE((SELECT MAX(id) FROM position_trades
+                         WHERE account_id=?), 0) AS position_trades,
+               COALESCE((SELECT MAX(id) FROM orders WHERE account_id=?), 0) AS orders""",
+        (int(account_id),) * 4,
+    ).fetchone()
+    return {name: int(row[name] or 0) for name in row.keys()}
+
+
+def fetch_trade_history_snapshot(account_id, *, symbol=None, watermarks=None):
+    account_id = int(account_id)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        if watermarks is None:
+            watermarks = _trade_history_watermarks(conn, account_id)
+
+        def fetch(table, time_column, watermark_name):
+            conditions = ["account_id=?", "id<=?"]
+            params = [account_id, int(watermarks[watermark_name])]
+            if symbol:
+                conditions.append("symbol=?")
+                params.append(str(symbol).upper())
+            rows = conn.execute(
+                f"SELECT * FROM {table} WHERE {' AND '.join(conditions)} "
+                f"ORDER BY {time_column} ASC, id ASC",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return {
+            "watermarks": dict(watermarks),
+            "fills": fetch("fills", "created_at", "fills"),
+            "income": fetch(
+                "exchange_income_ledger", "income_time", "income"
+            ),
+            "position_trades": fetch(
+                "position_trades", "exit_time", "position_trades"
+            ),
+            "orders": fetch("orders", "created_at", "orders"),
+        }
+    finally:
+        conn.close()
+
+
 def fetch_trade_history_fills(account_id, *, symbol=None, from_time=None, to_time=None):
     return _fetch_history_rows(
         "fills", "created_at", account_id, symbol, from_time, to_time

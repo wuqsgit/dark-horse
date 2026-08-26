@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import tempfile
 import unittest
@@ -157,8 +159,271 @@ class TradeHistorySummaryTest(unittest.TestCase):
         self.assertEqual(result["items"][0]["close_count"], 3)
         self.assertEqual(result["items"][0]["strategy_sources"], ["alpha"])
         self.assertEqual(result["stats"]["total_cycles"], 1)
-        with self.assertRaisesRegex(ValueError, "^invalid_history_cursor$"):
-            fetch_trade_history_summaries(account_id=2, cursor="not-a-cursor")
+        for invalid_cursor in ("not-a-cursor", "a"):
+            with self.subTest(cursor=invalid_cursor):
+                with self.assertRaisesRegex(ValueError, "^invalid_history_cursor$"):
+                    fetch_trade_history_summaries(
+                        account_id=2, cursor=invalid_cursor
+                    )
+
+    def test_fallback_deduplicates_22_ake_rows_without_inventing_values(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO position_trades
+                   (account_id, position_trade_id, symbol, side, strategy_source,
+                    entry_time, exit_time, entry_price, exit_price, quantity,
+                    net_pnl, income_count, source)
+                   VALUES (2, ?, 'AKEUSDT', 'LONG', 'alpha',
+                           '2026-08-22 01:00:00', '2026-08-22 02:00:00',
+                           NULL, NULL, NULL, 3.25, 2, 'exchange_income')""",
+                [(f"ake-duplicate-{index}",) for index in range(22)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(
+            account_id=2, symbol="AKEUSDT", source="alpha"
+        )
+
+        self.assertEqual(result["reconcile_status"], "incomplete")
+        self.assertEqual(len(result["items"]), 1)
+        row = result["items"][0]
+        self.assertIsNone(row["quantity"])
+        self.assertIsNone(row["entry_price"])
+        self.assertIsNone(row["exit_price"])
+        self.assertAlmostEqual(row["pnl"], 3.25)
+        self.assertEqual(row["position_count"], 1)
+        self.assertEqual(row["close_count"], 2)
+        self.assertEqual(result["stats"]["total_cycles"], 1)
+        self.assertAlmostEqual(result["stats"]["total_pnl"], 3.25)
+
+    def test_income_uses_stable_identity_and_reconciles_execution_value(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (2, 'SOLUSDT', ?, 'LONG', 2, ?, ?, ?, 'alpha')""",
+                [
+                    ("BUY", 10, "sol-open", "2026-08-22 01:00:00"),
+                    ("SELL", 12, "sol-close", "2026-08-22 02:00:00"),
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO exchange_income_ledger
+                   (account_id, income_id, symbol, income_type, income,
+                    trade_id, income_time)
+                   VALUES (2, ?, 'SOLUSDT', ?, ?, 'sol-close',
+                           '2026-08-22 02:00:00')""",
+                [
+                    ("realized-copy-1", "REALIZED_PNL", 4.0),
+                    ("realized-copy-2", "REALIZED_PNL", 4.0),
+                    ("commission-copy-1", "COMMISSION", -0.2),
+                    ("commission-copy-2", "COMMISSION", -0.2),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(account_id=2)
+
+        self.assertEqual(result["reconcile_status"], "ok")
+        self.assertAlmostEqual(result["items"][0]["pnl"], 3.8)
+        self.assertAlmostEqual(result["stats"]["total_pnl"], 3.8)
+
+    def test_missing_income_is_incomplete_and_does_not_report_zero_pnl(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (2, 'ETHUSDT', ?, 'LONG', 1, ?, ?, ?, 'normal')""",
+                [
+                    ("BUY", 100, "eth-open", "2026-08-22 01:00:00"),
+                    ("SELL", 105, "eth-close", "2026-08-22 02:00:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(account_id=2)
+
+        self.assertEqual(result["reconcile_status"], "incomplete")
+        self.assertIsNone(result["items"][0]["pnl"])
+        self.assertIsNone(result["stats"]["total_pnl"])
+
+    def test_income_value_mismatch_is_reported_without_replacing_ledger_pnl(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (2, 'ETHUSDT', ?, 'LONG', 1, ?, ?, ?, 'normal')""",
+                [
+                    ("BUY", 100, "eth-open", "2026-08-22 01:00:00"),
+                    ("SELL", 105, "eth-close", "2026-08-22 02:00:00"),
+                ],
+            )
+            conn.execute(
+                """INSERT INTO exchange_income_ledger
+                   (account_id, income_id, symbol, income_type, income,
+                    trade_id, income_time)
+                   VALUES (2, 'eth-income', 'ETHUSDT', 'REALIZED_PNL', 4.5,
+                           'eth-close', '2026-08-22 02:00:00')"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(account_id=2)
+
+        self.assertEqual(result["reconcile_status"], "mismatch")
+        self.assertAlmostEqual(result["items"][0]["pnl"], 4.5)
+
+    def test_fill_and_fallback_cycles_merge_without_double_counting_coverage(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (2, 'BTCUSDT', ?, 'LONG', 1, ?, ?, ?, 'alpha')""",
+                [
+                    ("BUY", 100, "btc-open", "2026-08-23 01:00:00"),
+                    ("SELL", 110, "btc-close", "2026-08-23 02:00:00"),
+                ],
+            )
+            conn.execute(
+                """INSERT INTO exchange_income_ledger
+                   (account_id, income_id, symbol, income_type, income,
+                    trade_id, income_time)
+                   VALUES (2, 'btc-income', 'BTCUSDT', 'REALIZED_PNL', 10,
+                           'btc-close', '2026-08-23 02:00:00')"""
+            )
+            conn.executemany(
+                """INSERT INTO position_trades
+                   (account_id, position_trade_id, symbol, side, strategy_source,
+                    entry_time, exit_time, entry_price, exit_price, quantity,
+                    net_pnl, income_count, source)
+                   VALUES (2, ?, ?, ?, 'alpha', ?, ?, ?, ?, ?, ?, 1,
+                           'exchange_income')""",
+                [
+                    (
+                        "btc-covered", "BTCUSDT", "LONG",
+                        "2026-08-23 01:00:00", "2026-08-23 02:00:00",
+                        100, 110, 1, 10,
+                    ),
+                    (
+                        "btc-legacy", "BTCUSDT", "LONG",
+                        "2026-08-21 01:00:00", "2026-08-21 02:00:00",
+                        50, 55, 2, 10,
+                    ),
+                    (
+                        "eth-legacy", "ETHUSDT", "SHORT",
+                        "2026-08-20 01:00:00", "2026-08-20 02:00:00",
+                        40, 35, 1, 5,
+                    ),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = fetch_trade_history_summaries(account_id=2)
+        rows = {row["symbol"]: row for row in result["items"]}
+
+        self.assertEqual(result["reconcile_status"], "incomplete")
+        self.assertEqual(set(rows), {"BTCUSDT", "ETHUSDT"})
+        self.assertEqual(rows["BTCUSDT"]["quantity"], 3)
+        self.assertAlmostEqual(rows["BTCUSDT"]["pnl"], 20)
+        self.assertEqual(rows["BTCUSDT"]["position_count"], 2)
+        self.assertEqual(rows["BTCUSDT"]["close_count"], 2)
+        self.assertEqual(rows["ETHUSDT"]["position_count"], 1)
+        self.assertEqual(result["stats"]["total_cycles"], 3)
+
+    def test_binance_sync_fills_recover_strategy_from_local_cycle_context(self):
+        conn = db.get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO orders
+                   (account_id, symbol, side, order_type, status, reason,
+                    strategy_source, created_at)
+                   VALUES (2, 'AKEUSDT', 'BUY', 'MARKET', 'filled',
+                           'normal_entry', 'alpha', '2026-08-22 00:59:30')"""
+            )
+            conn.execute(
+                """INSERT INTO position_trades
+                   (account_id, position_trade_id, symbol, side, strategy_source,
+                    entry_time, exit_time, entry_price, exit_price, quantity,
+                    net_pnl, income_count, source)
+                   VALUES (2, 'btc-local-cycle', 'BTCUSDT', 'SHORT', 'normal',
+                           '2026-08-23 01:00:00', '2026-08-23 02:00:00',
+                           20, 18, 1, 2, 1, 'exchange_income')"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        token = db.set_account_context(2)
+        try:
+            for item in [
+                {
+                    "id": 101, "orderId": 9001, "symbol": "AKEUSDT",
+                    "side": "BUY", "positionSide": "BOTH", "qty": 2,
+                    "price": 10, "realizedPnl": 0,
+                    "time": "2026-08-22 01:00:00",
+                },
+                {
+                    "id": 102, "orderId": 9002, "symbol": "AKEUSDT",
+                    "side": "SELL", "positionSide": "BOTH", "qty": 2,
+                    "price": 12, "realizedPnl": 4,
+                    "time": "2026-08-22 02:00:00",
+                },
+                {
+                    "id": 201, "orderId": 9101, "symbol": "BTCUSDT",
+                    "side": "SELL", "positionSide": "BOTH", "qty": 1,
+                    "price": 20, "realizedPnl": 0,
+                    "time": "2026-08-23 01:00:00",
+                },
+                {
+                    "id": 202, "orderId": 9102, "symbol": "BTCUSDT",
+                    "side": "BUY", "positionSide": "BOTH", "qty": 1,
+                    "price": 18, "realizedPnl": 2,
+                    "time": "2026-08-23 02:00:00",
+                },
+            ]:
+                db.upsert_exchange_fill(item)
+            db.upsert_exchange_income(
+                {
+                    "tranId": 1002, "tradeId": 102, "symbol": "AKEUSDT",
+                    "incomeType": "REALIZED_PNL", "income": 4,
+                    "time": "2026-08-22 02:00:00",
+                }
+            )
+            db.upsert_exchange_income(
+                {
+                    "tranId": 2002, "tradeId": 202, "symbol": "BTCUSDT",
+                    "incomeType": "REALIZED_PNL", "income": 2,
+                    "time": "2026-08-23 02:00:00",
+                }
+            )
+        finally:
+            db.reset_account_context(token)
+
+        alpha = fetch_trade_history_summaries(account_id=2, source="alpha")
+        normal = fetch_trade_history_summaries(account_id=2, source="normal")
+
+        self.assertEqual([row["symbol"] for row in alpha["items"]], ["AKEUSDT"])
+        self.assertEqual(alpha["items"][0]["strategy_sources"], ["alpha"])
+        self.assertEqual([row["symbol"] for row in normal["items"]], ["BTCUSDT"])
+        self.assertEqual(normal["items"][0]["strategy_sources"], ["normal"])
 
     def test_summary_paginates_lifetime_rows_by_exit_time_and_date_filter(self):
         conn = db.get_conn()
@@ -192,6 +457,61 @@ class TradeHistorySummaryTest(unittest.TestCase):
         self.assertEqual([row["symbol"] for row in second_page["items"]], ["ETHUSDT"])
         self.assertIsNone(second_page["next_cursor"])
         self.assertEqual([row["symbol"] for row in filtered["items"]], ["BTCUSDT"])
+
+    def test_cursor_freezes_as_of_watermark_when_new_cycle_arrives(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (2, ?, ?, 'LONG', 1, ?, ?, ?, 'alpha')""",
+                [
+                    ("ETHUSDT", "BUY", 100, "eth-old-open", "2026-08-21 01:00:00"),
+                    ("ETHUSDT", "SELL", 101, "eth-old-close", "2026-08-21 02:00:00"),
+                    ("BTCUSDT", "BUY", 200, "btc-open", "2026-08-23 01:00:00"),
+                    ("BTCUSDT", "SELL", 201, "btc-close", "2026-08-23 02:00:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        first_page = fetch_trade_history_summaries(account_id=2, limit=1)
+
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (2, 'ETHUSDT', ?, 'LONG', 2, ?, ?, ?, 'alpha')""",
+                [
+                    ("BUY", 110, "eth-new-open", "2026-08-24 01:00:00"),
+                    ("SELL", 112, "eth-new-close", "2026-08-24 02:00:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        second_page = fetch_trade_history_summaries(
+            account_id=2, limit=1, cursor=first_page["next_cursor"]
+        )
+        fresh_page = fetch_trade_history_summaries(account_id=2, limit=1)
+
+        self.assertEqual([row["symbol"] for row in first_page["items"]], ["BTCUSDT"])
+        self.assertEqual([row["symbol"] for row in second_page["items"]], ["ETHUSDT"])
+        self.assertEqual(second_page["items"][0]["quantity"], 1)
+        self.assertEqual(second_page["items"][0]["exit_time"], "2026-08-21 02:00:00")
+        self.assertEqual([row["symbol"] for row in fresh_page["items"]], ["ETHUSDT"])
+        self.assertEqual(fresh_page["items"][0]["quantity"], 3)
+
+        legacy_cursor = base64.urlsafe_b64encode(
+            json.dumps(["2026-08-23 02:00:00", "BTCUSDT", "LONG"]).encode()
+        ).decode().rstrip("=")
+        with self.assertRaisesRegex(ValueError, "^invalid_history_cursor$"):
+            fetch_trade_history_summaries(account_id=2, cursor=legacy_cursor)
 
     def test_same_second_fills_use_numeric_id_order(self):
         first = fill(1, "AKEUSDT", "BUY", 1, 10, "t2", "2026-08-22 01:00:00")
