@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import statistics
 import subprocess
@@ -385,6 +386,34 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.assertNotIn("api_key", account)
         self.assertNotIn("api_secret", account)
 
+    def test_runtime_status_payload_does_not_decrypt_account_credentials(self):
+        with patch(
+            "shared.accounts.decrypt_secret",
+            side_effect=AssertionError("runtime status decrypted credentials"),
+        ):
+            payload = self.main._trading_runtime_status_payload()
+            from shared.accounts import list_runtime_accounts
+
+            runtime_accounts = list_runtime_accounts()
+
+        self.assertEqual(len(payload["accounts"]), 1)
+        account = payload["accounts"][0]
+        self.assertEqual(account["account_id"], self.account_id)
+        self.assertEqual(account["account_name"], "route-test")
+        self.assertEqual(account["environment"], "testnet")
+        self.assertEqual(
+            set(runtime_accounts[0]),
+            {
+                "id",
+                "name",
+                "environment",
+                "normal_trading_enabled",
+                "alpha_trading_enabled",
+                "auto_trading_enabled",
+                "enabled",
+            },
+        )
+
     def test_slow_history_computation_does_not_block_snapshot_reads(self):
         helper_threads = []
 
@@ -476,7 +505,7 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
             return {"status": "healthy", "account_id": account["id"]}
 
         with patch(
-            "shared.accounts.list_accounts",
+            "shared.accounts.list_runtime_accounts",
             side_effect=slow_list_accounts,
         ), patch(
             "shared.live_diagnostics.build_live_diagnostics",
@@ -743,7 +772,7 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.main._runtime_status_snapshot.update({
             "data": old_data,
             "time": time.time() - 31,
-            "last_error": "previous refresh failed",
+            "last_error": "runtime_snapshot_refresh_failed",
         })
         entered = threading.Event()
 
@@ -774,7 +803,7 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["fresh"])
         self.assertGreaterEqual(payload["age_seconds"], 31)
         self.assertIsNotNone(payload["snapshot_at"])
-        self.assertEqual(payload["last_error"], "previous refresh failed")
+        self.assertEqual(payload["last_error"], "runtime_snapshot_refresh_failed")
         self.assertIs(self.main._runtime_status_snapshot["data"], new_data)
         self.assertTrue(self.main._runtime_status_snapshot["time"] > 0)
         self.assertIsNone(self.main._runtime_status_snapshot["last_error"])
@@ -814,6 +843,7 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
             release.set()
 
     async def test_refresh_failure_preserves_last_good_runtime_snapshot(self):
+        secret = "api_secret=round-3-must-not-leak"
         old_data = {
             "trading_controls": {"normal_trading_enabled": True},
             "accounts": [{"account_id": 1}],
@@ -824,10 +854,10 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
             "last_error": None,
         })
 
-        with self.assertLogs("api", level="ERROR"), patch.object(
+        with self.assertLogs("api", level="ERROR") as logs, patch.object(
             self.main,
             "_trading_runtime_status_payload",
-            side_effect=RuntimeError("diagnostics unavailable"),
+            side_effect=RuntimeError(f"diagnostics unavailable: {secret}"),
         ):
             payload = await self.main.get_trading_runtime_status(
                 Response(),
@@ -840,8 +870,20 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.main._runtime_status_snapshot["data"], old_data)
         self.assertEqual(
             self.main._runtime_status_snapshot["last_error"],
-            "diagnostics unavailable",
+            "runtime_snapshot_refresh_failed",
         )
+        self.assertIn(secret, "\n".join(logs.output))
+
+        self.main._runtime_status_snapshot["time"] = time.time()
+        response_payload = await self.main.get_trading_runtime_status(
+            Response(),
+            user="viewer",
+        )
+        self.assertEqual(
+            response_payload["last_error"],
+            "runtime_snapshot_refresh_failed",
+        )
+        self.assertNotIn(secret, json.dumps(response_payload))
 
     async def test_runtime_refresh_uses_only_local_account_data(self):
         account = {
@@ -861,7 +903,7 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
             return {"status": "healthy", "account_id": item["id"]}
 
         with patch(
-            "shared.accounts.list_accounts",
+            "shared.accounts.list_runtime_accounts",
             side_effect=local_accounts,
         ), patch(
             "shared.live_diagnostics.build_live_diagnostics",
@@ -882,6 +924,80 @@ class RuntimeStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["accounts"][0]["account_id"], 1)
         self.assertEqual(worker_threads[0], worker_threads[1])
         self.assertNotEqual(worker_threads[0], event_loop_thread)
+
+    async def test_shutdown_cancels_and_clears_runtime_refresh_task(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_payload():
+            entered.set()
+            release.wait(timeout=2)
+            return {"trading_controls": {}, "accounts": []}
+
+        try:
+            with patch.object(
+                self.main,
+                "_trading_runtime_status_payload",
+                side_effect=blocked_payload,
+            ):
+                task = self.main._ensure_trading_runtime_status_refresh()
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                await self.main.shutdown_runtime_status_refresh()
+        finally:
+            release.set()
+
+        self.assertIn(
+            self.main.shutdown_runtime_status_refresh,
+            self.main.app.router.on_shutdown,
+        )
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(self.main._runtime_status_refresh_task)
+
+    async def test_new_event_loop_does_not_reuse_foreign_refresh_task(self):
+        ready = threading.Event()
+        owner_state = {}
+
+        def run_owner_loop():
+            loop = asyncio.new_event_loop()
+
+            async def wait_forever():
+                await asyncio.Event().wait()
+
+            task = loop.create_task(wait_forever())
+            owner_state.update({"loop": loop, "task": task})
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                if not task.done():
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+                loop.close()
+
+        owner_thread = threading.Thread(target=run_owner_loop)
+        owner_thread.start()
+        self.assertTrue(await asyncio.to_thread(ready.wait, 1))
+        owner_loop = owner_state["loop"]
+        foreign_task = owner_state["task"]
+        self.main._runtime_status_refresh_task = foreign_task
+
+        try:
+            with patch.object(
+                self.main,
+                "_trading_runtime_status_payload",
+                return_value={"trading_controls": {}, "accounts": []},
+            ):
+                replacement = self.main._ensure_trading_runtime_status_refresh()
+                self.assertIsNot(replacement, foreign_task)
+                self.assertIs(replacement.get_loop(), asyncio.get_running_loop())
+                await replacement
+        finally:
+            owner_loop.call_soon_threadsafe(owner_loop.stop)
+            await asyncio.to_thread(owner_thread.join, 1)
+            if self.main._runtime_status_refresh_task is foreign_task:
+                self.main._runtime_status_refresh_task = None
+
+        self.assertFalse(owner_thread.is_alive())
 
 
 if __name__ == "__main__":

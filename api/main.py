@@ -227,6 +227,7 @@ _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
 _TRADING_ACCOUNT_STATUS_CACHE_TTL = 30
 _TRADING_RUNTIME_STATUS_CACHE_TTL = 30
+_RUNTIME_STATUS_REFRESH_ERROR_CODE = "runtime_snapshot_refresh_failed"
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _FAST_CACHE_PATHS = {
     "/api/scan/latest",
@@ -455,6 +456,11 @@ async def startup():
         await get_alpha_trade_candidates(user="admin")
     except Exception:
         pass
+
+
+@app.on_event("shutdown")
+async def shutdown_runtime_status_refresh():
+    await _shutdown_trading_runtime_status_refresh()
 
 
 async def get_user():
@@ -2031,10 +2037,10 @@ async def get_account_decisions(account_id: int, user=Depends(get_user)):
 
 
 def _trading_runtime_status_payload() -> dict:
-    from shared.accounts import list_accounts
+    from shared.accounts import list_runtime_accounts
     from shared.live_diagnostics import build_live_diagnostics
 
-    accounts = list_accounts()
+    accounts = list_runtime_accounts()
     return {
         "trading_controls": _safe_trading_runtime_controls(),
         "accounts": [
@@ -2062,7 +2068,7 @@ async def _run_trading_runtime_status_refresh() -> dict:
         return data
     except Exception as exc:
         logger.exception("Trading runtime status refresh failed")
-        _runtime_status_snapshot["last_error"] = str(exc)
+        _runtime_status_snapshot["last_error"] = _RUNTIME_STATUS_REFRESH_ERROR_CODE
         return _runtime_status_snapshot.get("data") or {
             "trading_controls": {},
             "accounts": [],
@@ -2072,11 +2078,46 @@ async def _run_trading_runtime_status_refresh() -> dict:
             _runtime_status_refresh_task = None
 
 
+def _cancel_trading_runtime_status_refresh(task: asyncio.Task) -> None:
+    if task.done():
+        return
+    owner_loop = task.get_loop()
+    if owner_loop.is_running():
+        owner_loop.call_soon_threadsafe(task.cancel)
+    elif not owner_loop.is_closed():
+        task.cancel()
+
+
 def _ensure_trading_runtime_status_refresh() -> asyncio.Task:
     global _runtime_status_refresh_task
-    if _runtime_status_refresh_task is None or _runtime_status_refresh_task.done():
-        _runtime_status_refresh_task = asyncio.create_task(_run_trading_runtime_status_refresh())
+    current_loop = asyncio.get_running_loop()
+    task = _runtime_status_refresh_task
+    if task is not None and not task.done():
+        if task.get_loop() is current_loop:
+            return task
+        _cancel_trading_runtime_status_refresh(task)
+    _runtime_status_refresh_task = current_loop.create_task(
+        _run_trading_runtime_status_refresh()
+    )
     return _runtime_status_refresh_task
+
+
+async def _shutdown_trading_runtime_status_refresh() -> None:
+    global _runtime_status_refresh_task
+    task = _runtime_status_refresh_task
+    if task is None:
+        return
+    if task.get_loop() is asyncio.get_running_loop():
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    else:
+        _cancel_trading_runtime_status_refresh(task)
+    if _runtime_status_refresh_task is task:
+        _runtime_status_refresh_task = None
 
 
 async def _get_trading_runtime_status_snapshot() -> tuple[dict, str]:
@@ -2096,7 +2137,11 @@ async def _get_trading_runtime_status_snapshot() -> tuple[dict, str]:
     payload["snapshot_at"] = snapshot_at or None
     payload["age_seconds"] = round(age, 1) if snapshot_at else None
     payload["fresh"] = cache_status == "HIT"
-    payload["last_error"] = _runtime_status_snapshot.get("last_error")
+    payload["last_error"] = (
+        _RUNTIME_STATUS_REFRESH_ERROR_CODE
+        if _runtime_status_snapshot.get("last_error")
+        else None
+    )
     if cache_status != "HIT":
         _ensure_trading_runtime_status_refresh()
     return payload, cache_status

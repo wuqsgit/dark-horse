@@ -94,6 +94,24 @@ def list_accounts(include_secrets: bool = False, enabled_only: bool = False) -> 
     return rows
 
 
+def list_runtime_accounts(enabled_only: bool = False) -> list[dict]:
+    """Return only non-sensitive fields needed by local runtime diagnostics."""
+    ensure_default_account()
+    conn = get_conn()
+    try:
+        where = "WHERE enabled=1" if enabled_only else ""
+        rows = conn.execute(
+            f"""SELECT id, name, environment,
+                       normal_trading_enabled, alpha_trading_enabled,
+                       auto_trading_enabled, enabled
+                FROM trading_accounts {where}
+                ORDER BY is_default DESC, id"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def get_account(account_id: int, include_secrets: bool = False) -> dict | None:
     return next((a for a in list_accounts(include_secrets=include_secrets) if int(a["id"]) == int(account_id)), None)
 
