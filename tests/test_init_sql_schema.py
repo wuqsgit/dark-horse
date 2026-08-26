@@ -33,8 +33,9 @@ class InitSqlSchemaTest(unittest.TestCase):
         try:
             initialized.executescript(INIT_SQL.read_text(encoding="utf-8"))
             initialized_objects = schema_objects(initialized)
-            for object_key in schema_objects(source):
+            for object_key, definition in schema_objects(source).items():
                 self.assertIn(object_key, initialized_objects)
+                self.assertEqual(initialized_objects[object_key], definition)
         finally:
             initialized.close()
             source.close()
@@ -49,15 +50,18 @@ class InitSqlSchemaTest(unittest.TestCase):
                 initialized = sqlite3.connect(":memory:")
                 try:
                     initialized.executescript(INIT_SQL.read_text(encoding="utf-8"))
-                    for connection in (runtime, initialized):
-                        indexes = {
-                            row[0]
-                            for row in connection.execute(
-                                "SELECT name FROM sqlite_master WHERE type='index'"
-                            )
-                        }
-                        self.assertIn("idx_fills_account_symbol_time", indexes)
-                        self.assertIn("idx_income_account_symbol_time", indexes)
+                    runtime_objects = schema_objects(runtime)
+                    initialized_objects = schema_objects(initialized)
+                    for name in (
+                        "idx_fills_account_symbol_time",
+                        "idx_income_account_symbol_time",
+                    ):
+                        object_key = ("index", name)
+                        self.assertIn(object_key, runtime_objects)
+                        self.assertIn(object_key, initialized_objects)
+                        self.assertEqual(
+                            initialized_objects[object_key], runtime_objects[object_key]
+                        )
                 finally:
                     initialized.close()
                     runtime.close()
