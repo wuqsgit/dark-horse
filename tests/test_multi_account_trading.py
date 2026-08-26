@@ -330,7 +330,7 @@ class MultiAccountTradingTest(unittest.TestCase):
             "volume_price_reasons_json": '["dual market volume confirmed"]',
         }
         with patch("trader.exchange.BinanceFutures", FakeExchange), \
-             patch("shared.db.fetch_position_trade_groups", return_value=[]), \
+             patch("shared.db.fetch_position_trade_groups", side_effect=AssertionError("snapshot must not load history")), \
              patch("shared.db.fetch_latest_alpha_position_context", return_value=alpha_context):
             payload = _account_status_payload(account)
 
@@ -361,8 +361,9 @@ class MultiAccountTradingTest(unittest.TestCase):
         self.assertEqual(eth["max_floating_pnl"], 12.0)
         self.assertEqual(eth["last_system_action"], "account one hold")
         self.assertEqual(btc["roll_status"], "state_incomplete")
-        self.assertEqual(payload["decision_panel"]["latest_run_id"], "account-1-run")
-        self.assertTrue(all(row["symbol"] != "BTCUSDT" for row in payload["decision_panel"]["recent"]))
+        self.assertNotIn("recent_trades", payload)
+        self.assertNotIn("decision_panel", payload)
+        self.assertNotIn("runtime_diagnostics", payload)
 
 
 class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
@@ -372,7 +373,7 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
         self.main = main
         self.original_snapshot = dict(main._account_status_snapshot)
         self.original_refresh_task = main._account_status_refresh_task
-        main._account_status_snapshot.update({"data": None, "time": 0.0})
+        main._account_status_snapshot.update({"data": None, "time": 0.0, "last_error": None})
         main._account_status_refresh_task = None
 
     async def asyncTearDown(self):
@@ -385,59 +386,30 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
         self.main._account_status_snapshot.update(self.original_snapshot)
         self.main._account_status_refresh_task = self.original_refresh_task
 
-    async def test_stale_snapshot_returns_immediately_and_refreshes_in_background(self):
+    async def test_stale_snapshot_returns_without_starting_a_refresh(self):
         self.main._account_status_snapshot.update({
             "data": {"accounts": [{"account_id": 1}], "summary": {}},
             "time": time.time() - 31,
+            "last_error": None,
         })
-        refresh_started = asyncio.Event()
-        release_refresh = asyncio.Event()
+        with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
+            payload, cache_status = await self.main._get_trading_account_status_snapshot()
 
-        async def slow_refresh():
-            refresh_started.set()
-            await release_refresh.wait()
-            return {"accounts": [{"account_id": 2}], "summary": {}}
+        refresh.assert_not_called()
+        self.assertEqual(cache_status, "STALE")
+        self.assertEqual(payload["accounts"][0]["account_id"], 1)
+        self.assertFalse(payload["fresh"])
+        self.assertGreaterEqual(payload["age_seconds"], 30)
 
-        with patch.object(self.main, "_build_all_trading_account_status", side_effect=slow_refresh):
-            payload, cache_status = await asyncio.wait_for(
-                self.main._get_trading_account_status_snapshot(),
-                timeout=0.1,
-            )
-            await asyncio.wait_for(refresh_started.wait(), timeout=0.1)
+    async def test_cold_snapshot_read_returns_empty_payload_without_starting_a_refresh(self):
+        with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
+            payload, cache_status = await self.main._get_trading_account_status_snapshot()
 
-            self.assertEqual(cache_status, "STALE")
-            self.assertEqual(payload["accounts"][0]["account_id"], 1)
-            self.assertTrue(payload["stale"])
-            self.assertGreaterEqual(payload["data_age_seconds"], 30)
-
-            release_refresh.set()
-            await self.main._account_status_refresh_task
-            self.assertEqual(self.main._account_status_snapshot["data"]["accounts"][0]["account_id"], 2)
-
-    async def test_concurrent_cold_requests_share_one_refresh(self):
-        refresh_started = asyncio.Event()
-        release_refresh = asyncio.Event()
-        refresh_count = 0
-
-        async def slow_refresh():
-            nonlocal refresh_count
-            refresh_count += 1
-            refresh_started.set()
-            await release_refresh.wait()
-            return {"accounts": [{"account_id": 1}], "summary": {}}
-
-        with patch.object(self.main, "_build_all_trading_account_status", side_effect=slow_refresh):
-            first = asyncio.create_task(self.main._get_trading_account_status_snapshot())
-            second = asyncio.create_task(self.main._get_trading_account_status_snapshot())
-            await asyncio.wait_for(refresh_started.wait(), timeout=0.1)
-            self.assertEqual(refresh_count, 1)
-
-            release_refresh.set()
-            results = await asyncio.gather(first, second)
-
-        self.assertEqual(refresh_count, 1)
-        self.assertEqual([row[1] for row in results], ["MISS", "MISS"])
-        self.assertTrue(all(row[0]["accounts"][0]["account_id"] == 1 for row in results))
+        refresh.assert_not_called()
+        self.assertEqual(cache_status, "MISS")
+        self.assertEqual(payload["accounts"], [])
+        self.assertEqual(payload["summary"], {})
+        self.assertIsNone(payload["snapshot_at"])
 
 
 if __name__ == "__main__":

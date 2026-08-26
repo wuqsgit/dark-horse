@@ -38,6 +38,7 @@ from shared.policy_loop import (
     label_decision_outcomes,
     clear_legacy_backtest_data,
 )
+from shared.account_status_snapshot import load_account_snapshot, save_account_snapshot
 
 
 def _roll_max_layers():
@@ -206,7 +207,10 @@ _response_cache = {}
 _versioned_cache = {}
 _scan_payload_cache = {"scan_id": None, "payload": None, "body": None, "time": 0}
 _scan_refresh_task = None
-_account_status_snapshot = {"data": None, "time": 0.0}
+_ACCOUNT_STATUS_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(__file__), "..", ".runtime", "trading-account-status.json"
+)
+_account_status_snapshot = {"data": None, "time": 0.0, "last_error": None}
 _account_status_refresh_task = None
 _account_status_refresher_task = None
 
@@ -433,6 +437,7 @@ async def fast_path_cache(request, call_next):
 async def startup():
     global _scan_refresh_task, _account_status_refresher_task
     init_db()
+    _load_persisted_trading_account_status_snapshot()
     if _account_status_refresher_task is None:
         _account_status_refresher_task = asyncio.create_task(_account_status_snapshot_refresher())
     try:
@@ -2126,13 +2131,11 @@ def _account_decision_panel(conn, account_id: int) -> dict:
 def _account_status_payload(account: dict) -> dict:
     from shared.accounts import account_exchange_config
     from shared.db import (
-        fetch_position_trade_groups,
         get_conn,
         reset_account_context,
         set_account_context,
     )
     from trader.exchange import BinanceFutures
-    from shared.live_diagnostics import build_live_diagnostics
 
     account_token = set_account_context(account["id"])
     ex = None
@@ -2158,7 +2161,6 @@ def _account_status_payload(account: dict) -> dict:
                    FROM account_capital_adjustments WHERE account_id=?""",
                 (account["id"],),
             ).fetchone()[0] or 0)
-            history = fetch_position_trade_groups(100, account_id=account["id"])
             position_states = {
                 row["symbol"]: dict(row)
                 for row in conn.execute(
@@ -2176,7 +2178,6 @@ def _account_status_payload(account: dict) -> dict:
                     (account["id"],),
                 ).fetchall()
             }
-            decision_panel = _account_decision_panel(conn, account["id"])
             latest_position_actions = {
                 row["symbol"]: row["filter_reason"] or row["decision_result"]
                 for row in conn.execute(
@@ -2221,9 +2222,6 @@ def _account_status_payload(account: dict) -> dict:
         initial = float(account.get("initial_capital") or 0)
         total_pnl = equity - initial - adjustments
         base = initial + adjustments
-        trade_rows = [row for row in history if row.get("symbol") != "ACCOUNT"]
-        win_count = sum(1 for row in trade_rows if float(row.get("pnl") or row.get("net_pnl") or 0) > 0)
-        loss_count = sum(1 for row in trade_rows if float(row.get("pnl") or row.get("net_pnl") or 0) < 0)
         for position in positions:
             position["account_id"] = account["id"]
             position["account_name"] = account["name"]
@@ -2287,31 +2285,18 @@ def _account_status_payload(account: dict) -> dict:
             "unrealized_pnl": float(margin.get("totalUnrealizedProfit") or 0),
             "total_pnl": total_pnl, "return_pct": (total_pnl / base * 100) if base else 0,
             "max_positions": int(account.get("max_positions") or 5),
-            "position_count": len(positions), "positions": positions, "recent_trades": history,
-            "decision_panel": decision_panel,
-            "stats": {
-                "total_opens": len(trade_rows) + len(positions),
-                "total_closed": len(trade_rows),
-                "win_count": win_count,
-                "loss_count": loss_count,
-                "win_rate": (win_count / len(trade_rows) * 100) if trade_rows else 0,
-            },
+            "position_count": len(positions), "positions": positions,
             "normal_trading_enabled": bool(account.get("normal_trading_enabled")),
             "alpha_trading_enabled": bool(account.get("alpha_trading_enabled")),
             "auto_trading_enabled": bool(account.get("auto_trading_enabled")),
-            "runtime_diagnostics": build_live_diagnostics(account),
         }
     except Exception as exc:
         return {
             "account_id": account["id"], "account_name": account["name"],
             "environment": account["environment"], "status": "degraded",
-            "error": str(exc), "positions": [], "recent_trades": [],
+            "error": str(exc), "positions": [],
             "initial_capital": float(account.get("initial_capital") or 0),
             "max_positions": int(account.get("max_positions") or 5),
-            "runtime_diagnostics": build_live_diagnostics(
-                account,
-                exchange_error=f"{type(exc).__name__}: {exc}",
-            ),
         }
     finally:
         if ex is not None:
@@ -2319,14 +2304,15 @@ def _account_status_payload(account: dict) -> dict:
         reset_account_context(account_token)
 
 
-async def _build_all_trading_account_status() -> dict:
+def _refresh_all_account_statuses_sync() -> dict:
     from shared.accounts import list_accounts
 
     accounts = list_accounts(include_secrets=True, enabled_only=True)
-    results = await asyncio.gather(*[
-        asyncio.to_thread(_account_status_payload, account)
-        for account in accounts
-    ])
+    results = [_account_status_payload(account) for account in accounts]
+    failures = [row for row in results if row.get("status") != "ok"]
+    if failures:
+        names = ", ".join(str(row.get("account_name") or row.get("account_id")) for row in failures)
+        raise RuntimeError(f"Account status refresh failed for: {names}")
     healthy = [row for row in results if row.get("status") == "ok"]
     environments = {row.get("environment") for row in healthy}
     if len(environments) > 1:
@@ -2350,14 +2336,40 @@ async def _build_all_trading_account_status() -> dict:
     }
 
 
+def _load_persisted_trading_account_status_snapshot() -> None:
+    persisted = load_account_snapshot(_ACCOUNT_STATUS_SNAPSHOT_PATH)
+    if not persisted:
+        return
+    data = persisted.get("data")
+    snapshot_at = persisted.get("snapshot_at")
+    if not isinstance(data, dict) or not isinstance(snapshot_at, (int, float)):
+        logger.warning("Ignoring invalid persisted account status snapshot")
+        return
+    _account_status_snapshot.update({
+        "data": data,
+        "time": float(snapshot_at),
+        "last_error": None,
+    })
+
+
 async def _run_trading_account_status_refresh() -> dict:
     global _account_status_refresh_task
     try:
-        data = await _build_all_trading_account_status()
-        _account_status_snapshot.update({"data": data, "time": time.time()})
+        data = await asyncio.to_thread(_refresh_all_account_statuses_sync)
+        snapshot_at = time.time()
+        save_account_snapshot(_ACCOUNT_STATUS_SNAPSHOT_PATH, {
+            "data": data,
+            "snapshot_at": snapshot_at,
+        })
+        _account_status_snapshot.update({
+            "data": data,
+            "time": snapshot_at,
+            "last_error": None,
+        })
         return data
-    except Exception:
+    except Exception as exc:
         logger.exception("Trading account status refresh failed")
+        _account_status_snapshot["last_error"] = str(exc)
         if _account_status_snapshot.get("data") is not None:
             return _account_status_snapshot["data"]
         raise
@@ -2376,21 +2388,15 @@ def _ensure_trading_account_status_refresh() -> asyncio.Task:
 async def _get_trading_account_status_snapshot() -> tuple[dict, str]:
     data = _account_status_snapshot.get("data")
     age = max(0.0, time.time() - float(_account_status_snapshot.get("time") or 0))
-    if data is None:
-        await _ensure_trading_account_status_refresh()
-        cache_status = "MISS"
-    elif age >= _TRADING_ACCOUNT_STATUS_CACHE_TTL:
-        _ensure_trading_account_status_refresh()
-        cache_status = "STALE"
-    else:
-        cache_status = "HIT"
-
-    data = _account_status_snapshot.get("data") or {}
-    age = max(0.0, time.time() - float(_account_status_snapshot.get("time") or 0))
-    payload = dict(data)
-    payload["data_age_seconds"] = round(age, 1)
-    payload["stale"] = cache_status == "STALE"
-    payload["cache_status"] = cache_status.lower()
+    cache_status = "MISS" if data is None else "STALE" if age >= _TRADING_ACCOUNT_STATUS_CACHE_TTL else "HIT"
+    snapshot_at = float(_account_status_snapshot.get("time") or 0)
+    payload = dict(data or {})
+    payload["accounts"] = payload.get("accounts") or []
+    payload["summary"] = payload.get("summary") or {}
+    payload["snapshot_at"] = snapshot_at or None
+    payload["age_seconds"] = round(age, 1) if snapshot_at else None
+    payload["fresh"] = cache_status == "HIT"
+    payload["last_error"] = _account_status_snapshot.get("last_error")
     return payload, cache_status
 
 
