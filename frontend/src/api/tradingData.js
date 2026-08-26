@@ -41,6 +41,9 @@ export function createTradingDataClient(fetchImpl = fetch, dedupeMs = 30000) {
   );
 
   const status = async ({ force = false, signal } = {}) => {
+    if (signal) {
+      return requestJson(fetchImpl, '/api/trading/accounts/status', signal);
+    }
     if (!force && hasCachedStatus && Date.now() - statusCachedAt < dedupeMs) {
       return statusCached;
     }

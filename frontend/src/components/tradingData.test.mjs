@@ -88,6 +88,36 @@ test('status deduplicates concurrent and cached requests for 30 seconds', async 
   assert.equal(calls, 2);
 });
 
+test('status callers with owned signals cancel independently', async () => {
+  const requests = [];
+  const client = createTradingDataClient((url, { signal }) => new Promise((resolve, reject) => {
+    const request = { url, signal, resolve, reject };
+    signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    requests.push(request);
+  }));
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+
+  const first = client.status({ signal: firstController.signal });
+  const second = client.status({ signal: secondController.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  firstController.abort();
+  requests[1]?.resolve(response({ caller: 'second' }));
+  const [firstOutcome, secondOutcome] = await Promise.all([
+    first.then((value) => ({ status: 'fulfilled', value }), (error) => ({ status: 'rejected', error })),
+    second.then((value) => ({ status: 'fulfilled', value }), (error) => ({ status: 'rejected', error })),
+  ]);
+
+  assert.deepEqual(requests.map(({ signal }) => signal), [
+    firstController.signal,
+    secondController.signal,
+  ]);
+  assert.equal(firstOutcome.status, 'rejected');
+  assert.equal(firstOutcome.error.message, 'aborted');
+  assert.deepEqual(secondOutcome, { status: 'fulfilled', value: { caller: 'second' } });
+});
+
 test('history requests are independently cancellable and never deduplicated', async () => {
   const calls = [];
   const client = createTradingDataClient(async (url, options) => {
