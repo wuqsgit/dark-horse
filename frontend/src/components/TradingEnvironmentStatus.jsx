@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { fetchTradingAccountsStatus } from '../api/tradingAccountsStatus';
+import { fetchTradingAccountsStatus } from '../api/tradingData';
 
 export default function TradingEnvironmentStatus() {
   const [label, setLabel] = useState('LIVE CHECKING');

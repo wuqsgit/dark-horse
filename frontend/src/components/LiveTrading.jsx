@@ -1,10 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { fetchTradingAccountsStatus } from '../api/tradingAccountsStatus';
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  fetchTradingAccounts,
+  fetchTradingAccountsStatus,
+  fetchTradingDecisions,
+  fetchTradingHistory,
+  fetchTradingRuntimeStatus,
+} from '../api/tradingData';
 import { adminFetch } from '../api/adminFetch';
 import TradingAccountManager from './TradingAccountManager';
 import { findSelectedAccount, normalizeSelectedAccount } from './liveTradingAccountSelection';
 
 const TRADES_PER_PAGE = 20;
+const EMPTY_HISTORY_PAGE = { items: [], next_cursor: null, stats: {} };
 
 function pnlColor(v) {
   const n = Number(v || 0);
@@ -58,7 +65,9 @@ function timeText(value) {
 }
 
 function sourceText(v) {
-  return v === 'alpha' ? 'Alpha 策略' : '普通策略';
+  if (v === 'alpha') return 'Alpha 策略';
+  if (v === 'normal') return '普通策略';
+  return '-';
 }
 
 function alphaProfileText(v) {
@@ -102,6 +111,59 @@ function volumePriceActionText(v) {
     cooldown: 'cooldown',
   };
   return map[v] || v || '-';
+}
+
+function DecisionPanel({ panel, loading, error }) {
+  if (loading) return <div className="trading-section">加载交易决策...</div>;
+  if (error) {
+    return <div className="trading-section" style={{ color: '#fbbf24' }}>{error}</div>;
+  }
+
+  const reasons = panel?.top_reasons || [];
+  const recent = panel?.recent || [];
+  const latestDecision = recent[0];
+  const lastExecutionTime = panel?.last_execution_time || panel?.latest_time;
+  const lastExecutionText = lastExecutionTime ? timeText(lastExecutionTime) : '暂无记录';
+
+  return (
+    <div className="trading-section">
+      <h3>系统刚才为什么没动手</h3>
+      <div className="plain-grid">
+        <div className="plain-card">
+          <div className="plain-title">开仓前检查</div>
+          <div className="plain-meta">最后执行：{lastExecutionText}</div>
+          <div className="plain-meta">策略学习规则：{panel?.active_entry_policy_count || 0} 条已生效 | {panel?.active_entry_policy_version || 'empty'}</div>
+          <div className="plain-text">
+            普通信号和 Alpha 信号都会先过分数、模板、方向、账户风控和 Binance 实时盘口；Alpha 还会检查分类模板、entry_level、futures 映射和信号新鲜度。
+          </div>
+        </div>
+        <div className="plain-card">
+          <div className="plain-title">持仓后检查</div>
+          <div className="plain-text">
+            持仓会继续看 Hold Alpha、评分衰减、盘口变弱、时间止损、移动止盈和 TP1/TP2，触发后自动减仓或平仓。
+          </div>
+        </div>
+      </div>
+      <div className="muted-box">
+        当前开仓线：{panel?.entry_gate_plain || '按币种模板判断'}　行情状态：{panel?.regime_effect_plain || '只调整名额和仓位'}
+      </div>
+      {reasons.length > 0 ? (
+        <div className="reason-list">
+          {reasons.map((r, i) => (
+            <div className="reason-row" key={`${r.reason}-${i}`}><span>{r.plain || r.reason}</span><b>{r.count} 次</b></div>
+          ))}
+        </div>
+      ) : <div className="muted-box" style={{ marginTop: 10 }}>最近一轮没有记录到过滤原因。</div>}
+      {latestDecision && (
+        <div className="decision-strip">
+          <div className="decision-pill">
+            <strong>{latestDecision.symbol}</strong>
+            <span>{latestDecision.plain || latestDecision.result}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function RuntimeDiagnostics({ diagnostics }) {
@@ -149,47 +211,119 @@ function RuntimeDiagnostics({ diagnostics }) {
 }
 
 export default function LiveTrading() {
-  const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [warning, setWarning] = useState(null);
-  const [tradePage, setTradePage] = useState(1);
+  const [accountWarning, setAccountWarning] = useState(null);
+  const [snapshotWarning, setSnapshotWarning] = useState(null);
+  const [runtimeWarning, setRuntimeWarning] = useState(null);
   const [tradeFilter, setTradeFilter] = useState('all');
+  const [tradeSymbol, setTradeSymbol] = useState('');
+  const [tradeDirection, setTradeDirection] = useState('all');
   const [switching, setSwitching] = useState(null);
   const [toast, setToast] = useState(null);
   const [accountsData, setAccountsData] = useState({ accounts: [], summary: {} });
   const [accountConfigs, setAccountConfigs] = useState([]);
+  const [runtimeData, setRuntimeData] = useState({ accounts: [] });
   const [selectedAccount, setSelectedAccount] = useState(null);
+  const [historyPage, setHistoryPage] = useState(EMPTY_HISTORY_PAGE);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState(null);
+  const [historyNavigation, setHistoryNavigation] = useState({
+    queryKey: null,
+    cursor: null,
+    historyCursorStack: [],
+  });
+  const [decisionsData, setDecisionsData] = useState(null);
+  const [decisionsLoading, setDecisionsLoading] = useState(false);
+  const [decisionsError, setDecisionsError] = useState(null);
 
-  const fetchAll = useCallback(async () => {
-    try {
-      const [res, multi, configsRes] = await Promise.all([
-        fetch('/api/trading/status'), fetchTradingAccountsStatus(), fetch('/api/trading/accounts'),
-      ]);
-      const [data, configs] = await Promise.all([res.json(), configsRes.json()]);
-      setAccountsData(multi);
-      setAccountConfigs(configs.accounts || []);
-      if (data.error) {
-        setWarning('默认账户诊断暂时不可用：' + data.error);
-        setStatus(null);
-        setError(null);
-      } else {
-        setStatus(data);
-        setError(null);
-        setWarning(data.binance_warning || null);
-      }
-    } catch (e) {
-      setError('加载实盘数据失败: ' + e.message);
-    } finally {
-      setLoading(false);
+  const applyAccountSnapshot = useCallback((data) => {
+    setAccountsData(data || { accounts: [], summary: {} });
+    setError(null);
+    if (data?.last_error) {
+      setSnapshotWarning(`账户快照刷新失败：${data.last_error}`);
+    } else if (data?.fresh === false) {
+      setSnapshotWarning('账户快照已过期');
+    } else {
+      setSnapshotWarning(null);
     }
   }, []);
 
+  const refreshAccountData = useCallback(async () => {
+    const [configsResult, snapshotResult, runtimeResult] = await Promise.allSettled([
+      fetchTradingAccounts(),
+      fetchTradingAccountsStatus({ force: true }),
+      fetchTradingRuntimeStatus(),
+    ]);
+    if (configsResult.status === 'fulfilled') {
+      setAccountConfigs(configsResult.value.accounts || []);
+      setAccountWarning(null);
+    } else {
+      setAccountWarning(`账户配置刷新失败：${configsResult.reason.message}`);
+    }
+    if (snapshotResult.status === 'fulfilled') {
+      applyAccountSnapshot(snapshotResult.value);
+    } else {
+      setSnapshotWarning(`账户快照刷新失败：${snapshotResult.reason.message}`);
+    }
+    if (runtimeResult.status === 'fulfilled') {
+      setRuntimeData(runtimeResult.value || { accounts: [] });
+      setRuntimeWarning(null);
+    } else {
+      setRuntimeWarning(`运行诊断刷新失败：${runtimeResult.reason.message}`);
+    }
+  }, [applyAccountSnapshot]);
+
   useEffect(() => {
-    fetchAll();
-    const id = setInterval(fetchAll, 30000);
-    return () => clearInterval(id);
-  }, [fetchAll]);
+    let active = true;
+    const initialAccounts = fetchTradingAccounts();
+    const initialSnapshot = fetchTradingAccountsStatus();
+    const initialRuntime = fetchTradingRuntimeStatus();
+
+    Promise.allSettled([initialAccounts, initialSnapshot, initialRuntime]).then((results) => {
+      if (!active) return;
+      const [configsResult, snapshotResult, runtimeResult] = results;
+      if (configsResult.status === 'fulfilled') {
+        setAccountConfigs(configsResult.value.accounts || []);
+      } else {
+        setAccountWarning(`账户配置加载失败：${configsResult.reason.message}`);
+      }
+      if (snapshotResult.status === 'fulfilled') {
+        applyAccountSnapshot(snapshotResult.value);
+        setError(null);
+      } else {
+        setError(`加载实盘数据失败: ${snapshotResult.reason.message}`);
+      }
+      if (runtimeResult.status === 'fulfilled') {
+        setRuntimeData(runtimeResult.value || { accounts: [] });
+      } else {
+        setRuntimeWarning(`运行诊断加载失败：${runtimeResult.reason.message}`);
+      }
+      setLoading(false);
+    });
+
+    const pollLiveData = () => {
+      fetchTradingAccountsStatus({ force: true })
+        .then((data) => { if (active) applyAccountSnapshot(data); })
+        .catch((requestError) => {
+          if (active) setSnapshotWarning(`账户快照刷新失败：${requestError.message}`);
+        });
+      fetchTradingRuntimeStatus()
+        .then((data) => {
+          if (!active) return;
+          setRuntimeData(data || { accounts: [] });
+          setRuntimeWarning(null);
+        })
+        .catch((requestError) => {
+          if (active) setRuntimeWarning(`运行诊断刷新失败：${requestError.message}`);
+        });
+    };
+    const id = setInterval(pollLiveData, 30000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [applyAccountSnapshot]);
 
   useEffect(() => {
     const normalized = normalizeSelectedAccount(selectedAccount, accountsData.accounts || []);
@@ -198,19 +332,82 @@ export default function LiveTrading() {
 
   const selectedRow = findSelectedAccount(selectedAccount, accountsData.accounts || []);
   const positions = selectedRow?.positions || [];
-  const recentTrades = selectedRow?.recent_trades || [];
-  const stats = selectedRow?.stats || {};
+  const stats = historyPage.stats || {};
   const accountSummary = selectedRow || {};
-  const runtimeDiagnostics = selectedRow?.runtime_diagnostics || status?.runtime_diagnostics;
-  const filteredTrades = useMemo(() => {
-    if (tradeFilter === 'all') return recentTrades;
-    return recentTrades.filter((t) => (t.strategy_source || 'normal') === tradeFilter);
-  }, [recentTrades, tradeFilter]);
-  const visibleTrades = filteredTrades.slice((tradePage - 1) * TRADES_PER_PAGE, tradePage * TRADES_PER_PAGE);
+  const runtimeAccount = (runtimeData.accounts || []).find(
+    (account) => String(account.account_id) === String(selectedAccount),
+  );
+  const runtimeDiagnostics = runtimeAccount?.runtime_diagnostics;
+  const historyQueryKey = [selectedAccount, tradeFilter, tradeSymbol, tradeDirection].join('|');
+  const historyNavigationMatches = historyNavigation.queryKey === historyQueryKey;
+  const historyCursor = historyNavigationMatches ? historyNavigation.cursor : null;
+  const historyCursorStack = historyNavigationMatches
+    ? historyNavigation.historyCursorStack
+    : [];
+  const warning = [accountWarning, snapshotWarning, runtimeWarning].filter(Boolean).join('；');
 
   useEffect(() => {
-    setTradePage(1);
-  }, [tradeFilter]);
+    setHistoryNavigation({
+      queryKey: historyQueryKey,
+      cursor: null,
+      historyCursorStack: [],
+    });
+    setHistoryPage(EMPTY_HISTORY_PAGE);
+  }, [historyQueryKey]);
+
+  useEffect(() => {
+    if (selectedAccount === null || selectedAccount === undefined) return undefined;
+    const controller = new AbortController();
+    let active = true;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    fetchTradingHistory(selectedAccount, {
+      cursor: historyCursor || undefined,
+      limit: TRADES_PER_PAGE,
+      source: tradeFilter === 'all' ? undefined : tradeFilter,
+      symbol: tradeSymbol || undefined,
+      direction: tradeDirection === 'all' ? undefined : tradeDirection,
+    }, { signal: controller.signal })
+      .then((data) => {
+        if (!active) return;
+        setHistoryPage({
+          items: Array.isArray(data?.items) ? data.items : [],
+          next_cursor: data?.next_cursor || null,
+          stats: data?.stats || {},
+        });
+      })
+      .catch((requestError) => {
+        if (active && requestError.name !== 'AbortError') {
+          setHistoryError(`历史交易加载失败：${requestError.message}`);
+        }
+      })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [selectedAccount, tradeFilter, tradeSymbol, tradeDirection, historyCursor]);
+
+  useEffect(() => {
+    if (selectedAccount === null || selectedAccount === undefined) return undefined;
+    const controller = new AbortController();
+    let active = true;
+    setDecisionsData(null);
+    setDecisionsLoading(true);
+    setDecisionsError(null);
+    fetchTradingDecisions(selectedAccount, { signal: controller.signal })
+      .then((data) => { if (active) setDecisionsData(data); })
+      .catch((requestError) => {
+        if (active && requestError.name !== 'AbortError') {
+          setDecisionsError(`交易决策加载失败：${requestError.message}`);
+        }
+      })
+      .finally(() => { if (active) setDecisionsLoading(false); });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [selectedAccount]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -220,6 +417,26 @@ export default function LiveTrading() {
 
   const showToast = (type, message) => {
     setToast({ type, message, id: Date.now() });
+  };
+
+  const goToNextHistoryPage = () => {
+    if (!historyPage.next_cursor) return;
+    setHistoryNavigation({
+      queryKey: historyQueryKey,
+      cursor: historyPage.next_cursor,
+      historyCursorStack: [...historyCursorStack, historyCursor],
+    });
+  };
+
+  const goToPreviousHistoryPage = () => {
+    if (historyCursorStack.length === 0) return;
+    const previousCursors = [...historyCursorStack];
+    const previousCursor = previousCursors.pop() ?? null;
+    setHistoryNavigation({
+      queryKey: historyQueryKey,
+      cursor: previousCursor,
+      historyCursorStack: previousCursors,
+    });
   };
 
   const toggleTrading = async (mode, enabled) => {
@@ -239,7 +456,7 @@ export default function LiveTrading() {
       }));
       const failed = results.find((item) => item.error);
       if (failed) throw new Error(failed.error);
-      await fetchAll();
+      await refreshAccountData();
       if (enabled) {
         showToast('success', `${modeText}已开启，交易进程会自动加载账户配置。`);
       } else {
@@ -257,7 +474,7 @@ export default function LiveTrading() {
   return (
     <div className="trading-panel">
       <div className="trading-section">
-        <TradingAccountManager accounts={accountConfigs} onChanged={fetchAll} />
+        <TradingAccountManager accounts={accountConfigs} onChanged={refreshAccountData} />
         <div className="account-tabs" role="tablist" aria-label="交易账户">
           {(accountsData.accounts || []).map((account) => (
             <button key={account.account_id} className={String(selectedAccount) === String(account.account_id) ? 'active' : ''} onClick={() => setSelectedAccount(account.account_id)}>
@@ -268,7 +485,7 @@ export default function LiveTrading() {
       </div>
       {warning && (
         <div className="trading-section" style={{ color: '#fbbf24', borderColor: '#92400e' }} role="status">
-          {warning}{status?.stale_age_seconds != null ? `（快照延迟 ${status.stale_age_seconds} 秒）` : ''}
+          {warning}{accountsData.age_seconds != null ? `（快照延迟 ${Math.round(accountsData.age_seconds)} 秒）` : ''}
         </div>
       )}
       {toast && (
@@ -339,8 +556,8 @@ export default function LiveTrading() {
         <div className="stats-grid">
           <div className="stat-card"><div className="stat-label">账户权益</div><div className="stat-value">${fmt(accountSummary.equity)}</div></div>
           <div className="stat-card"><div className="stat-label">当前持仓</div><div className="stat-value">{positions.length}</div></div>
-          <div className="stat-card"><div className="stat-label">开仓次数</div><div className="stat-value">{stats.total_opens || 0}</div></div>
-          <div className="stat-card"><div className="stat-label">已平仓</div><div className="stat-value">{stats.total_closed || 0}</div></div>
+          <div className="stat-card"><div className="stat-label">开仓次数</div><div className="stat-value">{stats.position_count || 0}</div></div>
+          <div className="stat-card"><div className="stat-label">已平仓</div><div className="stat-value">{stats.total_cycles || 0}</div></div>
           <div className="stat-card"><div className="stat-label">胜利/失败</div><div className="stat-value">{stats.win_count || 0} / {stats.loss_count || 0}</div></div>
           <div className="stat-card"><div className="stat-label">总盈亏</div><div className="stat-value" style={pnlColor(accountSummary.total_pnl)}>${fmt(accountSummary.total_pnl)}</div></div>
         </div>
@@ -409,16 +626,39 @@ export default function LiveTrading() {
         )}
       </div>
 
+      <DecisionPanel panel={decisionsData} loading={decisionsLoading} error={decisionsError} />
+
       <div className="trading-section">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
           <h3>历史交易</h3>
-          <div className="scan-toolbar" style={{ margin: 0 }}>
-            <button className={tradeFilter === 'all' ? 'active' : ''} onClick={() => setTradeFilter('all')}>全部</button>
-            <button className={tradeFilter === 'normal' ? 'active' : ''} onClick={() => setTradeFilter('normal')}>普通策略</button>
-            <button className={tradeFilter === 'alpha' ? 'active' : ''} onClick={() => setTradeFilter('alpha')}>Alpha 策略</button>
+          <div className="filters">
+            <input
+              aria-label="按币种筛选历史交易"
+              placeholder="币种，例如 BTCUSDT"
+              value={tradeSymbol}
+              onChange={(event) => setTradeSymbol(event.target.value.toUpperCase())}
+            />
+            <select
+              aria-label="按方向筛选历史交易"
+              value={tradeDirection}
+              onChange={(event) => setTradeDirection(event.target.value)}
+            >
+              <option value="all">全部方向</option>
+              <option value="LONG">做多</option>
+              <option value="SHORT">做空</option>
+            </select>
+            <div className="scan-toolbar" style={{ margin: 0 }}>
+              <button className={tradeFilter === 'all' ? 'active' : ''} onClick={() => setTradeFilter('all')}>全部</button>
+              <button className={tradeFilter === 'normal' ? 'active' : ''} onClick={() => setTradeFilter('normal')}>普通策略</button>
+              <button className={tradeFilter === 'alpha' ? 'active' : ''} onClick={() => setTradeFilter('alpha')}>Alpha 策略</button>
+            </div>
           </div>
         </div>
-        {filteredTrades.length === 0 ? (
+        {historyLoading ? (
+          <div style={{ color: '#6b7280', padding: 20, textAlign: 'center' }}>加载历史交易...</div>
+        ) : historyError ? (
+          <div style={{ color: '#fbbf24', padding: 20, textAlign: 'center' }}>{historyError}</div>
+        ) : historyPage.items.length === 0 ? (
           <div style={{ color: '#6b7280', padding: 20, textAlign: 'center' }}>暂无历史交易</div>
         ) : (
           <>
@@ -427,14 +667,14 @@ export default function LiveTrading() {
                 <tr><th>币种</th><th>来源</th><th>方向</th><th>数量</th><th>开仓价</th><th>平仓价</th><th>盈亏</th><th>盈亏%</th><th>评分</th><th>时间</th></tr>
               </thead>
               <tbody>
-                {visibleTrades.map((t, i) => (
-                  <tr key={i}>
+                {historyPage.items.map((t) => (
+                  <tr key={`${t.account_id}-${t.symbol}-${t.side}`}>
                     <td style={{ fontWeight: 600, color: '#c9d1d9' }}>
                       {t.symbol}
-                      {t.close_count > 1 ? <span className="mini-pill" style={{ marginLeft: 6 }}>合并 {t.close_count}</span> : null}
+                      {t.position_count > 1 ? <span className="mini-pill" style={{ marginLeft: 6 }}>合并 {t.position_count}</span> : null}
                       {t.alpha_symbol ? <span className="mini-pill" style={{ marginLeft: 6 }}>{t.alpha_symbol}</span> : null}
                     </td>
-                    <td>{sourceText(t.strategy_source)}{t.alpha_profile ? ` · ${alphaProfileText(t.alpha_profile)}` : ''}</td>
+                    <td>{sourceText(t.strategy_source || (tradeFilter === 'all' ? null : tradeFilter))}{t.alpha_profile ? ` · ${alphaProfileText(t.alpha_profile)}` : ''}</td>
                     <td style={{ color: sideColor(t.side) }}>{sideText(t.side)}</td>
                     <td>{fmtValue(t.qty ?? t.quantity, 6)}</td>
                     <td>{t.entry_price ? `$${fmtValue(t.entry_price, 4)}` : '-'}</td>
@@ -448,9 +688,9 @@ export default function LiveTrading() {
               </tbody>
             </table>
             <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 12 }}>
-              <button onClick={() => setTradePage((p) => Math.max(1, p - 1))} disabled={tradePage === 1}>上一页</button>
-              <span style={{ color: '#9ca3af', padding: '4px 8px' }}>{tradePage}</span>
-              <button onClick={() => setTradePage((p) => p + 1)} disabled={tradePage * TRADES_PER_PAGE >= filteredTrades.length}>下一页</button>
+              <button onClick={goToPreviousHistoryPage} disabled={historyCursorStack.length === 0 || historyLoading}>上一页</button>
+              <span style={{ color: '#9ca3af', padding: '4px 8px' }}>{historyCursorStack.length + 1}</span>
+              <button onClick={goToNextHistoryPage} disabled={!historyPage.next_cursor || historyLoading}>下一页</button>
             </div>
           </>
         )}
