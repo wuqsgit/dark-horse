@@ -68,6 +68,34 @@ class InitSqlSchemaTest(unittest.TestCase):
             finally:
                 db.DB_PATH = original_db_path
 
+    def test_runtime_and_init_sql_create_history_page_snapshots(self):
+        original_db_path = db.DB_PATH
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db.DB_PATH = str(Path(temp_dir) / "runtime.db")
+            try:
+                db.init_db()
+                runtime = sqlite3.connect(db.DB_PATH)
+                initialized = sqlite3.connect(":memory:")
+                try:
+                    initialized.executescript(INIT_SQL.read_text(encoding="utf-8"))
+                    runtime_objects = schema_objects(runtime)
+                    initialized_objects = schema_objects(initialized)
+                    for object_key in (
+                        ("table", "trade_history_page_snapshots"),
+                        ("index", "idx_trade_history_snapshots_expiry"),
+                    ):
+                        self.assertIn(object_key, runtime_objects)
+                        self.assertIn(object_key, initialized_objects)
+                        self.assertEqual(
+                            initialized_objects[object_key],
+                            runtime_objects[object_key],
+                        )
+                finally:
+                    initialized.close()
+                    runtime.close()
+            finally:
+                db.DB_PATH = original_db_path
+
 
 if __name__ == "__main__":
     unittest.main()
