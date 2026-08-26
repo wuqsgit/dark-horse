@@ -19,6 +19,7 @@ node_modules/
 *.sqlite3
 logs/
 .runtime_logs/
+.runtime/trading-account-status.json
 server.log
 *.log
 

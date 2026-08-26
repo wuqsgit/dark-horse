@@ -38,7 +38,11 @@ from shared.policy_loop import (
     label_decision_outcomes,
     clear_legacy_backtest_data,
 )
-from shared.account_status_snapshot import load_account_snapshot, save_account_snapshot
+from shared.account_status_snapshot import (
+    load_account_snapshot,
+    sanitize_account_status_snapshot,
+    save_account_snapshot,
+)
 
 
 def _roll_max_layers():
@@ -2346,7 +2350,7 @@ def _load_persisted_trading_account_status_snapshot() -> None:
         logger.warning("Ignoring invalid persisted account status snapshot")
         return
     _account_status_snapshot.update({
-        "data": data,
+        "data": sanitize_account_status_snapshot(data),
         "time": float(snapshot_at),
         "last_error": None,
     })
@@ -2355,7 +2359,9 @@ def _load_persisted_trading_account_status_snapshot() -> None:
 async def _run_trading_account_status_refresh() -> dict:
     global _account_status_refresh_task
     try:
-        data = await asyncio.to_thread(_refresh_all_account_statuses_sync)
+        data = sanitize_account_status_snapshot(
+            await asyncio.to_thread(_refresh_all_account_statuses_sync)
+        )
         snapshot_at = time.time()
         save_account_snapshot(_ACCOUNT_STATUS_SNAPSHOT_PATH, {
             "data": data,
