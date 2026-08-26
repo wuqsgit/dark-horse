@@ -5,8 +5,13 @@ import test from 'node:test';
 import * as tradingSelection from './liveTradingAccountSelection.js';
 
 const {
+  accountSnapshotAvailability,
+  formatHistoryMoney,
+  formatHistoryValue,
   findSelectedAccount,
+  normalizeHistoryPage,
   normalizeSelectedAccount,
+  reconciliationStatusLabel,
   tradingEnvironmentDisplay,
 } = tradingSelection;
 
@@ -43,6 +48,76 @@ test('keeps existing concrete account selection', () => {
 test('finds only concrete account rows', () => {
   assert.equal(findSelectedAccount('all', accounts), null);
   assert.equal(findSelectedAccount(3, accounts).account_name, '账户A');
+});
+
+test('uses configured account identifiers for selection even when snapshots are absent', () => {
+  const configuredAccounts = [
+    { id: 3, name: '账户A', enabled: true },
+    { id: 8, name: '已禁用账户', enabled: false },
+  ];
+
+  assert.equal(normalizeSelectedAccount(8, configuredAccounts), 8);
+  assert.equal(findSelectedAccount(8, configuredAccounts).enabled, false);
+  assert.equal(normalizeSelectedAccount(null, configuredAccounts), 3);
+});
+
+test('marks missing and stale account snapshots without removing configured accounts', () => {
+  const configuredAccount = { id: 8, name: '账户B', enabled: false };
+
+  assert.equal(
+    accountSnapshotAvailability(configuredAccount, { accounts: [], fresh: true }),
+    'unavailable',
+  );
+  assert.equal(
+    accountSnapshotAvailability(
+      configuredAccount,
+      { accounts: [{ account_id: 8, status: 'ok' }], fresh: false },
+    ),
+    'stale',
+  );
+  assert.equal(
+    accountSnapshotAvailability(
+      configuredAccount,
+      { accounts: [{ account_id: 8, status: 'ok' }], fresh: true },
+      '账户快照刷新失败：timeout',
+    ),
+    'stale',
+  );
+  assert.equal(
+    accountSnapshotAvailability(
+      configuredAccount,
+      { accounts: [{ account_id: 8, status: 'ok' }], fresh: true },
+    ),
+    'available',
+  );
+});
+
+test('retains history reconciliation metadata and does not invent unknown numbers', () => {
+  const response = {
+    items: [{
+      symbol: 'BTCUSDT',
+      side: 'LONG',
+      quantity: null,
+      entry_price: null,
+      pnl: null,
+      reconcile_status: 'mismatch',
+    }],
+    next_cursor: 'cursor-2',
+    stats: { total_cycles: 1 },
+    reconcile_status: 'incomplete',
+  };
+
+  const page = normalizeHistoryPage(response);
+  assert.equal(page.reconcile_status, 'incomplete');
+  assert.strictEqual(page.items[0], response.items[0]);
+  assert.equal(page.items[0].reconcile_status, 'mismatch');
+  assert.equal(reconciliationStatusLabel(page.reconcile_status), '不完整');
+  assert.equal(reconciliationStatusLabel(page.items[0].reconcile_status), '对账不匹配');
+  assert.equal(formatHistoryValue(response.items[0].quantity, 6), '-');
+  assert.equal(formatHistoryMoney(response.items[0].entry_price, 4), '-');
+  assert.equal(formatHistoryMoney(response.items[0].pnl, 2, { signed: true }), '-');
+  assert.equal(formatHistoryValue(0, 6), '0.000000');
+  assert.equal(formatHistoryMoney(0, 2, { signed: true }), '+$0.00');
 });
 
 test('environment display degrades stale and failed snapshots', () => {
@@ -279,6 +354,17 @@ test('live trading clears a fatal snapshot error after a successful refresh', ()
   );
   assert.ok(applySnapshotBody, 'expected an applyAccountSnapshot callback');
   assert.match(applySnapshotBody[1], /setError\(null\)/);
+});
+
+test('live trading keeps configured accounts available when the initial snapshot fails', () => {
+  const initialSnapshotFailure = liveTradingSource.match(
+    /snapshot:\s*\{[\s\S]*?onRejected:\s*\(requestError\)\s*=>\s*\{([\s\S]*?)\n\s*\},[\s\S]*?onSettled:/,
+  );
+  assert.ok(initialSnapshotFailure, 'expected an initial snapshot failure handler');
+  assert.match(initialSnapshotFailure[1], /setSnapshotWarning\(/);
+  assert.doesNotMatch(initialSnapshotFailure[1], /setError\(/);
+  assert.match(liveTradingSource, /normalizeSelectedAccount\(selectedAccount, accountConfigs\)/);
+  assert.match(liveTradingSource, /accountConfigs\.map\(\(account\)\s*=>/);
 });
 
 test('live trading cancels account-scoped history and decision loads', () => {

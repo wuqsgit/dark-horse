@@ -1,12 +1,58 @@
+function accountIdentifier(account) {
+  return account?.account_id ?? account?.id;
+}
+
 export function normalizeSelectedAccount(selectedAccount, accounts = []) {
   if (!accounts.length) return null;
-  const exists = accounts.some((account) => String(account.account_id) === String(selectedAccount));
-  return exists ? selectedAccount : accounts[0].account_id;
+  const exists = accounts.some((account) => String(accountIdentifier(account)) === String(selectedAccount));
+  return exists ? selectedAccount : accountIdentifier(accounts[0]);
 }
 
 export function findSelectedAccount(selectedAccount, accounts = []) {
   if (selectedAccount == null || selectedAccount === 'all') return null;
-  return accounts.find((account) => String(account.account_id) === String(selectedAccount)) || null;
+  return accounts.find((account) => String(accountIdentifier(account)) === String(selectedAccount)) || null;
+}
+
+export function accountSnapshotAvailability(account, snapshot = {}, snapshotWarning = null) {
+  const snapshotAccount = findSelectedAccount(accountIdentifier(account), snapshot?.accounts || []);
+  if (!snapshotAccount) return 'unavailable';
+  if (snapshotWarning || snapshot?.last_error || snapshot?.fresh === false) return 'stale';
+  return 'available';
+}
+
+export function normalizeHistoryPage(data) {
+  return {
+    ...(data || {}),
+    items: Array.isArray(data?.items) ? data.items : [],
+    next_cursor: data?.next_cursor || null,
+    stats: data?.stats || {},
+  };
+}
+
+function hasKnownHistoryValue(value) {
+  return value !== null
+    && value !== undefined
+    && value !== ''
+    && Number.isFinite(Number(value));
+}
+
+export function formatHistoryValue(value, digits = 2) {
+  return hasKnownHistoryValue(value) ? Number(value).toFixed(digits) : '-';
+}
+
+export function formatHistoryMoney(value, digits = 2, { signed = false } = {}) {
+  if (!hasKnownHistoryValue(value)) return '-';
+  const amount = Number(value);
+  return `${signed && amount >= 0 ? '+' : ''}$${amount.toFixed(digits)}`;
+}
+
+export function reconciliationStatusLabel(status) {
+  const labels = {
+    ok: '完整',
+    incomplete: '不完整',
+    mismatch: '对账不匹配',
+  };
+  return labels[status] || '完整性未知';
 }
 
 export function tradingEnvironmentDisplay(snapshot = {}) {

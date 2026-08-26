@@ -9,12 +9,17 @@ import {
 import { adminFetch } from '../api/adminFetch';
 import TradingAccountManager from './TradingAccountManager';
 import {
+  accountSnapshotAvailability,
   advanceHistoryNavigation,
   createSingleFlightRequest,
   createHistoryNavigation,
+  formatHistoryMoney,
+  formatHistoryValue,
   findSelectedAccount,
   historyFailureTransition,
+  normalizeHistoryPage,
   normalizeSelectedAccount,
+  reconciliationStatusLabel,
   resetAccountScopedTradingState,
   retreatHistoryNavigation,
   settleIndependentLoads,
@@ -312,7 +317,7 @@ export default function LiveTrading() {
       snapshot: {
         onFulfilled: (data) => { if (active) applyAccountSnapshot(data); },
         onRejected: (requestError) => {
-          if (active) setError(`加载实盘数据失败: ${requestError.message}`);
+          if (active) setSnapshotWarning(`账户快照加载失败：${requestError.message}`);
         },
         onSettled: () => { if (active) setLoading(false); },
       },
@@ -335,10 +340,11 @@ export default function LiveTrading() {
   }, [applyAccountSnapshot, loadRuntimeStatus]);
 
   useEffect(() => {
-    const normalized = normalizeSelectedAccount(selectedAccount, accountsData.accounts || []);
+    const normalized = normalizeSelectedAccount(selectedAccount, accountConfigs);
     if (String(normalized) !== String(selectedAccount)) setSelectedAccount(normalized);
-  }, [accountsData.accounts, selectedAccount]);
+  }, [accountConfigs, selectedAccount]);
 
+  const selectedConfig = findSelectedAccount(selectedAccount, accountConfigs);
   const selectedRow = findSelectedAccount(selectedAccount, accountsData.accounts || []);
   const positions = selectedRow?.positions || [];
   const stats = historyPage.stats || {};
@@ -397,11 +403,7 @@ export default function LiveTrading() {
     }, { signal: controller.signal })
       .then((data) => {
         if (!active) return;
-        setHistoryPage({
-          items: Array.isArray(data?.items) ? data.items : [],
-          next_cursor: data?.next_cursor || null,
-          stats: data?.stats || {},
-        });
+        setHistoryPage(normalizeHistoryPage(data));
       })
       .catch((requestError) => {
         if (active && requestError.name !== 'AbortError') {
@@ -521,11 +523,25 @@ export default function LiveTrading() {
       <div className="trading-section">
         <TradingAccountManager accounts={accountConfigs} onChanged={refreshAccountData} />
         <div className="account-tabs" role="tablist" aria-label="交易账户">
-          {(accountsData.accounts || []).map((account) => (
-            <button key={account.account_id} className={String(selectedAccount) === String(account.account_id) ? 'active' : ''} onClick={() => setSelectedAccount(account.account_id)}>
-              {account.account_name}<span className={`account-health ${account.status}`} />
-            </button>
-          ))}
+          {accountConfigs.map((account) => {
+            const snapshotAccount = findSelectedAccount(account.id, accountsData.accounts || []);
+            const availability = accountSnapshotAvailability(account, accountsData, snapshotWarning);
+            const status = availability === 'available' ? snapshotAccount?.status || 'unavailable' : availability;
+            const statusLabel = availability === 'unavailable'
+              ? '状态不可用'
+              : availability === 'stale'
+                ? '状态过期'
+                : snapshotAccount?.status === 'ok'
+                  ? '状态正常'
+                  : `状态 ${snapshotAccount?.status || '未知'}`;
+            return (
+              <button key={account.id} className={String(selectedAccount) === String(account.id) ? 'active' : ''} onClick={() => setSelectedAccount(account.id)}>
+                {account.name || account.account_name || `账户 ${account.id}`}
+                <span className={`account-health ${status}`} />
+                <span className="mini-pill">{statusLabel}</span>
+              </button>
+            );
+          })}
         </div>
       </div>
       {warning && (
@@ -561,9 +577,7 @@ export default function LiveTrading() {
               inactiveText: 'Alpha 开仓已关闭',
             },
           ].map((item) => {
-            const enabled = selectedRow
-              ? Boolean(selectedRow[item.key])
-              : Boolean((accountsData.accounts || []).length && (accountsData.accounts || []).every((account) => account[item.key]));
+            const enabled = selectedConfig ? Boolean(selectedConfig[item.key]) : false;
             const relatedCount = positions.filter((p) => (p.strategy_source || 'normal') === item.mode).length;
             return (
               <div className="plain-card" key={item.mode}>
@@ -676,26 +690,29 @@ export default function LiveTrading() {
       <div className="trading-section">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
           <h3>历史交易</h3>
-          <div className="filters">
-            <input
-              aria-label="按币种筛选历史交易"
-              placeholder="币种，例如 BTCUSDT"
-              value={tradeSymbol}
-              onChange={(event) => setTradeSymbol(event.target.value.toUpperCase())}
-            />
-            <select
-              aria-label="按方向筛选历史交易"
-              value={tradeDirection}
-              onChange={(event) => setTradeDirection(event.target.value)}
-            >
-              <option value="all">全部方向</option>
-              <option value="LONG">做多</option>
-              <option value="SHORT">做空</option>
-            </select>
-            <div className="scan-toolbar" style={{ margin: 0 }}>
-              <button className={tradeFilter === 'all' ? 'active' : ''} onClick={() => setTradeFilter('all')}>全部</button>
-              <button className={tradeFilter === 'normal' ? 'active' : ''} onClick={() => setTradeFilter('normal')}>普通策略</button>
-              <button className={tradeFilter === 'alpha' ? 'active' : ''} onClick={() => setTradeFilter('alpha')}>Alpha 策略</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span className="mini-pill">完整性：{reconciliationStatusLabel(historyPage.reconcile_status)}</span>
+            <div className="filters">
+              <input
+                aria-label="按币种筛选历史交易"
+                placeholder="币种，例如 BTCUSDT"
+                value={tradeSymbol}
+                onChange={(event) => setTradeSymbol(event.target.value.toUpperCase())}
+              />
+              <select
+                aria-label="按方向筛选历史交易"
+                value={tradeDirection}
+                onChange={(event) => setTradeDirection(event.target.value)}
+              >
+                <option value="all">全部方向</option>
+                <option value="LONG">做多</option>
+                <option value="SHORT">做空</option>
+              </select>
+              <div className="scan-toolbar" style={{ margin: 0 }}>
+                <button className={tradeFilter === 'all' ? 'active' : ''} onClick={() => setTradeFilter('all')}>全部</button>
+                <button className={tradeFilter === 'normal' ? 'active' : ''} onClick={() => setTradeFilter('normal')}>普通策略</button>
+                <button className={tradeFilter === 'alpha' ? 'active' : ''} onClick={() => setTradeFilter('alpha')}>Alpha 策略</button>
+              </div>
             </div>
           </div>
         </div>
@@ -715,10 +732,13 @@ export default function LiveTrading() {
           <>
             <table className="trade-table">
               <thead>
-                <tr><th>币种</th><th>来源</th><th>方向</th><th>数量</th><th>开仓价</th><th>平仓价</th><th>盈亏</th><th>盈亏%</th><th>评分</th><th>时间</th></tr>
+                <tr><th>币种</th><th>来源</th><th>方向</th><th>数量</th><th>开仓价</th><th>平仓价</th><th>盈亏</th><th>盈亏%</th><th>完整性</th><th>评分</th><th>时间</th></tr>
               </thead>
               <tbody>
-                {historyPage.items.map((t) => (
+                {historyPage.items.map((t) => {
+                  const pnlText = formatHistoryMoney(t.pnl, 2, { signed: true });
+                  const pnlPctText = formatHistoryValue(t.pnl_pct);
+                  return (
                   <tr key={`${t.account_id}-${t.symbol}-${t.side}`}>
                     <td style={{ fontWeight: 600, color: '#c9d1d9' }}>
                       {t.symbol}
@@ -727,15 +747,17 @@ export default function LiveTrading() {
                     </td>
                     <td>{strategySourcesLabel(t.strategy_sources)}{t.alpha_profile ? ` · ${alphaProfileText(t.alpha_profile)}` : ''}</td>
                     <td style={{ color: sideColor(t.side) }}>{sideText(t.side)}</td>
-                    <td>{fmtValue(t.qty ?? t.quantity, 6)}</td>
-                    <td>{t.entry_price ? `$${fmtValue(t.entry_price, 4)}` : '-'}</td>
-                    <td>{t.exit_price ? `$${fmtValue(t.exit_price, 4)}` : '-'}</td>
-                    <td style={pnlColor(t.pnl)}>{Number(t.pnl || 0) >= 0 ? '+' : ''}${fmt(t.pnl)}</td>
-                    <td style={pnlColor(t.pnl_pct)}>{t.pnl_pct != null ? `${fmtValue(t.pnl_pct)}%` : '-'}</td>
+                    <td>{formatHistoryValue(t.qty ?? t.quantity, 6)}</td>
+                    <td>{formatHistoryMoney(t.entry_price, 4)}</td>
+                    <td>{formatHistoryMoney(t.exit_price, 4)}</td>
+                    <td style={pnlText === '-' ? undefined : pnlColor(t.pnl)}>{pnlText}</td>
+                    <td style={pnlPctText === '-' ? undefined : pnlColor(t.pnl_pct)}>{pnlPctText === '-' ? '-' : `${pnlPctText}%`}</td>
+                    <td><span className="mini-pill">{reconciliationStatusLabel(t.reconcile_status)}</span></td>
                     <td>{t.score_at_entry != null ? `${t.grade_at_entry ? `${t.grade_at_entry} ` : ''}${fmt(t.score_at_entry, 1)}` : '-'}</td>
                     <td>{timeText(t.exit_time || t.entry_time)}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
             <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 12 }}>
