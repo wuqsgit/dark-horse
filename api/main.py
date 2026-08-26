@@ -1932,14 +1932,40 @@ def _parse_history_timestamp(value: str | None):
         ) from None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _account_history_payload(
+    account_id: int,
+    *,
+    cursor: str | None,
+    limit: int,
+    symbol: str | None,
+    direction: str | None,
+    source: str | None,
+    from_time: str | None,
+    to_time: str | None,
+) -> dict:
+    from shared.trade_history import fetch_trade_history_summaries
+
+    _trading_account_or_404(account_id)
+    return fetch_trade_history_summaries(
+        account_id,
+        cursor=cursor,
+        limit=limit,
+        symbol=symbol,
+        direction=direction,
+        source=source,
+        from_time=from_time,
+        to_time=to_time,
+    )
 
 
 @app.get("/api/trading/accounts/{account_id}/history")
 async def get_account_history(
     account_id: int,
     cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    limit: int = 20,
     symbol: str | None = None,
     direction: str | None = None,
     source: str | None = None,
@@ -1947,9 +1973,11 @@ async def get_account_history(
     to_time: Annotated[str | None, Query(alias="to")] = None,
     user=Depends(get_user),
 ):
-    from shared.trade_history import fetch_trade_history_summaries
-
-    _trading_account_or_404(account_id)
+    if not 1 <= limit <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_limit"},
+        )
     normalized_direction = str(direction).strip().upper() if direction else None
     if normalized_direction not in {None, "LONG", "SHORT"}:
         raise HTTPException(
@@ -1964,15 +1992,16 @@ async def get_account_history(
             detail={"code": "invalid_date"},
         )
     try:
-        return fetch_trade_history_summaries(
+        return await asyncio.to_thread(
+            _account_history_payload,
             account_id,
             cursor=cursor,
             limit=limit,
             symbol=symbol,
             direction=normalized_direction,
             source=source,
-            from_time=from_time,
-            to_time=to_time,
+            from_time=parsed_from,
+            to_time=parsed_to,
         )
     except ValueError as exc:
         code = str(exc)
@@ -1984,8 +2013,7 @@ async def get_account_history(
         raise
 
 
-@app.get("/api/trading/accounts/{account_id}/decisions")
-async def get_account_decisions(account_id: int, user=Depends(get_user)):
+def _account_decisions_payload(account_id: int) -> dict:
     from shared.db import get_conn
 
     _trading_account_or_404(account_id)
@@ -1993,8 +2021,12 @@ async def get_account_decisions(account_id: int, user=Depends(get_user)):
         return _account_decision_panel(conn, account_id)
 
 
-@app.get("/api/trading/runtime/status")
-async def get_trading_runtime_status(user=Depends(get_user)):
+@app.get("/api/trading/accounts/{account_id}/decisions")
+async def get_account_decisions(account_id: int, user=Depends(get_user)):
+    return await asyncio.to_thread(_account_decisions_payload, account_id)
+
+
+def _trading_runtime_status_payload() -> dict:
     from shared.accounts import list_accounts
     from shared.live_diagnostics import build_live_diagnostics
 
@@ -2011,6 +2043,11 @@ async def get_trading_runtime_status(user=Depends(get_user)):
             for account in accounts
         ],
     }
+
+
+@app.get("/api/trading/runtime/status")
+async def get_trading_runtime_status(user=Depends(get_user)):
+    return await asyncio.to_thread(_trading_runtime_status_payload)
 
 
 @app.get("/api/trading/positions_history")

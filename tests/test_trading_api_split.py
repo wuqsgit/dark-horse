@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import threading
@@ -8,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 from fastapi import Response
 from fastapi.testclient import TestClient
 
@@ -171,17 +173,17 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
                 [
                     (
                         self.account_id, "BTCUSDT-cycle-1", "BTCUSDT", "LONG",
-                        "2026-08-20T01:00:00Z", "2026-08-20T02:00:00Z",
+                        "2026-08-20 01:00:00", "2026-08-20 02:00:00",
                         100000, 101000, 0.01, 10, 1, 1, "exchange_income", "normal",
                     ),
                     (
                         self.account_id, "BTCUSDT-cycle-2", "BTCUSDT", "LONG",
-                        "2026-08-21T01:00:00Z", "2026-08-21T02:00:00Z",
+                        "2026-08-21 01:00:00", "2026-08-21 02:00:00",
                         102000, 101000, 0.01, -10, -1, 1, "exchange_income", "alpha",
                     ),
                     (
                         self.account_id, "ETHUSDT-cycle-1", "ETHUSDT", "SHORT",
-                        "2026-08-22T01:00:00Z", "2026-08-22T02:00:00Z",
+                        "2026-08-22 01:00:00", "2026-08-22 02:00:00",
                         4000, 3900, 0.1, 10, 2.5, 1, "exchange_income", "normal",
                     ),
                 ],
@@ -205,6 +207,22 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.client.close()
         db.DB_PATH = self.original_db_path
         self.temp.cleanup()
+
+    async def _request_slow_route_and_snapshot(self, path):
+        transport = httpx.ASGITransport(app=self.main.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            scheduled_at = time.monotonic()
+            slow_request = asyncio.create_task(client.get(path))
+            snapshot_request = asyncio.create_task(
+                client.get("/api/trading/accounts/status")
+            )
+            snapshot = await snapshot_request
+            snapshot_elapsed = time.monotonic() - scheduled_at
+            slow_response = await slow_request
+        return slow_response, snapshot, snapshot_elapsed
 
     def test_legacy_trading_routes_are_removed(self):
         with patch(
@@ -256,6 +274,8 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
             ({"cursor": "not-a-cursor"}, "invalid_history_cursor"),
             ({"direction": "SIDEWAYS"}, "invalid_direction"),
             ({"from": "not-a-date"}, "invalid_date"),
+            ({"limit": 0}, "invalid_limit"),
+            ({"limit": 101}, "invalid_limit"),
             (
                 {"from": "2026-08-22T00:00:00Z", "to": "2026-08-21T00:00:00Z"},
                 "invalid_date",
@@ -269,6 +289,49 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
                 )
                 self.assertEqual(invalid.status_code, 400)
                 self.assertEqual(invalid.json()["detail"]["code"], code)
+
+    def test_history_route_normalizes_iso_filters_to_db_timestamps(self):
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO fills
+                   (account_id, symbol, side, position_side, quantity, price,
+                    trade_id, created_at, strategy_source)
+                   VALUES (?, 'SOLUSDT', ?, 'LONG', 1, ?, ?, ?, 'normal')""",
+                [
+                    (
+                        self.account_id,
+                        "BUY",
+                        100,
+                        "sol-open",
+                        "2026-08-24 01:00:00",
+                    ),
+                    (
+                        self.account_id,
+                        "SELL",
+                        110,
+                        "sol-close",
+                        "2026-08-24 02:00:00",
+                    ),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get(
+            f"/api/trading/accounts/{self.account_id}/history",
+            params={
+                "from": "2026-08-24T02:00:00Z",
+                "to": "2026-08-24T02:00:00Z",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [(row["symbol"], row["side"]) for row in response.json()["items"]],
+            [("SOLUSDT", "LONG")],
+        )
 
     def test_history_and_decisions_reject_unknown_accounts(self):
         for suffix in ("history", "decisions"):
@@ -298,6 +361,121 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.assertIn("runtime_diagnostics", account)
         self.assertNotIn("api_key", account)
         self.assertNotIn("api_secret", account)
+
+    def test_slow_history_computation_does_not_block_snapshot_reads(self):
+        helper_threads = []
+
+        def slow_history(*_args, **_kwargs):
+            helper_threads.append(threading.get_ident())
+            time.sleep(0.4)
+            return {
+                "items": [],
+                "next_cursor": None,
+                "stats": {},
+                "reconcile_status": "ok",
+            }
+
+        event_loop_thread = threading.get_ident()
+        with patch(
+            "shared.trade_history.fetch_trade_history_summaries",
+            side_effect=slow_history,
+        ):
+            slow, snapshot, elapsed = asyncio.run(
+                self._request_slow_route_and_snapshot(
+                    f"/api/trading/accounts/{self.account_id}/history"
+                )
+            )
+
+        self.assertEqual(slow.status_code, 200)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(len(helper_threads), 1)
+        self.assertNotEqual(helper_threads[0], event_loop_thread)
+
+    def test_slow_decision_sqlite_work_does_not_block_snapshot_reads(self):
+        event_loop_thread = threading.get_ident()
+        connection_threads = {"open": [], "close": []}
+        panel_threads = []
+        real_get_conn = db.get_conn
+
+        class TrackedConnection:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+            def close(self):
+                connection_threads["close"].append(threading.get_ident())
+                self.conn.close()
+
+        def tracked_get_conn():
+            connection_threads["open"].append(threading.get_ident())
+            return TrackedConnection(real_get_conn())
+
+        def slow_panel(_conn, _account_id):
+            panel_threads.append(threading.get_ident())
+            time.sleep(0.4)
+            return {"latest_run_id": "slow-local-run", "recent": []}
+
+        with patch("shared.db.get_conn", side_effect=tracked_get_conn), patch.object(
+            self.main,
+            "_account_decision_panel",
+            side_effect=slow_panel,
+        ):
+            slow, snapshot, elapsed = asyncio.run(
+                self._request_slow_route_and_snapshot(
+                    f"/api/trading/accounts/{self.account_id}/decisions"
+                )
+            )
+
+        self.assertEqual(slow.status_code, 200)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(connection_threads["open"], panel_threads)
+        self.assertEqual(connection_threads["close"], panel_threads)
+        self.assertNotEqual(panel_threads[0], event_loop_thread)
+
+    def test_slow_runtime_local_reads_do_not_block_or_use_exchange(self):
+        from shared.accounts import list_accounts
+
+        configured_accounts = list_accounts()
+        event_loop_thread = threading.get_ident()
+        runtime_threads = {"accounts": [], "diagnostics": []}
+
+        def slow_list_accounts(*_args, **_kwargs):
+            runtime_threads["accounts"].append(threading.get_ident())
+            time.sleep(0.4)
+            return configured_accounts
+
+        def local_diagnostics(account):
+            runtime_threads["diagnostics"].append(threading.get_ident())
+            return {"status": "healthy", "account_id": account["id"]}
+
+        with patch(
+            "shared.accounts.list_accounts",
+            side_effect=slow_list_accounts,
+        ), patch(
+            "shared.live_diagnostics.build_live_diagnostics",
+            side_effect=local_diagnostics,
+        ), patch(
+            "shared.accounts.account_exchange_config",
+            side_effect=AssertionError("runtime must not validate credentials"),
+        ), patch(
+            "trader.exchange.BinanceFutures",
+            side_effect=AssertionError("runtime must not instantiate Binance"),
+        ):
+            slow, snapshot, elapsed = asyncio.run(
+                self._request_slow_route_and_snapshot(
+                    "/api/trading/runtime/status"
+                )
+            )
+
+        self.assertEqual(slow.status_code, 200)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(runtime_threads["accounts"], runtime_threads["diagnostics"])
+        self.assertNotEqual(runtime_threads["accounts"][0], event_loop_thread)
 
     def test_local_read_routes_remain_responsive_during_exchange_timeout(self):
         entered_margin_call = threading.Event()
