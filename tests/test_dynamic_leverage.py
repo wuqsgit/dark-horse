@@ -48,6 +48,41 @@ class DynamicLeverageTest(unittest.TestCase):
         self.assertEqual(result.get("leverage"), 8)
         self.assertEqual(result.get("leverage_stop_pct"), 0.025)
 
+    def test_expanded_probe_sizing_uses_new_margin_and_risk_caps(self):
+        balance = 707.22739282
+        result = calculate_position(
+            AtrExchange(0.03),
+            "SOLUSDT",
+            price=100.0,
+            balance=balance,
+            score=64,
+            category="core_bluechip",
+            entry_mode="probe",
+        )
+
+        self.assertEqual(result["leverage"], 3)
+        self.assertAlmostEqual(result["target_margin_pct"], 0.075 * 0.85)
+        self.assertAlmostEqual(result["risk_per_trade_pct"], 0.0075)
+        self.assertAlmostEqual(result["margin"], balance * 0.05)
+
+    def test_all_sizing_classes_use_expanded_margin_bands(self):
+        expected_risk = {
+            "core_bluechip": 0.0075,
+            "large_cap": 0.0075,
+            "fundamental": 0.0075,
+            "narrative": 0.00675,
+            "meme": 0.00525,
+            "alpha": 0.0075,
+        }
+        for category, risk_pct in expected_risk.items():
+            with self.subTest(category=category):
+                _, sizing = _position_sizing_config("TESTUSDT", category)
+                self.assertEqual(sizing["probe_margin_pct"], 0.075)
+                self.assertEqual(sizing["confirmed_margin_pct"], 0.10)
+                self.assertEqual(sizing["strong_margin_pct"], 0.15)
+                self.assertEqual(sizing["max_margin_pct"], 0.15)
+                self.assertEqual(sizing["risk_per_trade_pct"], risk_pct)
+
 
 if __name__ == "__main__":
     unittest.main()

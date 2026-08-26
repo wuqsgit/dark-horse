@@ -27,6 +27,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("engine")
 
+EMPTY_SYMBOL_DEGRADE_AFTER = 2
+_consecutive_empty_symbol_runs = 0
+
+
+def _register_symbol_count(count: int) -> int:
+    """Return consecutive empty scans, resetting after any healthy universe."""
+    global _consecutive_empty_symbol_runs
+    if int(count) > 0:
+        _consecutive_empty_symbol_runs = 0
+    else:
+        _consecutive_empty_symbol_runs += 1
+    return _consecutive_empty_symbol_runs
+
 
 def next_hourly_run(now, minute=10):
     """Return the next UTC hourly slot without ever scheduling in the past."""
@@ -54,13 +67,22 @@ async def run_scoring():
     engine = ScoringEngine()
     try:
         symbols = fetch_active_symbols()
+        empty_runs = _register_symbol_count(len(symbols))
         if not symbols:
-            logger.warning("No symbols")
+            if empty_runs < EMPTY_SYMBOL_DEGRADE_AFTER:
+                logger.warning(
+                    "No symbols (transient %s/%s); preserving last healthy status",
+                    empty_runs,
+                    EMPTY_SYMBOL_DEGRADE_AFTER,
+                )
+                return
+            logger.warning("No symbols for %s consecutive scoring runs", empty_runs)
             upsert_service_runtime_status(
                 "engine",
                 status="degraded",
                 error_code="normal_symbols_empty",
                 last_error="普通策略没有可评分币种。",
+                details={"consecutive_empty_runs": empty_runs},
             )
             return
         logger.info(f"Scoring {len(symbols)} symbols")

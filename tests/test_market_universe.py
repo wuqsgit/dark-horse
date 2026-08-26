@@ -65,6 +65,35 @@ class MarketUniverseTest(unittest.TestCase):
         self.assertTrue(result.ready)
         self.assertIsNone(result.error)
 
+    def test_readiness_allows_previous_bucket_during_ingestion_grace(self):
+        now = datetime(2026, 7, 10, 4, 1, tzinfo=timezone.utc)
+        state = CandleState(
+            datetime(2026, 7, 10, 3, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 10, 2, 0, tzinfo=timezone.utc),
+            40,
+            50,
+        )
+
+        result = assess_dual_market_readiness(now, state, state)
+
+        self.assertTrue(result.ready)
+        self.assertIsNone(result.error)
+
+    def test_readiness_rejects_previous_bucket_after_ingestion_grace(self):
+        now = datetime(2026, 7, 10, 4, 3, tzinfo=timezone.utc)
+        state = CandleState(
+            datetime(2026, 7, 10, 3, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 10, 2, 0, tzinfo=timezone.utc),
+            40,
+            50,
+        )
+
+        result = assess_dual_market_readiness(now, state, state)
+
+        self.assertFalse(result.ready)
+        self.assertIn("spot_15m_age", result.error)
+        self.assertIn("spot_1h_age", result.error)
+
 
 if __name__ == "__main__":
     unittest.main()
