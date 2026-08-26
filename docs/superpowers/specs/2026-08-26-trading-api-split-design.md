@@ -60,9 +60,12 @@ exchange synchronously. The normal snapshot TTL and frontend poll interval are
 ### `GET /api/trading/accounts/{account_id}/history`
 
 Returns the selected account's historical trade summaries. Supported query
-parameters are `cursor`, `limit`, `symbol`, `direction`, `from`, and `to`.
+parameters are `cursor`, `limit`, `symbol`, `direction`, `source`, `from`, and `to`.
 Pagination is cursor-based and deterministic. Each returned row represents one
 `(account_id, symbol, direction)` summary within the requested date filter.
+The `source` filter selects matching position cycles before aggregation; it does
+not become part of the grouping key. The response also contains cycle-level
+win/loss statistics so portfolio metrics are not inferred from lifetime rows.
 
 The endpoint calls one canonical backend history-summary service. No controller
 or frontend component may implement a second grouping algorithm.
@@ -166,8 +169,8 @@ Other fields are defined as follows:
   configured numeric tolerance, otherwise `incomplete` or `mismatch`.
 
 For the full-history request, a symbol and direction can occur only once in the
-response. A date filter creates the same one-row projection over cycles whose
-exit time falls inside the requested range.
+response. Date and source filters create the same one-row projection after
+selecting cycles whose exit time and strategy source match the request.
 
 ## Background Refresh and Persistence
 
