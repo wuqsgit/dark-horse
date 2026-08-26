@@ -17,6 +17,34 @@ def fill(account_id, symbol, side, quantity, price, trade_id, created_at, positi
 
 
 class TradeHistorySummaryTest(unittest.TestCase):
+    def test_same_second_fills_use_numeric_id_order(self):
+        first = fill(1, "AKEUSDT", "BUY", 1, 10, "t2", "2026-08-22 01:00:00")
+        second = fill(1, "AKEUSDT", "SELL", 1, 12, "t10", "2026-08-22 01:00:00")
+        first["id"] = 2
+        second["id"] = 10
+
+        cycle = reconstruct_position_cycles([first, second])[0]
+
+        self.assertEqual(cycle["direction"], "LONG")
+        self.assertAlmostEqual(cycle["entry_price"], 10)
+        self.assertAlmostEqual(cycle["exit_price"], 12)
+
+    def test_non_execution_sides_are_ignored_before_cycle_accounting(self):
+        fills = [
+            fill(1, "AKEUSDT", "REALIZED_PNL", 1, 100, "income", "2026-08-22 01:00:00"),
+            fill(1, "AKEUSDT", "BUY", 1, 10, "buy", "2026-08-22 02:00:00"),
+            fill(1, "AKEUSDT", "SELL", 1, 12, "sell", "2026-08-22 03:00:00"),
+        ]
+
+        unique = deduplicate_fills(fills)
+        cycles = reconstruct_position_cycles(fills)
+
+        self.assertEqual([row["side"] for row in unique], ["BUY", "SELL"])
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0]["direction"], "LONG")
+        self.assertEqual(cycles[0]["entry_fills"][0]["trade_id"], "buy")
+        self.assertEqual(cycles[0]["exit_fills"][0]["trade_id"], "sell")
+
     def test_deduplicate_fills_uses_normalized_trade_identity(self):
         fills = [
             fill(1, "akeusdt", "BUY", 100, 10, "A1:t1", "2026-08-22 01:00:00"),

@@ -3,6 +3,10 @@
 from collections.abc import Iterable, Mapping
 
 
+def _is_execution_fill(row):
+    return str(row.get("side") or "").upper() in {"BUY", "SELL"}
+
+
 def _fill_identity(row):
     trade_id = str(row.get("trade_id") or "").split(":")[-1]
     if trade_id:
@@ -18,9 +22,15 @@ def _fill_identity(row):
 
 
 def _fill_sort_key(row):
+    raw_id = row.get("id")
+    id_text = str(raw_id or "")
+    try:
+        id_key = (0, int(raw_id))
+    except (TypeError, ValueError):
+        id_key = (1, id_text)
     return (
         str(row.get("created_at") or ""),
-        str(row.get("id") or ""),
+        id_key,
         str(row.get("trade_id") or ""),
     )
 
@@ -29,6 +39,8 @@ def deduplicate_fills(rows: Iterable[Mapping]) -> list[dict]:
     unique = {}
     for original in rows:
         row = dict(original)
+        if not _is_execution_fill(row):
+            continue
         unique.setdefault(_fill_identity(row), row)
     return sorted(unique.values(), key=_fill_sort_key)
 
@@ -49,6 +61,8 @@ def _position_side(row):
 def _signed_quantity(row):
     quantity = abs(float(row.get("quantity") or 0))
     side = str(row.get("side") or "").upper()
+    if side not in {"BUY", "SELL"}:
+        return 0.0
     return quantity if side == "BUY" else -quantity
 
 
