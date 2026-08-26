@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fetchTradingAccounts,
   fetchTradingAccountsStatus,
-  fetchTradingDecisions,
   fetchTradingHistory,
   fetchTradingRuntimeStatus,
 } from '../api/tradingData';
@@ -129,59 +128,6 @@ function volumePriceActionText(v) {
   return map[v] || v || '-';
 }
 
-function DecisionPanel({ panel, loading, error }) {
-  if (loading) return <div className="trading-section">加载交易决策...</div>;
-  if (error) {
-    return <div className="trading-section" style={{ color: '#fbbf24' }}>{error}</div>;
-  }
-
-  const reasons = panel?.top_reasons || [];
-  const recent = panel?.recent || [];
-  const latestDecision = recent[0];
-  const lastExecutionTime = panel?.last_execution_time || panel?.latest_time;
-  const lastExecutionText = lastExecutionTime ? timeText(lastExecutionTime) : '暂无记录';
-
-  return (
-    <div className="trading-section">
-      <h3>系统刚才为什么没动手</h3>
-      <div className="plain-grid">
-        <div className="plain-card">
-          <div className="plain-title">开仓前检查</div>
-          <div className="plain-meta">最后执行：{lastExecutionText}</div>
-          <div className="plain-meta">策略学习规则：{panel?.active_entry_policy_count || 0} 条已生效 | {panel?.active_entry_policy_version || 'empty'}</div>
-          <div className="plain-text">
-            普通信号和 Alpha 信号都会先过分数、模板、方向、账户风控和 Binance 实时盘口；Alpha 还会检查分类模板、entry_level、futures 映射和信号新鲜度。
-          </div>
-        </div>
-        <div className="plain-card">
-          <div className="plain-title">持仓后检查</div>
-          <div className="plain-text">
-            持仓会继续看 Hold Alpha、评分衰减、盘口变弱、时间止损、移动止盈和 TP1/TP2，触发后自动减仓或平仓。
-          </div>
-        </div>
-      </div>
-      <div className="muted-box">
-        当前开仓线：{panel?.entry_gate_plain || '按币种模板判断'}　行情状态：{panel?.regime_effect_plain || '只调整名额和仓位'}
-      </div>
-      {reasons.length > 0 ? (
-        <div className="reason-list">
-          {reasons.map((r, i) => (
-            <div className="reason-row" key={`${r.reason}-${i}`}><span>{r.plain || r.reason}</span><b>{r.count} 次</b></div>
-          ))}
-        </div>
-      ) : <div className="muted-box" style={{ marginTop: 10 }}>最近一轮没有记录到过滤原因。</div>}
-      {latestDecision && (
-        <div className="decision-strip">
-          <div className="decision-pill">
-            <strong>{latestDecision.symbol}</strong>
-            <span>{latestDecision.plain || latestDecision.result}</span>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function RuntimeDiagnostics({ diagnostics }) {
   if (!diagnostics) return null;
   const issues = diagnostics.issues || [];
@@ -246,9 +192,6 @@ export default function LiveTrading() {
   const [historyError, setHistoryError] = useState(null);
   const [historyNavigation, setHistoryNavigation] = useState(createHistoryNavigation());
   const [historyRetryToken, setHistoryRetryToken] = useState(0);
-  const [decisionsData, setDecisionsData] = useState(null);
-  const [decisionsLoading, setDecisionsLoading] = useState(false);
-  const [decisionsError, setDecisionsError] = useState(null);
   const runtimeControllerRef = useRef(null);
   if (!runtimeControllerRef.current) {
     runtimeControllerRef.current = createSingleFlightRequest(
@@ -368,17 +311,11 @@ export default function LiveTrading() {
       historyNavigation,
       historyError,
       historyLoading,
-      decisionsData,
-      decisionsError,
-      decisionsLoading,
     }, historyQueryKey);
     setHistoryPage(emptyState.historyPage);
     setHistoryNavigation(emptyState.historyNavigation);
     setHistoryError(emptyState.historyError);
     setHistoryLoading(emptyState.historyLoading);
-    setDecisionsData(emptyState.decisionsData);
-    setDecisionsError(emptyState.decisionsError);
-    setDecisionsLoading(emptyState.decisionsLoading);
   }, [historyQueryKey, selectedAccount]);
 
   useEffect(() => {
@@ -437,27 +374,6 @@ export default function LiveTrading() {
     historyCursor,
     historyRetryToken,
   ]);
-
-  useEffect(() => {
-    if (selectedAccount === null || selectedAccount === undefined) return undefined;
-    const controller = new AbortController();
-    let active = true;
-    setDecisionsData(null);
-    setDecisionsLoading(true);
-    setDecisionsError(null);
-    fetchTradingDecisions(selectedAccount, { signal: controller.signal })
-      .then((data) => { if (active) setDecisionsData(data); })
-      .catch((requestError) => {
-        if (active && requestError.name !== 'AbortError') {
-          setDecisionsError(`交易决策加载失败：${requestError.message}`);
-        }
-      })
-      .finally(() => { if (active) setDecisionsLoading(false); });
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [selectedAccount]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -684,8 +600,6 @@ export default function LiveTrading() {
           </div>
         )}
       </div>
-
-      <DecisionPanel panel={decisionsData} loading={decisionsLoading} error={decisionsError} />
 
       <div className="trading-section">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>

@@ -109,9 +109,6 @@ export function emptyAccountScopedTradingState(queryKey = null) {
     historyNavigation: createHistoryNavigation(queryKey),
     historyError: null,
     historyLoading: false,
-    decisionsData: null,
-    decisionsError: null,
-    decisionsLoading: false,
   };
 }
 

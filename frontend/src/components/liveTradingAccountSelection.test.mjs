@@ -190,9 +190,6 @@ test('populated account-scoped state resets immediately when the account becomes
     },
     historyError: 'old error',
     historyLoading: true,
-    decisionsData: { recent: [{ id: 2 }] },
-    decisionsError: 'decision error',
-    decisionsLoading: true,
   };
 
   assert.deepEqual(tradingSelection.resetAccountScopedTradingState(populated, 'no-account'), {
@@ -204,9 +201,6 @@ test('populated account-scoped state resets immediately when the account becomes
     },
     historyError: null,
     historyLoading: false,
-    decisionsData: null,
-    decisionsError: null,
-    decisionsLoading: false,
   });
 });
 
@@ -304,7 +298,6 @@ test('live trading consumers use only the split trading data client', () => {
     'fetchTradingAccounts',
     'fetchTradingAccountsStatus',
     'fetchTradingHistory',
-    'fetchTradingDecisions',
     'fetchTradingRuntimeStatus',
   ]) {
     assert.match(liveTradingSource, new RegExp(`\\b${clientFunction}\\(`));
@@ -312,6 +305,7 @@ test('live trading consumers use only the split trading data client', () => {
   assert.match(liveTradingSource, /from ['"]\.\.\/api\/tradingData['"]/);
   assert.match(environmentStatusSource, /from ['"]\.\.\/api\/tradingData['"]/);
   assert.doesNotMatch(liveTradingSource, /tradingAccountsStatus|\/api\/trading\/status/);
+  assert.doesNotMatch(liveTradingSource, /fetchTradingDecisions/);
   assert.doesNotMatch(environmentStatusSource, /tradingAccountsStatus|\/api\/trading\/status/);
 });
 
@@ -367,22 +361,19 @@ test('live trading keeps configured accounts available when the initial snapshot
   assert.match(liveTradingSource, /accountConfigs\.map\(\(account\)\s*=>/);
 });
 
-test('live trading cancels account-scoped history and decision loads', () => {
+test('live trading cancels account-scoped history loads without requesting decisions', () => {
   assert.ok(
-    (liveTradingSource.match(/new AbortController\(\)/g) || []).length >= 2,
-    'expected independently cancellable history and decision requests',
+    (liveTradingSource.match(/new AbortController\(\)/g) || []).length >= 1,
+    'expected cancellable history requests',
   );
   assert.match(
     liveTradingSource,
     /fetchTradingHistory\(selectedAccount,[\s\S]*?\{ signal: controller\.signal \}/,
   );
-  assert.match(
-    liveTradingSource,
-    /fetchTradingDecisions\(selectedAccount, \{ signal: controller\.signal \}\)/,
-  );
+  assert.doesNotMatch(liveTradingSource, /fetchTradingDecisions|DecisionPanel|系统刚才为什么没动手/);
   assert.ok(
-    (liveTradingSource.match(/controller\.abort\(\)/g) || []).length >= 2,
-    'expected both account-scoped effects to abort on cleanup',
+    (liveTradingSource.match(/controller\.abort\(\)/g) || []).length >= 1,
+    'expected the history effect to abort on cleanup',
   );
 });
 
@@ -405,5 +396,5 @@ test('live trading keeps history recovery controls visible and clears null accou
   assert.doesNotMatch(liveTradingSource, /: historyError \? \(/);
   assert.match(liveTradingSource, /resetAccountScopedTradingState\(/);
   assert.match(liveTradingSource, /setHistoryPage\(emptyState\.historyPage\)/);
-  assert.match(liveTradingSource, /setDecisionsData\(emptyState\.decisionsData\)/);
+  assert.doesNotMatch(liveTradingSource, /setDecisionsData|setDecisionsError|setDecisionsLoading/);
 });
