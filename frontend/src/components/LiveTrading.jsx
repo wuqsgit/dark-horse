@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fetchTradingAccounts,
   fetchTradingAccountsStatus,
@@ -8,7 +8,19 @@ import {
 } from '../api/tradingData';
 import { adminFetch } from '../api/adminFetch';
 import TradingAccountManager from './TradingAccountManager';
-import { findSelectedAccount, normalizeSelectedAccount } from './liveTradingAccountSelection';
+import {
+  advanceHistoryNavigation,
+  createHistoryNavigation,
+  emptyAccountScopedTradingState,
+  findSelectedAccount,
+  finishLatestRequest,
+  invalidateLatestRequest,
+  isLatestRequest,
+  normalizeSelectedAccount,
+  retreatHistoryNavigation,
+  startLatestRequest,
+  strategySourcesLabel,
+} from './liveTradingAccountSelection';
 
 const TRADES_PER_PAGE = 20;
 const EMPTY_HISTORY_PAGE = { items: [], next_cursor: null, stats: {} };
@@ -228,14 +240,18 @@ export default function LiveTrading() {
   const [historyPage, setHistoryPage] = useState(EMPTY_HISTORY_PAGE);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState(null);
-  const [historyNavigation, setHistoryNavigation] = useState({
-    queryKey: null,
-    cursor: null,
-    historyCursorStack: [],
-  });
+  const [historyNavigation, setHistoryNavigation] = useState(createHistoryNavigation());
+  const [historyRetryToken, setHistoryRetryToken] = useState(0);
   const [decisionsData, setDecisionsData] = useState(null);
   const [decisionsLoading, setDecisionsLoading] = useState(false);
   const [decisionsError, setDecisionsError] = useState(null);
+  const mountedRef = useRef(false);
+  const runtimeRequestRef = useRef({
+    generation: 0,
+    inFlight: false,
+    controller: null,
+    promise: null,
+  });
 
   const applyAccountSnapshot = useCallback((data) => {
     setAccountsData(data || { accounts: [], summary: {} });
@@ -249,11 +265,49 @@ export default function LiveTrading() {
     }
   }, []);
 
+  const loadRuntimeStatus = useCallback(() => {
+    if (runtimeRequestRef.current.inFlight) return runtimeRequestRef.current.promise;
+    const currentRequest = runtimeRequestRef.current;
+
+    const startedRequest = startLatestRequest(currentRequest);
+    const controller = new AbortController();
+    const generation = startedRequest.generation;
+    const promise = fetchTradingRuntimeStatus({ signal: controller.signal })
+      .then((data) => {
+        if (!mountedRef.current || !isLatestRequest(runtimeRequestRef.current, generation)) return;
+        setRuntimeData(data || { accounts: [] });
+        setRuntimeWarning(null);
+      })
+      .catch((requestError) => {
+        if (
+          mountedRef.current
+          && requestError.name !== 'AbortError'
+          && isLatestRequest(runtimeRequestRef.current, generation)
+        ) {
+          setRuntimeWarning(`运行诊断刷新失败：${requestError.message}`);
+        }
+      })
+      .finally(() => {
+        if (!isLatestRequest(runtimeRequestRef.current, generation)) return;
+        runtimeRequestRef.current = {
+          ...finishLatestRequest(runtimeRequestRef.current, generation),
+          controller: null,
+          promise: null,
+        };
+      });
+    runtimeRequestRef.current = {
+      ...startedRequest,
+      controller,
+      promise,
+    };
+    return promise;
+  }, []);
+
   const refreshAccountData = useCallback(async () => {
-    const [configsResult, snapshotResult, runtimeResult] = await Promise.allSettled([
+    loadRuntimeStatus();
+    const [configsResult, snapshotResult] = await Promise.allSettled([
       fetchTradingAccounts(),
       fetchTradingAccountsStatus({ force: true }),
-      fetchTradingRuntimeStatus(),
     ]);
     if (configsResult.status === 'fulfilled') {
       setAccountConfigs(configsResult.value.accounts || []);
@@ -266,41 +320,27 @@ export default function LiveTrading() {
     } else {
       setSnapshotWarning(`账户快照刷新失败：${snapshotResult.reason.message}`);
     }
-    if (runtimeResult.status === 'fulfilled') {
-      setRuntimeData(runtimeResult.value || { accounts: [] });
-      setRuntimeWarning(null);
-    } else {
-      setRuntimeWarning(`运行诊断刷新失败：${runtimeResult.reason.message}`);
-    }
-  }, [applyAccountSnapshot]);
+  }, [applyAccountSnapshot, loadRuntimeStatus]);
 
   useEffect(() => {
     let active = true;
-    const initialAccounts = fetchTradingAccounts();
-    const initialSnapshot = fetchTradingAccountsStatus();
-    const initialRuntime = fetchTradingRuntimeStatus();
-
-    Promise.allSettled([initialAccounts, initialSnapshot, initialRuntime]).then((results) => {
-      if (!active) return;
-      const [configsResult, snapshotResult, runtimeResult] = results;
-      if (configsResult.status === 'fulfilled') {
-        setAccountConfigs(configsResult.value.accounts || []);
-      } else {
-        setAccountWarning(`账户配置加载失败：${configsResult.reason.message}`);
-      }
-      if (snapshotResult.status === 'fulfilled') {
-        applyAccountSnapshot(snapshotResult.value);
-        setError(null);
-      } else {
-        setError(`加载实盘数据失败: ${snapshotResult.reason.message}`);
-      }
-      if (runtimeResult.status === 'fulfilled') {
-        setRuntimeData(runtimeResult.value || { accounts: [] });
-      } else {
-        setRuntimeWarning(`运行诊断加载失败：${runtimeResult.reason.message}`);
-      }
-      setLoading(false);
-    });
+    mountedRef.current = true;
+    fetchTradingAccounts()
+      .then((data) => {
+        if (!active) return;
+        setAccountConfigs(data.accounts || []);
+        setAccountWarning(null);
+      })
+      .catch((requestError) => {
+        if (active) setAccountWarning(`账户配置加载失败：${requestError.message}`);
+      });
+    fetchTradingAccountsStatus()
+      .then((data) => { if (active) applyAccountSnapshot(data); })
+      .catch((requestError) => {
+        if (active) setError(`加载实盘数据失败: ${requestError.message}`);
+      })
+      .finally(() => { if (active) setLoading(false); });
+    loadRuntimeStatus();
 
     const pollLiveData = () => {
       fetchTradingAccountsStatus({ force: true })
@@ -308,22 +348,21 @@ export default function LiveTrading() {
         .catch((requestError) => {
           if (active) setSnapshotWarning(`账户快照刷新失败：${requestError.message}`);
         });
-      fetchTradingRuntimeStatus()
-        .then((data) => {
-          if (!active) return;
-          setRuntimeData(data || { accounts: [] });
-          setRuntimeWarning(null);
-        })
-        .catch((requestError) => {
-          if (active) setRuntimeWarning(`运行诊断刷新失败：${requestError.message}`);
-        });
+      loadRuntimeStatus();
     };
     const id = setInterval(pollLiveData, 30000);
     return () => {
       active = false;
+      mountedRef.current = false;
       clearInterval(id);
+      runtimeRequestRef.current.controller?.abort();
+      runtimeRequestRef.current = {
+        ...invalidateLatestRequest(runtimeRequestRef.current),
+        controller: null,
+        promise: null,
+      };
     };
-  }, [applyAccountSnapshot]);
+  }, [applyAccountSnapshot, loadRuntimeStatus]);
 
   useEffect(() => {
     const normalized = normalizeSelectedAccount(selectedAccount, accountsData.accounts || []);
@@ -347,13 +386,23 @@ export default function LiveTrading() {
   const warning = [accountWarning, snapshotWarning, runtimeWarning].filter(Boolean).join('；');
 
   useEffect(() => {
-    setHistoryNavigation({
-      queryKey: historyQueryKey,
-      cursor: null,
-      historyCursorStack: [],
-    });
+    if (selectedAccount !== null && selectedAccount !== undefined) return;
+    const emptyState = emptyAccountScopedTradingState(historyQueryKey);
+    setHistoryPage(emptyState.historyPage);
+    setHistoryNavigation(emptyState.historyNavigation);
+    setHistoryError(emptyState.historyError);
+    setHistoryLoading(emptyState.historyLoading);
+    setDecisionsData(emptyState.decisionsData);
+    setDecisionsError(emptyState.decisionsError);
+    setDecisionsLoading(emptyState.decisionsLoading);
+  }, [historyQueryKey, selectedAccount]);
+
+  useEffect(() => {
+    if (selectedAccount === null || selectedAccount === undefined) return;
+    setHistoryNavigation(createHistoryNavigation(historyQueryKey));
     setHistoryPage(EMPTY_HISTORY_PAGE);
-  }, [historyQueryKey]);
+    setHistoryError(null);
+  }, [historyQueryKey, selectedAccount]);
 
   useEffect(() => {
     if (selectedAccount === null || selectedAccount === undefined) return undefined;
@@ -386,7 +435,14 @@ export default function LiveTrading() {
       active = false;
       controller.abort();
     };
-  }, [selectedAccount, tradeFilter, tradeSymbol, tradeDirection, historyCursor]);
+  }, [
+    selectedAccount,
+    tradeFilter,
+    tradeSymbol,
+    tradeDirection,
+    historyCursor,
+    historyRetryToken,
+  ]);
 
   useEffect(() => {
     if (selectedAccount === null || selectedAccount === undefined) return undefined;
@@ -421,23 +477,20 @@ export default function LiveTrading() {
 
   const goToNextHistoryPage = () => {
     if (!historyPage.next_cursor) return;
-    setHistoryNavigation({
-      queryKey: historyQueryKey,
-      cursor: historyPage.next_cursor,
-      historyCursorStack: [...historyCursorStack, historyCursor],
-    });
+    setHistoryNavigation((navigation) => advanceHistoryNavigation(
+      navigation.queryKey === historyQueryKey
+        ? navigation
+        : createHistoryNavigation(historyQueryKey),
+      historyPage.next_cursor,
+    ));
   };
 
   const goToPreviousHistoryPage = () => {
     if (historyCursorStack.length === 0) return;
-    const previousCursors = [...historyCursorStack];
-    const previousCursor = previousCursors.pop() ?? null;
-    setHistoryNavigation({
-      queryKey: historyQueryKey,
-      cursor: previousCursor,
-      historyCursorStack: previousCursors,
-    });
+    setHistoryNavigation((navigation) => retreatHistoryNavigation(navigation));
   };
+
+  const retryHistoryPage = () => setHistoryRetryToken((token) => token + 1);
 
   const toggleTrading = async (mode, enabled) => {
     setSwitching(mode);
@@ -654,10 +707,16 @@ export default function LiveTrading() {
             </div>
           </div>
         </div>
-        {historyLoading ? (
+        {historyError && (
+          <div style={{ color: '#fbbf24', padding: '12px 0' }} role="alert">
+            {historyError}
+            <button type="button" onClick={retryHistoryPage} disabled={historyLoading} style={{ marginLeft: 10 }}>
+              重试
+            </button>
+          </div>
+        )}
+        {historyLoading && historyPage.items.length === 0 ? (
           <div style={{ color: '#6b7280', padding: 20, textAlign: 'center' }}>加载历史交易...</div>
-        ) : historyError ? (
-          <div style={{ color: '#fbbf24', padding: 20, textAlign: 'center' }}>{historyError}</div>
         ) : historyPage.items.length === 0 ? (
           <div style={{ color: '#6b7280', padding: 20, textAlign: 'center' }}>暂无历史交易</div>
         ) : (
@@ -674,7 +733,7 @@ export default function LiveTrading() {
                       {t.position_count > 1 ? <span className="mini-pill" style={{ marginLeft: 6 }}>合并 {t.position_count}</span> : null}
                       {t.alpha_symbol ? <span className="mini-pill" style={{ marginLeft: 6 }}>{t.alpha_symbol}</span> : null}
                     </td>
-                    <td>{sourceText(t.strategy_source || (tradeFilter === 'all' ? null : tradeFilter))}{t.alpha_profile ? ` · ${alphaProfileText(t.alpha_profile)}` : ''}</td>
+                    <td>{strategySourcesLabel(t.strategy_sources)}{t.alpha_profile ? ` · ${alphaProfileText(t.alpha_profile)}` : ''}</td>
                     <td style={{ color: sideColor(t.side) }}>{sideText(t.side)}</td>
                     <td>{fmtValue(t.qty ?? t.quantity, 6)}</td>
                     <td>{t.entry_price ? `$${fmtValue(t.entry_price, 4)}` : '-'}</td>
@@ -690,7 +749,7 @@ export default function LiveTrading() {
             <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 12 }}>
               <button onClick={goToPreviousHistoryPage} disabled={historyCursorStack.length === 0 || historyLoading}>上一页</button>
               <span style={{ color: '#9ca3af', padding: '4px 8px' }}>{historyCursorStack.length + 1}</span>
-              <button onClick={goToNextHistoryPage} disabled={!historyPage.next_cursor || historyLoading}>下一页</button>
+              <button onClick={goToNextHistoryPage} disabled={!historyPage.next_cursor || historyLoading || Boolean(historyError)}>下一页</button>
             </div>
           </>
         )}
