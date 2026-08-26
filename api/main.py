@@ -1521,7 +1521,7 @@ def _account_decision_panel(conn, account_id: int) -> dict:
 
     latest = conn.execute(
         """SELECT run_id, time FROM strategy_decisions
-           WHERE account_id=? ORDER BY datetime(time) DESC, id DESC LIMIT 1""",
+           WHERE account_id=? ORDER BY time DESC, id DESC LIMIT 1""",
         (account_id,),
     ).fetchone()
     if not latest:

@@ -396,6 +396,34 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.assertNotIn("api_key", account)
         self.assertNotIn("api_secret", account)
 
+    def test_decision_panel_queries_use_account_indexes(self):
+        conn = db.get_conn()
+        try:
+            index_names = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA index_list(strategy_decisions)"
+                ).fetchall()
+            }
+            plan = " ".join(
+                str(row[3])
+                for row in conn.execute(
+                    """EXPLAIN QUERY PLAN
+                       SELECT run_id, time FROM strategy_decisions
+                       WHERE account_id=?
+                       ORDER BY time DESC, id DESC LIMIT 1""",
+                    (self.account_id,),
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+        self.assertIn("idx_strategy_decisions_account_time", index_names)
+        self.assertIn("idx_strategy_decisions_account_run_id", index_names)
+        self.assertIn("idx_strategy_decisions_account_run_filter", index_names)
+        self.assertIn("idx_strategy_decisions_account_time", plan)
+        self.assertNotIn("USE TEMP B-TREE", plan)
+
     def test_runtime_status_payload_does_not_decrypt_account_credentials(self):
         with patch(
             "shared.accounts.decrypt_secret",
