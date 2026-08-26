@@ -30,6 +30,7 @@ server.log
 # Local agent/runtime metadata
 .agents/
 .codex/
+.worktrees/
 
 # Secrets
 .env
