@@ -1,8 +1,10 @@
 ﻿"""Live execution engine."""
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from trader.exchange import BinanceFutures
@@ -100,6 +102,43 @@ def _market_phase_gate(raw: dict) -> dict:
 
 def _alpha_position_factor(volume_price: dict) -> float:
     return max(0.0, min(2.0, float((volume_price or {}).get("max_position_factor") or 0)))
+
+
+def _cap_explosive_add_quantity(
+    initial_quantity,
+    current_quantity,
+    proposed_quantity,
+    *,
+    max_factor: float = 2.0,
+) -> float:
+    initial = max(0.0, float(initial_quantity or 0))
+    current = max(0.0, float(current_quantity or 0))
+    proposed = max(0.0, float(proposed_quantity or 0))
+    if initial <= 0 or max_factor <= 0:
+        return 0.0
+    remaining = max(0.0, initial * float(max_factor) - current)
+    return min(proposed, remaining)
+
+
+def _explosive_client_order_id(setup_id) -> str:
+    digest = hashlib.sha256(str(setup_id or "explosive").encode("utf-8")).hexdigest()[:24]
+    return f"DH-EXP-{digest}"
+
+
+def _is_transient_order_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(token in text for token in (
+        "timeout",
+        "timed out",
+        "network",
+        "connection",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "duplicate client order",
+        "client order id is not unique",
+    ))
 
 
 def _alpha_discovery_position_factor(score: float, min_score: float = 78, full_score: float = 80) -> float:
@@ -2437,6 +2476,11 @@ class ExecutionEngine:
                 row.get("market_price") or 0,
                 discovery_score,
             )
+            explosive_candidate = (
+                volume_price.get("event_type") == "explosive_breakout"
+            )
+            soft_gate_factor = 1.0
+            soft_gate_reasons = []
 
             def record_candidate(reason=None, status="filtered"):
                 try:
@@ -2500,8 +2544,12 @@ class ExecutionEngine:
                 reject(f"stale volume-price state age={age:.1f}m > {vp_ttl:.0f}m")
                 continue
             if profile in blocked_profiles:
-                reject(f"blocked alpha profile: {profile}")
-                continue
+                if explosive_candidate:
+                    soft_gate_factor = min(soft_gate_factor, 0.5)
+                    soft_gate_reasons.append(f"alpha_profile:{profile}")
+                else:
+                    reject(f"blocked alpha profile: {profile}")
+                    continue
             if discovery_score < min_score:
                 reject(f"alpha_discovery_score {discovery_score:.1f} < {min_score:.1f}")
                 continue
@@ -2521,10 +2569,14 @@ class ExecutionEngine:
                 current_positions,
                 symbol,
                 [*(planned_actions or []), *actions],
+                allow_explosive_override=explosive_candidate,
             )
             if not category_ok:
                 reject(category_reason)
                 continue
+            if "soft_override" in category_reason:
+                soft_gate_factor = min(soft_gate_factor, 0.5)
+                soft_gate_reasons.append(category_reason)
 
             learning_action = build_learning_action(
                 row,
@@ -2538,8 +2590,22 @@ class ExecutionEngine:
 
             cooldown = get_alpha_cooldown(symbol) or get_alpha_cooldown("*")
             if cooldown:
-                reject(f"alpha cooldown active: {cooldown.get('reason')} until {cooldown.get('cooldown_until')}")
-                continue
+                soft_cooldowns = {
+                    "orderbook_reject",
+                    "volume_price_overheated",
+                    "chase_guard",
+                }
+                if (
+                    explosive_candidate
+                    and cooldown.get("cooldown_type") in soft_cooldowns
+                ):
+                    soft_gate_factor = min(soft_gate_factor, 0.5)
+                    soft_gate_reasons.append(
+                        f"cooldown:{cooldown.get('cooldown_type')}"
+                    )
+                else:
+                    reject(f"alpha cooldown active: {cooldown.get('reason')} until {cooldown.get('cooldown_until')}")
+                    continue
 
             vp_action = volume_price.get("action")
             if vp_action == "cooldown":
@@ -2650,13 +2716,26 @@ class ExecutionEngine:
             except Exception as e:
                 ob_ok, ob_reason, ob_info = False, f"binance depth error: {e}", {}
             if not ob_ok:
-                try:
-                    from shared.db import set_alpha_cooldown
-                    set_alpha_cooldown(symbol, "orderbook_reject", ob_reason, 20)
-                except Exception:
-                    pass
-                reject(ob_reason, ob_info)
-                continue
+                if explosive_candidate and str(ob_reason).startswith("live depth against"):
+                    soft_gate_factor = min(soft_gate_factor, 0.5)
+                    soft_gate_reasons.append(ob_reason)
+                    ob_ok = True
+                    ob_info = {
+                        **ob_info,
+                        "depth_soft_override": True,
+                        "spread_size_multiplier": min(
+                            float(ob_info.get("spread_size_multiplier") or 1.0),
+                            0.5,
+                        ),
+                    }
+                else:
+                    try:
+                        from shared.db import set_alpha_cooldown
+                        set_alpha_cooldown(symbol, "orderbook_reject", ob_reason, 20)
+                    except Exception:
+                        pass
+                    reject(ob_reason, ob_info)
+                    continue
 
             price = float(normal_row.get("market_price") or row.get("market_price") or 0)
             try:
@@ -2684,6 +2763,9 @@ class ExecutionEngine:
                 size_multiplier *= vp_factor
             size_multiplier *= discovery_factor
             size_multiplier *= _market_phase_size_factor(market_phase)
+            size_multiplier *= soft_gate_factor
+            if explosive_candidate:
+                size_multiplier = max(0.5, min(1.0, size_multiplier))
             pos_info = calculate_position(
                 self.ex,
                 symbol,
@@ -2710,6 +2792,8 @@ class ExecutionEngine:
             invested = round(price * qty, 2)
 
             reason = f"alpha_volume_price->{entry_profile.get('template')} alpha_score={alpha_execution_score:.1f} {side}"
+            if explosive_candidate:
+                reason = f"explosive_breakout {reason}"
             action = {
                 "action": "open",
                 "symbol": symbol,
@@ -2750,6 +2834,27 @@ class ExecutionEngine:
                     "volume_sync_score": volume_price.get("sync_score") or 0,
                 },
             }
+            if explosive_candidate:
+                setup_anchor = (
+                    breakout_info.get("breakout_time")
+                    or row.get("time")
+                    or row.get("scan_id")
+                )
+                setup_id = f"{symbol}:{side}:{setup_anchor}"
+                action.update({
+                    "event_type": "explosive_breakout",
+                    "setup_id": setup_id,
+                    "alpha_setup_id": setup_id,
+                    "client_order_id": _explosive_client_order_id(setup_id),
+                    "soft_gate_override": bool(soft_gate_reasons),
+                    "soft_gate_reasons": soft_gate_reasons,
+                    "initial_position_factor": float(
+                        volume_price.get("initial_position_factor") or 1.0
+                    ),
+                    "max_total_position_factor": float(
+                        volume_price.get("max_total_position_factor") or 2.0
+                    ),
+                })
             actions.append(action)
             record_candidate(None, status="planned_open")
             self._record_decision(
@@ -2798,6 +2903,8 @@ class ExecutionEngine:
         strategy_source = hist.get("strategy_source") or "normal"
         entry_reason = str(hist.get("entry_reason") or "").lower()
         if strategy_source == "alpha":
+            if "explosive_breakout" in entry_reason:
+                return True, "explosive breakout confirmation add"
             alpha_profile = hist.get("alpha_profile")
             if alpha_profile in set(cfg.get("blocked_alpha_profiles") or []):
                 return False, f"alpha profile blocked: {alpha_profile}"
@@ -2851,6 +2958,7 @@ class ExecutionEngine:
             tech = raw.get("technical") or {}
             market_phase = _market_phase_gate(raw)
             strategy_source = hist.get("strategy_source") or "normal"
+            explosive_position = "explosive_breakout" in str(hist.get("entry_reason") or "").lower()
             side = pos.get("side")
             mark_price = float(pos.get("mark_price") or 0)
             raw_sync = raw.get("dual_market_volume") or {}
@@ -2891,6 +2999,9 @@ class ExecutionEngine:
                 config=cfg,
             )
             current_layer = int(hist.get("roll_layer") or 0)
+            if explosive_position and current_layer >= 1:
+                block("explosive confirmation add already used")
+                continue
             if current_layer >= 1:
                 update_position_management(
                     sym,
@@ -2923,6 +3034,13 @@ class ExecutionEngine:
                 current_quantity=pos.get("quantity"),
                 side=side,
             )
+            if explosive_position:
+                add_qty = _cap_explosive_add_quantity(
+                    hist.get("initial_quantity"),
+                    pos.get("quantity"),
+                    add_qty,
+                    max_factor=2.0,
+                )
             if add_qty <= 0:
                 block("roll quantity <= 0")
                 continue
@@ -2940,7 +3058,7 @@ class ExecutionEngine:
                 a for a in planned_actions
                 if not (a.get("symbol") == sym and a.get("action") == "partial_close")
             ]
-            actions.append({
+            roll_action = {
                 "action": "roll_add",
                 "symbol": sym,
                 "side": action_side,
@@ -2974,7 +3092,13 @@ class ExecutionEngine:
                     "estimated_blended_entry": blended_entry,
                     "estimated_protected_stop": stop_price,
                 },
-            })
+            }
+            if explosive_position:
+                roll_action.update({
+                    "event_type": "explosive_breakout",
+                    "max_total_position_factor": 2.0,
+                })
+            actions.append(roll_action)
             update_position_management(
                 sym,
                 roll_enabled=1,
@@ -3698,7 +3822,11 @@ class ExecutionEngine:
                 if act["action"] == "open":
                     live_positions = self.ex.get_positions()
                     category_ok, category_reason = check_category_position_limit(
-                        live_positions, act["symbol"]
+                        live_positions,
+                        act["symbol"],
+                        allow_explosive_override=(
+                            act.get("event_type") == "explosive_breakout"
+                        ),
                     )
                     if not category_ok:
                         self._record_decision(
@@ -3765,33 +3893,78 @@ class ExecutionEngine:
     ):
         qty = float(quantity if quantity is not None else act["quantity"])
         client_order_id = act.get("client_order_id")
-        try:
-            if reduce_only:
-                return self.ex.close_position_market(
+
+        def submit():
+            try:
+                if reduce_only:
+                    return self.ex.close_position_market(
+                        act["symbol"],
+                        act["side"],
+                        qty,
+                        client_order_id=client_order_id,
+                    )
+                return self.ex.place_market_order(
                     act["symbol"],
                     act["side"],
                     qty,
                     client_order_id=client_order_id,
                 )
-            return self.ex.place_market_order(
-                act["symbol"],
-                act["side"],
-                qty,
-                client_order_id=client_order_id,
-            )
-        except TypeError:
-            # Compatibility for test doubles and legacy exchange adapters.
-            if reduce_only:
-                return self.ex.close_position_market(
+            except TypeError:
+                # Compatibility for test doubles and legacy exchange adapters.
+                if reduce_only:
+                    return self.ex.close_position_market(
+                        act["symbol"],
+                        act["side"],
+                        qty,
+                    )
+                return self.ex.place_market_order(
                     act["symbol"],
                     act["side"],
                     qty,
                 )
-            return self.ex.place_market_order(
-                act["symbol"],
-                act["side"],
-                qty,
-            )
+
+        retryable_explosive = (
+            act.get("event_type") == "explosive_breakout"
+            and bool(client_order_id)
+            and not reduce_only
+        )
+        attempts = 3 if retryable_explosive else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return submit()
+            except Exception as exc:
+                if not retryable_explosive or not _is_transient_order_error(exc):
+                    raise
+                lookup = getattr(self.ex, "get_order_by_client_id", None)
+                if callable(lookup):
+                    try:
+                        existing = lookup(act["symbol"], client_order_id)
+                        if existing:
+                            logger.warning(
+                                "Recovered explosive order after submit uncertainty: %s %s",
+                                act["symbol"],
+                                client_order_id,
+                            )
+                            return existing
+                    except Exception as lookup_exc:
+                        logger.warning(
+                            "Explosive order lookup failed %s attempt=%s: %s",
+                            act["symbol"],
+                            attempt,
+                            lookup_exc,
+                        )
+                if attempt >= attempts:
+                    raise
+                logger.warning(
+                    "Retry explosive market order %s attempt=%s/%s after %s",
+                    act["symbol"],
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                time.sleep(0.2 * attempt)
+
+        raise RuntimeError(f"explosive market order produced no result: {act['symbol']}")
 
     def _mark_partial_close_state(self, act):
         try:
@@ -4022,30 +4195,6 @@ class ExecutionEngine:
             )
         except Exception as e:
             logger.warning(f"    local order write failed: {e}")
-        self._record_decision(
-            act["symbol"],
-            run_id=act.get("run_id"),
-            scan_id=act.get("scan_id"),
-            side=act.get("position_side"),
-            decision_stage="execution",
-            decision_result="opened",
-            quantity=act.get("quantity"),
-            entry_price=act.get("entry_price"),
-            risk_params={
-                "leverage": act.get("leverage"),
-                "stop_loss": act.get("stop_loss"),
-                "tp1_price": act.get("tp1_price"),
-                "tp2_price": act.get("tp2_price"),
-                "atr_value": act.get("atr_value"),
-                "order_id": order.get("orderId"),
-                "ai_quality_status": act.get("ai_quality_status"),
-                "ai_quality_decision": act.get("ai_quality_decision"),
-                "ai_quality_score": act.get("ai_quality_score"),
-                "ai_model_version": act.get("ai_model_version"),
-                "ai_quality_reasons": act.get("ai_quality_reasons"),
-            },
-            reason={"reason": act.get("reason")},
-        )
         logger.info("    Open order filled: %s", order.get("orderId"))
 
         # Place the protective stop order.
@@ -4109,6 +4258,33 @@ class ExecutionEngine:
             "    Stop order @$%.4f: %s",
             act["stop_loss"],
             stop_order_id,
+        )
+        self._record_decision(
+            act["symbol"],
+            run_id=act.get("run_id"),
+            scan_id=act.get("scan_id"),
+            side=act.get("position_side"),
+            decision_stage="execution",
+            decision_result="opened",
+            quantity=act.get("quantity"),
+            entry_price=act.get("entry_price"),
+            risk_params={
+                "leverage": act.get("leverage"),
+                "stop_loss": act.get("stop_loss"),
+                "tp1_price": act.get("tp1_price"),
+                "tp2_price": act.get("tp2_price"),
+                "atr_value": act.get("atr_value"),
+                "order_id": order.get("orderId"),
+                "stop_order_id": stop_order_id,
+                "event_type": act.get("event_type"),
+                "setup_id": act.get("setup_id"),
+                "ai_quality_status": act.get("ai_quality_status"),
+                "ai_quality_decision": act.get("ai_quality_decision"),
+                "ai_quality_score": act.get("ai_quality_score"),
+                "ai_model_version": act.get("ai_model_version"),
+                "ai_quality_reasons": act.get("ai_quality_reasons"),
+            },
+            reason={"reason": act.get("reason")},
         )
 
         # Record the open-position cooldown.

@@ -48,6 +48,33 @@ def _features(alpha_volume=1.8, futures_volume=1.5, oi4=0.0, oi24=0.0, trend=75)
 
 
 class AlphaEntryConfirmationTest(unittest.TestCase):
+    def test_btr_breakout_snapshot_is_classified_as_explosive_event(self):
+        raw = _features(
+            alpha_volume=3.5119,
+            futures_volume=2.7481,
+            oi4=0.034194,
+            oi24=0.104198,
+            trend=64.25,
+        )
+        raw["returns"] = {
+            "ret_15m": 1.9042,
+            "ret_1h": 9.1482,
+            "ret_6h": 9.8069,
+            "pct_24h": 22.16,
+        }
+        raw["depth"]["spread_pct"] = 0.0
+
+        result = evaluate_alpha_volume_price(
+            raw,
+            market_price=0.03639,
+            alpha_score=91.44,
+        )
+
+        self.assertTrue(result["allow_long"])
+        self.assertEqual(result["event_type"], "explosive_breakout")
+        self.assertEqual(result["initial_position_factor"], 1.0)
+        self.assertEqual(result["max_total_position_factor"], 2.0)
+
     def test_ub_snapshot_is_blocked_by_dual_volume_gate(self):
         result = evaluate_alpha_volume_price(_features(1.8026, 1.396, -0.004428, -0.005824, 77.15))
         self.assertFalse(result["allow_long"])

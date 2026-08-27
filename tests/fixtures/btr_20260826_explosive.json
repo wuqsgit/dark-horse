@@ -1,0 +1,39 @@
+{
+  "symbol": "BTRUSDT",
+  "market_price": 0.03639,
+  "alpha_score": 91.44,
+  "features": {
+    "returns": {
+      "ret_15m": 1.9042,
+      "ret_1h": 9.1482,
+      "ret_6h": 9.8069,
+      "pct_24h": 22.16
+    },
+    "volume": {
+      "alpha_volume_growth_6h": 3.5119
+    },
+    "depth": {
+      "spread_pct": 0.0,
+      "imbalance": 0.3034,
+      "bid_depth": 3005.747,
+      "ask_depth": 9905.5122
+    },
+    "risk": {
+      "range_24h_pct": 20.2803,
+      "pullback_from_high_pct": 0.8794
+    },
+    "futures_sync": {
+      "available": true,
+      "futures_volume_growth_6h": 2.7481,
+      "oi_change_4h": 0.034194,
+      "oi_change_24h": 0.104198,
+      "funding_rate": 0.0004451,
+      "sync_score": 65
+    },
+    "alpha_trend": {
+      "trend_continuation_score": 64.25,
+      "trend_state": "probe",
+      "volume_regime": "suspicious"
+    }
+  }
+}

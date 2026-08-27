@@ -209,6 +209,14 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
             filtered.append(action)
             continue
         if decision.get("decision") == "reject":
+            if action.get("event_type") == "explosive_breakout":
+                action["ai_quality_decision"] = "reject_advisory"
+                action["soft_gate_reasons"] = [
+                    *(action.get("soft_gate_reasons") or []),
+                    "ai_quality_reject",
+                ]
+                filtered.append(action)
+                continue
             logger.info("AI rejected %s entry at quality=%s", action.get("symbol"), decision.get("quality_score"))
             continue
         if decision.get("decision") == "probe":

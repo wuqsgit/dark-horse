@@ -103,6 +103,29 @@ class TraderAIGateTest(unittest.TestCase):
         )
         self.assertEqual(result, [close])
 
+    def test_reject_is_advisory_for_explosive_breakout(self):
+        action = open_action()
+        action.update({
+            "event_type": "explosive_breakout",
+            "setup_id": "BTRUSDT:LONG:2026-08-26T02:30:00Z",
+        })
+
+        result = apply_entry_quality_gate(
+            [action], [], balance=5000, exchange=FakeExchange(), account_id=1,
+            evaluate=lambda candidate: {
+                "status": "live",
+                "decision": "reject",
+                "quality_score": 42,
+                "position_factor": 0,
+                "applied": True,
+            },
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["quantity"], action["quantity"])
+        self.assertEqual(result[0]["ai_quality_decision"], "reject_advisory")
+        self.assertIn("ai_quality_reject", result[0]["soft_gate_reasons"])
+
     def test_probe_resizes_entry_to_five_percent_current_balance_margin(self):
         action = open_action()
         action["quantity"] = 2000.0

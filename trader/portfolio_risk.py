@@ -17,6 +17,7 @@ def check_category_position_limit(
     positions: list,
     new_symbol: str,
     planned_actions: list | None = None,
+    allow_explosive_override: bool = False,
 ) -> Tuple[bool, str]:
     """Allow at most one live/planned position in each symbol risk class."""
     limit = max(1, int(PORTFOLIO_RISK.get("max_positions_per_category", 1)))
@@ -48,6 +49,12 @@ def check_category_position_limit(
 
     if len(occupied) >= limit:
         blocker = ",".join(dict.fromkeys(occupied))
+        if allow_explosive_override:
+            return (
+                True,
+                f"category_position_soft_override class={new_category} "
+                f"occupied={blocker} limit={limit}",
+            )
         return (
             False,
             f"category_position_limit class={new_category} occupied={blocker} limit={limit}",

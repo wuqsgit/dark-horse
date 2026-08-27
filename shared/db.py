@@ -1938,6 +1938,57 @@ def get_trading_runtime_controls():
     return controls
 
 
+def get_trading_kv_value(key, default=None):
+    key = str(key or "").strip()
+    if not key:
+        return default
+    conn = get_conn()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trading_runtime_controls'"
+        ).fetchone()
+        if not exists:
+            return default
+        row = conn.execute(
+            "SELECT value FROM trading_runtime_controls WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else default
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            raise
+        return default
+    finally:
+        conn.close()
+
+
+def set_trading_kv_value(key, value):
+    key = str(key or "").strip()
+    if not key:
+        raise ValueError("trading KV key is required")
+    conn = get_conn()
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS trading_runtime_controls (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO trading_runtime_controls(key, value, updated_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                 value=excluded.value,
+                 updated_at=datetime('now')""",
+            (key, str(value or "")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_trading_kv_value(key)
+
+
 def set_trading_runtime_control(key, enabled):
     if key not in {"normal_trading_enabled", "alpha_trading_enabled"}:
         raise ValueError(f"unsupported trading control: {key}")

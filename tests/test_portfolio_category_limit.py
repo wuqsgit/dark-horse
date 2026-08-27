@@ -47,6 +47,16 @@ class PortfolioCategoryLimitTest(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("BTCUSDT", reason)
 
+    def test_explosive_event_can_soft_override_occupied_category(self):
+        allowed, reason = check_category_position_limit(
+            [{"symbol": "JCTUSDT"}],
+            "BTRUSDT",
+            allow_explosive_override=True,
+        )
+
+        self.assertTrue(allowed)
+        self.assertIn("soft_override", reason)
+
     def test_full_close_releases_the_category_for_replacement(self):
         allowed, _ = check_category_position_limit(
             [{"symbol": "BTCUSDT"}],

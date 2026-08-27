@@ -25,6 +25,7 @@ from trader.execution import ExecutionEngine
 from trader.alpha_signal_consumer import AlphaSignalConsumer, LIVE_MODES
 from trader.ai_client import apply_entry_quality_gate, observe_entry_quality_candidates
 from trader.config import TRADING_CONFIG
+from trader.notifications import notify_explosive_results
 from trader.risk import get_symbol_threshold, get_category_config
 
 logger = logging.getLogger("trader")
@@ -40,6 +41,40 @@ def _json_object(value):
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
+
+
+def _filter_legacy_alpha_entries(actions: list, strategy_v2: dict) -> list:
+    mode = str((strategy_v2 or {}).get("mode") or "shadow").lower()
+    if not (strategy_v2 or {}).get("enabled") or mode not in LIVE_MODES:
+        return actions
+    if (strategy_v2 or {}).get("legacy_alpha_entry_enabled", False):
+        return actions
+    return [
+        action
+        for action in actions
+        if not (
+            action.get("action") == "open"
+            and action.get("strategy_source") == "alpha"
+            and action.get("event_type") != "explosive_breakout"
+        )
+    ]
+
+
+def _filter_account_entry_actions(actions: list, account: dict) -> list:
+    return [
+        action
+        for action in actions
+        if action.get("action") != "open"
+        or action.get("event_type") == "explosive_breakout"
+        or (
+            action.get("strategy_source") == "alpha"
+            and bool(account.get("alpha_trading_enabled"))
+        )
+        or (
+            action.get("strategy_source") != "alpha"
+            and bool(account.get("normal_trading_enabled"))
+        )
+    ]
 
 
 async def _account_trading_loop(account):
@@ -217,17 +252,7 @@ async def _account_trading_loop(account):
                 alpha_signal_recovered = True
             actions = engine.decide(top_symbols, positions, run_id=run_id)
             strategy_v2 = engine.cfg.get("alpha_strategy_v2") or {}
-            strategy_mode = str(strategy_v2.get("mode") or "shadow").lower()
-            if strategy_v2.get("enabled") and strategy_mode in LIVE_MODES:
-                if not strategy_v2.get("legacy_alpha_entry_enabled", False):
-                    actions = [
-                        action
-                        for action in actions
-                        if not (
-                            action.get("action") == "open"
-                            and action.get("strategy_source") == "alpha"
-                        )
-                    ]
+            actions = _filter_legacy_alpha_entries(actions, strategy_v2)
             actions.extend(
                 alpha_signal_consumer.build_actions(
                     account=account,
@@ -245,14 +270,7 @@ async def _account_trading_loop(account):
             )
             if observation.get("sent"):
                 logger.info("AI learning candidates observed: %s", observation["sent"])
-            actions = [
-                action for action in actions
-                if action.get("action") != "open"
-                or (
-                    (action.get("strategy_source") == "alpha" and bool(account.get("alpha_trading_enabled")))
-                    or (action.get("strategy_source") != "alpha" and bool(account.get("normal_trading_enabled")))
-                )
-            ]
+            actions = _filter_account_entry_actions(actions, account)
             actions = apply_entry_quality_gate(
                 actions,
                 top_symbols,
@@ -272,6 +290,7 @@ async def _account_trading_loop(account):
                     logger.info(f"  [{a['action']}] {a.get('symbol','?')} reason: {a.get('reason','')}")
                 alpha_signal_consumer.mark_submitted(account["id"], actions)
                 results = engine.execute(actions)
+                notify_explosive_results(results)
                 alpha_signal_consumer.finalize(account["id"], results)
                 logger.info(f"执行完成: {sum(1 for r in results if r['status']=='ok')} OK / {sum(1 for r in results if r['status']=='error')} ERR")
                 execution_errors = [r for r in results if r.get("status") == "error"]

@@ -35,8 +35,11 @@ def _state(
     cooldown_minutes=0,
     reasons=None,
     metrics=None,
+    event_type=None,
+    initial_position_factor=None,
+    max_total_position_factor=None,
 ):
-    return {
+    result = {
         "state": state,
         "action": action,
         "allow_long": bool(allow_long),
@@ -46,6 +49,13 @@ def _state(
         "reasons": list(reasons or []),
         "metrics": dict(metrics or {}),
     }
+    if event_type:
+        result["event_type"] = str(event_type)
+    if initial_position_factor is not None:
+        result["initial_position_factor"] = _num(initial_position_factor)
+    if max_total_position_factor is not None:
+        result["max_total_position_factor"] = _num(max_total_position_factor)
+    return result
 
 
 def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
@@ -188,6 +198,7 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
     }
     metrics["entry_conditions"] = conditions
     if all(conditions.values()):
+        explosive = _num(alpha_score) >= 80.0
         reasons = [
             f"alpha volume {alpha_volume_growth_6h:.1f}x >= 3.5x",
             f"futures volume {futures_volume_growth_6h:.1f}x >= 1.5x",
@@ -201,6 +212,9 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
             max_position_factor=spread_position_factor,
             reasons=reasons,
             metrics=metrics,
+            event_type="explosive_breakout" if explosive else None,
+            initial_position_factor=1.0 if explosive else None,
+            max_total_position_factor=2.0 if explosive else None,
         )
 
     missing = [name for name, passed in conditions.items() if not passed]
