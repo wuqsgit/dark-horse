@@ -1,4 +1,4 @@
-"""Simple long-only Alpha volume-price entry signal."""
+"""Strict long-only Alpha explosive-move precursor signal."""
 from __future__ import annotations
 
 from alpha_engine.square_sentiment import evaluate_square_reversal
@@ -59,10 +59,10 @@ def _state(
 
 
 def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
-    """Evaluate one simple Alpha impulse signal.
+    """Evaluate the precursor conditions for an explosive Alpha entry.
 
-    Discovery score and symbol eligibility are checked by Trader. This gate only
-    needs dual-market volume, basic price confirmation, and four hard risks.
+    The closed-candle breakout and next-bar hold are checked by Trader immediately
+    before planning the order. Volume alone only creates a watch state here.
     """
     raw = raw_features or {}
     returns = raw.get("returns") or {}
@@ -84,8 +84,13 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
         futures_sync.get("futures_volume_growth_6h"),
         1.0,
     )
+    sync_score = _num(futures_sync.get("sync_score"))
     oi_change_4h = _num(futures_sync.get("oi_change_4h"))
     oi_change_24h = _num(futures_sync.get("oi_change_24h"))
+    oi_24h_available = (
+        "oi_change_24h" in futures_sync
+        and futures_sync.get("oi_change_24h") is not None
+    )
     funding_rate = _num(futures_sync.get("funding_rate"))
     spread_pct = _num(depth.get("spread_pct"), 99.0)
     imbalance = _num(depth.get("imbalance"), 1.0)
@@ -111,8 +116,11 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
         "volume_growth_6h": round(alpha_volume_growth_6h, 4),
         "alpha_volume_growth_6h": round(alpha_volume_growth_6h, 4),
         "futures_volume_growth_6h": round(futures_volume_growth_6h, 4),
+        "sync_score": round(sync_score, 2),
+        "alpha_score": round(_num(alpha_score), 2),
         "oi_change_4h": round(oi_change_4h, 6),
         "oi_change_24h": round(oi_change_24h, 6),
+        "oi_24h_available": oi_24h_available,
         "funding_rate": round(funding_rate, 8),
         "trend_score": round(trend_score, 2),
         "trend_state": trend_state,
@@ -189,42 +197,64 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
             metrics=metrics,
         )
 
+    oi_expanded = (
+        oi_change_4h >= 0.01 and oi_change_24h > 0
+        if oi_24h_available
+        else oi_change_4h >= 0.02
+    )
     conditions = {
+        "alpha_score_80": _num(alpha_score) >= 80.0,
         "futures_available": bool(futures_sync.get("available")),
         "alpha_volume_impulse": alpha_volume_growth_6h >= 3.5,
         "futures_volume_expanded": futures_volume_growth_6h >= 1.5,
-        "price_confirmed_15m": ret_15m >= -1.0,
-        "price_confirmed_1h": ret_1h >= -2.0,
+        "markets_synchronized": sync_score >= 75.0,
+        "price_strong_15m": ret_15m >= 0.5,
+        "price_strong_1h": ret_1h >= 2.0,
+        "price_strong_6h": ret_6h > 0,
+        "oi_expanded": oi_expanded,
     }
     metrics["entry_conditions"] = conditions
     if all(conditions.values()):
-        explosive = _num(alpha_score) >= 80.0
         reasons = [
+            f"alpha score {_num(alpha_score):.1f} >= 80",
             f"alpha volume {alpha_volume_growth_6h:.1f}x >= 3.5x",
             f"futures volume {futures_volume_growth_6h:.1f}x >= 1.5x",
-            f"price confirmed: 15m {ret_15m:.2f}%, 1h {ret_1h:.2f}%",
+            f"sync score {sync_score:.1f} >= 75",
+            f"price strengthened: 15m {ret_15m:.2f}%, 1h {ret_1h:.2f}%, 6h {ret_6h:.2f}%",
+            f"OI expanded: 4h {oi_change_4h:.2%}, 24h {oi_change_24h:.2%}",
+            "waiting for breakout bar and next closed 15m hold",
             f"position adjusted by spread to {spread_position_factor:.2f}x",
         ]
         return _state(
-            "alpha_volume_impulse_entry",
+            "explosive_breakout_pending",
             "normal_review",
             allow_long=True,
             max_position_factor=spread_position_factor,
             reasons=reasons,
             metrics=metrics,
-            event_type="explosive_breakout" if explosive else None,
-            initial_position_factor=1.0 if explosive else None,
-            max_total_position_factor=2.0 if explosive else None,
+            event_type="explosive_breakout",
+            initial_position_factor=1.0,
+            max_total_position_factor=2.0,
         )
 
     missing = [name for name, passed in conditions.items() if not passed]
+    volume_watch = all(
+        conditions[name]
+        for name in (
+            "alpha_score_80",
+            "futures_available",
+            "alpha_volume_impulse",
+            "futures_volume_expanded",
+        )
+    )
     return _state(
-        "alpha_entry_conditions_missing",
+        "explosive_volume_watch" if volume_watch else "alpha_entry_conditions_missing",
         "observe",
         reasons=[
-            "simple alpha entry missing: " + ", ".join(missing),
+            "strict explosive entry missing: " + ", ".join(missing),
             f"alpha volume {alpha_volume_growth_6h:.1f}x, futures volume {futures_volume_growth_6h:.1f}x",
-            f"15m {ret_15m:.2f}%, 1h {ret_1h:.2f}%",
+            f"15m {ret_15m:.2f}%, 1h {ret_1h:.2f}%, 6h {ret_6h:.2f}%",
+            f"OI 4h {oi_change_4h:.2%}, OI 24h {oi_change_24h:.2%}, sync {sync_score:.1f}",
         ],
         metrics=metrics,
     )

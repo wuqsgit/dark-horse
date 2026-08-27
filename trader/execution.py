@@ -867,7 +867,7 @@ def _json_or_empty(value):
     return {}
 
 
-def _evaluate_alpha_breakout_bars(rows):
+def _evaluate_alpha_breakout_bars(rows, expected_confirmation_time=None):
     """Require a closed 15m breakout bar followed by a holding confirmation."""
     bars = [dict(row) for row in (rows or [])]
     if len(bars) < 6:
@@ -875,26 +875,56 @@ def _evaluate_alpha_breakout_bars(rows):
     prior = bars[-6:-2]
     breakout = bars[-2]
     confirmation = bars[-1]
+    breakout_time = _parse_time(breakout.get("time"))
+    confirmation_time = _parse_time(confirmation.get("time"))
+    expected_time = _parse_time(expected_confirmation_time) if expected_confirmation_time else None
     breakout_level = max(float(bar.get("high") or 0) for bar in prior)
     prior_avg_volume = sum(float(bar.get("quote_vol") or 0) for bar in prior) / len(prior)
     breakout_close = float(breakout.get("close") or 0)
     confirmation_close = float(confirmation.get("close") or 0)
+    confirmation_low = float(confirmation.get("low") or confirmation_close)
     confirmation_volume = float(confirmation.get("quote_vol") or 0)
+    breakout_distance_pct = (
+        (breakout_close / breakout_level - 1) * 100 if breakout_level > 0 else 0
+    )
+    confirmation_distance_pct = (
+        (confirmation_close / breakout_level - 1) * 100 if breakout_level > 0 else 0
+    )
+    confirmation_volume_ratio = (
+        confirmation_volume / prior_avg_volume if prior_avg_volume > 0 else 0
+    )
     details = {
         "breakout_level": breakout_level,
         "breakout_close": breakout_close,
+        "breakout_distance_pct": round(breakout_distance_pct, 4),
         "confirmation_close": confirmation_close,
+        "confirmation_low": confirmation_low,
+        "confirmation_distance_pct": round(confirmation_distance_pct, 4),
         "confirmation_quote_vol": confirmation_volume,
         "prior_avg_quote_vol": prior_avg_volume,
+        "confirmation_volume_ratio": round(confirmation_volume_ratio, 4),
         "breakout_time": breakout.get("time"),
         "confirmation_time": confirmation.get("time"),
     }
-    if breakout_close <= breakout_level:
-        return False, f"15m breakout not confirmed: close {breakout_close:.8g} <= level {breakout_level:.8g}", details
-    if confirmation_close < breakout_level:
-        return False, f"15m breakout failed to hold: close {confirmation_close:.8g} < level {breakout_level:.8g}", details
-    if confirmation_volume < prior_avg_volume:
-        return False, f"15m confirmation volume weak: {confirmation_volume:.0f} < avg {prior_avg_volume:.0f}", details
+    if breakout_time is None or confirmation_time is None:
+        return False, "15m breakout candle timestamp invalid", details
+    interval_seconds = (confirmation_time - breakout_time).total_seconds()
+    if interval_seconds != 15 * 60:
+        return False, f"15m breakout and confirmation are not consecutive ({interval_seconds:.0f}s)", details
+    if expected_time and confirmation_time != expected_time:
+        return False, f"15m confirmation candle stale: got {confirmation.get('time')}, expected {expected_confirmation_time}", details
+    if breakout_level <= 0 or prior_avg_volume <= 0:
+        return False, "15m breakout baseline invalid", details
+    if breakout_close < breakout_level * 1.003:
+        return False, f"15m breakout not confirmed: close must exceed level by 0.30% ({breakout_distance_pct:.2f}%)", details
+    if confirmation_close < breakout_level * 1.003:
+        return False, f"15m breakout failed to hold 0.30% above level ({confirmation_distance_pct:.2f}%)", details
+    if confirmation_low < breakout_level * 0.995:
+        return False, f"15m confirmation low broke level: low {confirmation_low:.8g}, level {breakout_level:.8g}", details
+    if confirmation_volume_ratio < 1.5:
+        return False, f"15m confirmation volume weak: {confirmation_volume_ratio:.2f}x < 1.50x", details
+    if confirmation_close > breakout_level * 1.15:
+        return False, f"15m confirmation extended too far: {confirmation_distance_pct:.2f}% > 15.00%", details
     return True, "15m breakout and hold confirmed", details
 
 
@@ -909,7 +939,7 @@ def _check_alpha_futures_breakout_confirmation(symbol, now=None):
     try:
         rows = conn.execute(
             """
-            SELECT time, high, close, quote_vol
+            SELECT time, high, low, close, quote_vol
             FROM futures_candles_15m
             WHERE symbol = ? AND time <= ?
             ORDER BY time DESC
@@ -919,7 +949,10 @@ def _check_alpha_futures_breakout_confirmation(symbol, now=None):
         ).fetchall()
     finally:
         conn.close()
-    return _evaluate_alpha_breakout_bars(list(reversed(rows)))
+    return _evaluate_alpha_breakout_bars(
+        list(reversed(rows)),
+        expected_confirmation_time=cutoff,
+    )
 
 
 def _safe_alpha_futures_breakout_confirmation(symbol, now=None):
@@ -2675,6 +2708,15 @@ class ExecutionEngine:
                 _safe_alpha_futures_breakout_confirmation(symbol)
             )
             entry_profile["breakout_confirmation"] = breakout_info
+            if explosive_candidate and not breakout_ok:
+                reject(
+                    "explosive_breakout_confirmation_required: " + _breakout_reason,
+                    {
+                        "volume_price": volume_price,
+                        "alpha_15m_confirmation": breakout_info,
+                    },
+                )
+                continue
             market_phase = _market_phase_gate(raw_alpha)
             alpha_entry_ok, alpha_entry_reason = _alpha_probe_entry_decision(
                 raw_alpha,
