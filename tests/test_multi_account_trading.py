@@ -385,7 +385,7 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
         self.main._account_status_snapshot.update(self.original_snapshot)
         self.main._account_status_refresh_task = self.original_refresh_task
 
-    async def test_stale_snapshot_returns_without_starting_a_refresh(self):
+    async def test_snapshot_in_polling_grace_stays_fresh_and_starts_refresh(self):
         self.main._account_status_snapshot.update({
             "data": {"accounts": [{"account_id": 1}], "summary": {}},
             "time": time.time() - 31,
@@ -394,11 +394,26 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
             payload, cache_status = await self.main._get_trading_account_status_snapshot()
 
-        refresh.assert_not_called()
+        refresh.assert_called_once_with()
+        self.assertEqual(cache_status, "HIT")
+        self.assertEqual(payload["accounts"][0]["account_id"], 1)
+        self.assertTrue(payload["fresh"])
+        self.assertGreaterEqual(payload["age_seconds"], 30)
+
+    async def test_snapshot_after_grace_is_stale_and_starts_refresh(self):
+        self.main._account_status_snapshot.update({
+            "data": {"accounts": [{"account_id": 1}], "summary": {}},
+            "time": time.time() - 45,
+            "last_error": None,
+        })
+        with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
+            payload, cache_status = await self.main._get_trading_account_status_snapshot()
+
+        refresh.assert_called_once_with()
         self.assertEqual(cache_status, "STALE")
         self.assertEqual(payload["accounts"][0]["account_id"], 1)
         self.assertFalse(payload["fresh"])
-        self.assertGreaterEqual(payload["age_seconds"], 30)
+        self.assertGreaterEqual(payload["age_seconds"], 45)
 
     async def test_cold_snapshot_read_returns_empty_payload_without_starting_a_refresh(self):
         with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:

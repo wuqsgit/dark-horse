@@ -234,6 +234,7 @@ _runtime_status_refresh_executor = ThreadPoolExecutor(
 _SCAN_CACHE_TTL = 5
 _BACKTEST_CACHE_TTL = 300
 _TRADING_ACCOUNT_STATUS_CACHE_TTL = 30
+_TRADING_ACCOUNT_STATUS_STALE_AFTER = 45
 _TRADING_RUNTIME_STATUS_CACHE_TTL = 30
 _RUNTIME_STATUS_REFRESH_ERROR_CODE = "runtime_snapshot_refresh_failed"
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
@@ -1820,7 +1821,15 @@ def _ensure_trading_account_status_refresh() -> asyncio.Task:
 async def _get_trading_account_status_snapshot() -> tuple[dict, str]:
     data = _account_status_snapshot.get("data")
     age = max(0.0, time.time() - float(_account_status_snapshot.get("time") or 0))
-    cache_status = "MISS" if data is None else "STALE" if age >= _TRADING_ACCOUNT_STATUS_CACHE_TTL else "HIT"
+    cache_status = (
+        "MISS"
+        if data is None
+        else "STALE"
+        if age >= _TRADING_ACCOUNT_STATUS_STALE_AFTER
+        else "HIT"
+    )
+    if data is not None and age >= _TRADING_ACCOUNT_STATUS_CACHE_TTL:
+        _ensure_trading_account_status_refresh()
     snapshot_at = float(_account_status_snapshot.get("time") or 0)
     payload = dict(data or {})
     payload["accounts"] = payload.get("accounts") or []

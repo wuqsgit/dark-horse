@@ -709,12 +709,12 @@ class AccountStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.main._account_status_snapshot.clear()
         self.main._account_status_snapshot.update(self.original_snapshot)
 
-    async def test_snapshot_http_read_does_not_start_a_refresh(self):
+    async def test_stale_snapshot_http_read_starts_background_refresh(self):
         response = Response()
         with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
             payload = await self.main.get_all_trading_account_status(response, user="viewer")
 
-        refresh.assert_not_called()
+        refresh.assert_called_once_with()
         self.assertEqual(payload["accounts"][0]["account_id"], 1)
         self.assertEqual(payload["summary"]["equity"], 100)
         self.assertIn("snapshot_at", payload)
