@@ -323,16 +323,16 @@ test('components wire the tested environment and strategy source helpers', () =>
   );
 });
 
-test('live trading polls only account snapshots and runtime status', () => {
-  const pollBody = liveTradingSource.match(/const pollLiveData = [^{]*\{([\s\S]*?)\n\s*\};/);
-  assert.ok(pollBody, 'expected a dedicated pollLiveData callback');
+test('live trading polls account snapshots every five seconds and runtime every thirty seconds', () => {
+  const pollBody = liveTradingSource.match(/const pollAccountSnapshot = [^{]*\{([\s\S]*?)\n\s*\};/);
+  assert.ok(pollBody, 'expected a dedicated pollAccountSnapshot callback');
   assert.match(pollBody[1], /fetchTradingAccountsStatus\(/);
-  assert.match(pollBody[1], /loadRuntimeStatus\(\)/);
   assert.doesNotMatch(
     pollBody[1],
-    /fetchTradingAccounts\(|fetchTradingHistory\(|fetchTradingDecisions\(|fetchTradingRuntimeStatus\(/,
+    /fetchTradingAccounts\(|fetchTradingHistory\(|fetchTradingDecisions\(|fetchTradingRuntimeStatus\(|loadRuntimeStatus\(/,
   );
-  assert.match(liveTradingSource, /setInterval\(pollLiveData, 30000\)/);
+  assert.match(liveTradingSource, /setInterval\(pollAccountSnapshot, 5000\)/);
+  assert.match(liveTradingSource, /setInterval\(loadRuntimeStatus, 30000\)/);
 });
 
 test('live trading settles initial resources independently and snapshot controls loading', () => {

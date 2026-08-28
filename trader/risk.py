@@ -132,15 +132,17 @@ def calculate_position(
     stop_distance = price * stop_pct
 
     mode = str(entry_mode or "confirmed").lower()
+    strong_entry = mode in {"strong", "trend_confirmed", "confirmed_strong"}
     if mode in _PROBE_ENTRY_MODES:
         margin_pct = float(sizing.get("probe_margin_pct", cfg.get("position_size_pct", 0.20)))
-    elif mode in {"strong", "trend_confirmed", "confirmed_strong"}:
+    elif strong_entry:
         margin_pct = float(sizing.get("strong_margin_pct", sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20))))
     else:
         margin_pct = float(sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20)))
 
-    score_adj = 1.0 if score is None else min(1.15, max(0.85, float(score) / 80.0))
-    margin_pct *= score_adj * max(0.1, min(1.5, float(size_multiplier or 1.0)))
+    if not strong_entry:
+        score_adj = 1.0 if score is None else min(1.15, max(0.85, float(score) / 80.0))
+        margin_pct *= score_adj * max(0.1, min(1.5, float(size_multiplier or 1.0)))
     max_margin_pct = float(sizing.get("max_margin_pct", margin_pct))
     margin_pct = min(margin_pct, max_margin_pct)
     target_margin = balance * margin_pct
@@ -164,10 +166,9 @@ def calculate_position(
         )
     risk_budget = balance * risk_per_trade_pct
     risk_notional = risk_budget / stop_pct
-    capped_notional = min(target_notional, risk_notional)
-    # Never force a minimum position above the 1R risk budget.  If a position
-    # is too small for exchange filters, the execution layer rejects it safely.
-    position_value = capped_notional
+    # Strong confirmations use the configured balance-based margin directly.
+    # The risk budget remains observable, but does not silently shrink the order.
+    position_value = target_notional if strong_entry else min(target_notional, risk_notional)
 
     max_notional = balance * max_margin_pct * leverage
     position_value = min(position_value, max_notional)

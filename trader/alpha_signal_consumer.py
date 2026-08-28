@@ -441,7 +441,11 @@ class AlphaSignalConsumer:
             )
             structural_risk = price - invalidation
             risk_qty = risk_budget / structural_risk if structural_risk > 0 else 0
-            target_qty = min(float(pos_info["quantity"]), risk_qty)
+            target_qty = (
+                float(pos_info["quantity"])
+                if entry_mode == "strong"
+                else min(float(pos_info["quantity"]), risk_qty)
+            )
             existing_qty = float(position.get("quantity") or 0) if position else 0.0
             quantity = (
                 max(0.0, target_qty - existing_qty)

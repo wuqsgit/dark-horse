@@ -190,7 +190,7 @@ class MultiAccountTradingTest(unittest.TestCase):
         from api.main import _FAST_CACHE_PATHS, _cache_ttl_for_path
 
         self.assertNotIn("/api/trading/accounts/status", _FAST_CACHE_PATHS)
-        self.assertEqual(_cache_ttl_for_path("/api/trading/accounts/status"), 30)
+        self.assertEqual(_cache_ttl_for_path("/api/trading/accounts/status"), 10)
 
     def test_recent_trades_are_position_level_groups_with_score_and_pct(self):
         conn = db.get_conn()
@@ -388,7 +388,7 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_in_polling_grace_stays_fresh_and_starts_refresh(self):
         self.main._account_status_snapshot.update({
             "data": {"accounts": [{"account_id": 1}], "summary": {}},
-            "time": time.time() - 31,
+            "time": time.time() - 11,
             "last_error": None,
         })
         with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
@@ -398,12 +398,12 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache_status, "HIT")
         self.assertEqual(payload["accounts"][0]["account_id"], 1)
         self.assertTrue(payload["fresh"])
-        self.assertGreaterEqual(payload["age_seconds"], 30)
+        self.assertGreaterEqual(payload["age_seconds"], 10)
 
     async def test_snapshot_after_grace_is_stale_and_starts_refresh(self):
         self.main._account_status_snapshot.update({
             "data": {"accounts": [{"account_id": 1}], "summary": {}},
-            "time": time.time() - 45,
+            "time": time.time() - 20,
             "last_error": None,
         })
         with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
@@ -413,7 +413,7 @@ class AccountStatusSnapshotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache_status, "STALE")
         self.assertEqual(payload["accounts"][0]["account_id"], 1)
         self.assertFalse(payload["fresh"])
-        self.assertGreaterEqual(payload["age_seconds"], 45)
+        self.assertGreaterEqual(payload["age_seconds"], 20)
 
     async def test_cold_snapshot_read_returns_empty_payload_without_starting_a_refresh(self):
         with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:

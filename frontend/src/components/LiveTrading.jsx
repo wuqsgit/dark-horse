@@ -266,18 +266,19 @@ export default function LiveTrading() {
       },
     });
 
-    const pollLiveData = () => {
+    const pollAccountSnapshot = () => {
       fetchTradingAccountsStatus({ force: true })
         .then((data) => { if (active) applyAccountSnapshot(data); })
         .catch((requestError) => {
           if (active) setSnapshotWarning(`账户快照刷新失败：${requestError.message}`);
         });
-      loadRuntimeStatus();
     };
-    const id = setInterval(pollLiveData, 30000);
+    const accountSnapshotPollId = setInterval(pollAccountSnapshot, 5000);
+    const runtimeStatusPollId = setInterval(loadRuntimeStatus, 30000);
     return () => {
       active = false;
-      clearInterval(id);
+      clearInterval(accountSnapshotPollId);
+      clearInterval(runtimeStatusPollId);
       runtimeControllerRef.current.invalidate();
     };
   }, [applyAccountSnapshot, loadRuntimeStatus]);

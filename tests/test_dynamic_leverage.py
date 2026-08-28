@@ -93,7 +93,7 @@ class DynamicLeverageTest(unittest.TestCase):
         self.assertTrue(risk.should_execute_entry_mode("confirmed"))
         self.assertTrue(risk.should_execute_entry_mode("strong"))
 
-    def test_strong_bluechip_uses_two_percent_risk_budget(self):
+    def test_strong_bluechip_reports_two_percent_risk_budget_without_capping_margin(self):
         balance = 704.08386734
 
         result = calculate_position(
@@ -108,7 +108,26 @@ class DynamicLeverageTest(unittest.TestCase):
 
         self.assertEqual(result["risk_per_trade_pct"], 0.02)
         self.assertAlmostEqual(result["risk_budget"], balance * 0.02)
-        self.assertAlmostEqual(result["position_value"], balance * 0.02 / 0.05)
+        self.assertAlmostEqual(result["margin"], balance * 0.15)
+        self.assertAlmostEqual(result["position_value"], balance * 0.15 * 3)
+
+    def test_strong_entry_uses_fifteen_percent_balance_as_actual_margin(self):
+        balance = 707.0
+
+        result = calculate_position(
+            AtrExchange(0.08),
+            "SOLUSDT",
+            price=100.0,
+            balance=balance,
+            score=72,
+            category="large_cap",
+            entry_mode="trend_confirmed",
+        )
+
+        self.assertEqual(result["leverage"], 2)
+        self.assertLess(result["risk_notional"], 212.10)
+        self.assertAlmostEqual(result["margin"], 106.05)
+        self.assertAlmostEqual(result["position_value"], 212.10)
 
     def test_high_quality_sol_snapshot_is_promoted_to_strong(self):
         row = {

@@ -12,7 +12,6 @@ from alpha_engine.strategy.models import (
 )
 from alpha_engine.strategy.repository import AlphaStrategyRepository
 from trader.alpha_signal_consumer import AlphaSignalConsumer
-from trader.config import TRADING_CONFIG
 
 
 class FakeExchange:
@@ -181,13 +180,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(actions[0]["market_data_env"], "mainnet")
         self.assertEqual(actions[0]["execution_env"], "testnet")
         self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.70)
-        self.assertLessEqual(
-            actions[0]["quantity"]
-            * (actions[0]["entry_price"] - actions[0]["stop_loss"]),
-            1000
-            * TRADING_CONFIG["position_sizing"]["alpha"][
-                "risk_per_trade_pct"
-            ],
+        self.assertAlmostEqual(actions[0]["quantity"], 450.0)
+        self.assertAlmostEqual(
+            actions[0]["quantity"] * actions[0]["entry_price"]
+            / actions[0]["leverage"],
+            150.0,
         )
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
         self.assertEqual(duplicate, [])
