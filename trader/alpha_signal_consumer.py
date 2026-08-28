@@ -19,7 +19,7 @@ from trader.portfolio_risk import (
     check_portfolio_risk,
     symbol_risk_category,
 )
-from trader.risk import calc_tp_levels, calculate_position
+from trader.risk import calc_tp_levels, calculate_position, should_execute_entry_mode
 
 
 LIVE_MODES = {"testnet_live", "mainnet_canary", "mainnet_live"}
@@ -179,6 +179,16 @@ class AlphaSignalConsumer:
                     event=event,
                     reason="signal_mode_record_only",
                     status="SIGNAL_ONLY",
+                )
+                continue
+            if not should_execute_entry_mode(
+                "probe" if action_type == "PROBE_LONG" else "strong"
+            ):
+                self._reject(
+                    account_id=account_id,
+                    event=event,
+                    reason="probe_observation_only",
+                    status="OBSERVED",
                 )
                 continue
             symbol = str(event["futures_symbol"]).upper()

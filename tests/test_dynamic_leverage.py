@@ -1,6 +1,8 @@
 import unittest
 
+from trader import risk
 from trader.risk import _dynamic_leverage, _position_sizing_config, calculate_position
+from trader.selection import BluechipTrendSelector
 
 
 class AtrExchange:
@@ -82,6 +84,87 @@ class DynamicLeverageTest(unittest.TestCase):
                 self.assertEqual(sizing["strong_margin_pct"], 0.15)
                 self.assertEqual(sizing["max_margin_pct"], 0.15)
                 self.assertEqual(sizing["risk_per_trade_pct"], risk_pct)
+
+    def test_probe_modes_are_observation_only(self):
+        self.assertTrue(hasattr(risk, "should_execute_entry_mode"))
+        self.assertFalse(risk.should_execute_entry_mode("probe"))
+        self.assertFalse(risk.should_execute_entry_mode("normal_review_probe"))
+        self.assertFalse(risk.should_execute_entry_mode("trend_probe"))
+        self.assertTrue(risk.should_execute_entry_mode("confirmed"))
+        self.assertTrue(risk.should_execute_entry_mode("strong"))
+
+    def test_strong_bluechip_uses_two_percent_risk_budget(self):
+        balance = 704.08386734
+
+        result = calculate_position(
+            AtrExchange(0.03),
+            "SOLUSDT",
+            price=100.0,
+            balance=balance,
+            score=88,
+            category="core_bluechip",
+            entry_mode="strong",
+        )
+
+        self.assertEqual(result["risk_per_trade_pct"], 0.02)
+        self.assertAlmostEqual(result["risk_budget"], balance * 0.02)
+        self.assertAlmostEqual(result["position_value"], balance * 0.02 / 0.05)
+
+    def test_high_quality_sol_snapshot_is_promoted_to_strong(self):
+        row = {
+            "symbol": "SOLUSDT",
+            "composite_score": 64.0,
+            "entry_alpha": 45.0,
+            "relative_strength": 85.7,
+            "raw_features": {
+                "technical": {
+                    "price_change_24h": 0.0501,
+                    "return_6h": 0.4057,
+                    "ema20_slope": 0.3409,
+                    "ema20_50_ratio": 1.015,
+                    "volume_change_pct": 0.8191,
+                    "support_score": 72.1,
+                    "absorption_score": 55.4,
+                    "rsi_14": 50.7263,
+                    "price_position_value": 0.7161,
+                    "trend_score": 50.0,
+                },
+                "futures": {"oi_change_pct": 0.116817, "oi_score": 70},
+                "depth": {"depth_ratio_score": 50.0, "big_order_score": 40.0},
+            },
+        }
+
+        result = BluechipTrendSelector()._evaluate(row, set(), 0)
+
+        self.assertEqual(result["bluechip_entry_mode"], "trend_confirmed")
+
+    def test_weak_eth_snapshot_remains_observation_only(self):
+        row = {
+            "symbol": "ETHUSDT",
+            "composite_score": 56.7,
+            "entry_alpha": 45.0,
+            "relative_strength": 70.7,
+            "raw_features": {
+                "technical": {
+                    "price_change_24h": 0.0118,
+                    "return_6h": 0.3457,
+                    "ema20_slope": 0.1917,
+                    "ema20_50_ratio": 1.0019,
+                    "volume_change_pct": 0.2643,
+                    "support_score": 73.3,
+                    "absorption_score": 65.7,
+                    "rsi_14": 62.4879,
+                    "price_position_value": 0.7035,
+                    "trend_score": 50.0,
+                },
+                "futures": {"oi_change_pct": -0.003766, "oi_score": 50},
+                "depth": {"depth_ratio_score": 50.0, "big_order_score": 40.0},
+            },
+        }
+
+        result = BluechipTrendSelector()._evaluate(row, set(), 0)
+
+        self.assertEqual(result["bluechip_entry_mode"], "probe")
 
 
 if __name__ == "__main__":

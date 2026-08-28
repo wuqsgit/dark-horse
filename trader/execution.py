@@ -12,6 +12,7 @@ from trader.risk import (
     calculate_position, determine_side, meets_safety_filters,
     calc_tp_levels, calc_trailing_stop, entry_alpha_for_side,
     evaluate_entry_policy, evaluate_short_setup, funding_position_factor,
+    should_execute_entry_mode,
 )
 from trader.entry_profiles import evaluate_profile_entry
 from trader.config import TRADING_CONFIG
@@ -2692,6 +2693,12 @@ class ExecutionEngine:
                 discovery_score, min_score, full_position_score,
             )
             entry_status = "probe" if vp_action == "normal_review_probe" or vp_factor <= 0.25 else "pass"
+            if not should_execute_entry_mode(entry_status):
+                reject(
+                    "probe_observation_only",
+                    {"volume_price": volume_price},
+                )
+                continue
             entry_profile = {
                 "status": entry_status,
                 "template": f"alpha_{volume_price.get('state') or 'volume_price'}",
@@ -3473,6 +3480,22 @@ class ExecutionEngine:
                 if side == "SHORT" and directional_alpha < float(short_cfg.get("full_position_alpha", 72)):
                     size_multiplier *= float(short_cfg.get("probe_position_factor", 0.5))
                     sizing_mode = "probe"
+                if not should_execute_entry_mode(sizing_mode):
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        decision_stage="risk_sizing",
+                        decision_result="observe",
+                        filter_reason="probe_observation_only",
+                        risk_params={
+                            "entry_profile": entry_profile,
+                            "market_phase": market_phase,
+                        },
+                        market_regime=regime,
+                    )
+                    logger.info(f"  {sym}: probe observation only, skip live order")
+                    continue
                 funding = float((_raw_features(s).get("futures") or {}).get("funding_rate") or 0)
                 size_multiplier *= funding_position_factor(funding, side)
                 pos_info = calculate_position(
@@ -3690,6 +3713,20 @@ class ExecutionEngine:
                     "template": "bluechip_trend",
                     "template_name": "Bluechip Trend",
                 }
+                if not should_execute_entry_mode(entry_profile.get("status")):
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="bluechip_trend",
+                        decision_result="observe",
+                        filter_reason="probe_observation_only",
+                        risk_params={"metrics": s.get("bluechip_metrics")},
+                        market_regime=regime,
+                    )
+                    logger.info(f"  {sym}: bluechip probe observation only")
+                    continue
                 try:
                     ob_ok, ob_reason, ob_info = self._check_live_orderbook(sym, side, entry_profile)
                 except Exception as e:

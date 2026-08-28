@@ -474,12 +474,21 @@ class BluechipTrendSelector:
                 f"adverse_funding_rate side=LONG rate={funding:.5f} limit={max_funding:.5f}"
             )
 
-        confirmed = (
+        legacy_confirmed = (
             metrics["score"] >= float(cfg.get("confirmed_score", 60))
             and metrics["entry_alpha"] >= float(cfg.get("confirmed_entry_alpha", 50))
             and metrics["relative_strength"] >= float(cfg.get("confirmed_relative_strength", 58))
             and metrics["trend_score"] >= float(cfg.get("confirmed_trend_score", 68))
         )
+        aggregate_confirmed = (
+            metrics["bluechip_trend_score"] >= float(cfg.get("aggregate_confirmed_score", 75))
+            and metrics["score"] >= float(cfg.get("aggregate_confirmed_base_score", 60))
+            and metrics["relative_strength"] >= float(cfg.get("aggregate_confirmed_relative_strength", 70))
+            and metrics["ret_24h"] >= float(cfg.get("aggregate_confirmed_return_24h", 0.005))
+            and metrics["oi_change_pct"] > float(cfg.get("aggregate_confirmed_oi_change", 0.0))
+            and metrics["support_component"] >= float(cfg.get("aggregate_confirmed_support_score", 55))
+        )
+        confirmed = legacy_confirmed or aggregate_confirmed
         mode = "trend_confirmed" if confirmed else "probe"
         return {
             **row,

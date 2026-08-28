@@ -88,12 +88,18 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         mode="testnet_live",
         reasons=("trigger_confirmed",),
         max_position_factor=0.3,
+        action_type=ActionType.PROBE_LONG,
     ):
         now = datetime.now(timezone.utc)
+        confirmed = action_type == ActionType.CONFIRM_LONG
         transition = TransitionResult(
             from_state=AlphaSignalState.ARMED,
-            to_state=AlphaSignalState.PROBE_READY,
-            action_type=ActionType.PROBE_LONG,
+            to_state=(
+                AlphaSignalState.CONFIRMED
+                if confirmed
+                else AlphaSignalState.PROBE_READY
+            ),
+            action_type=action_type,
             changed=True,
             candle_close_time=now,
             snapshot_id=f"snap-{symbol}",
@@ -134,8 +140,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             "max_capital_usage_pct": 0.8,
         }
 
-    def test_builds_bounded_action_and_consumes_event_once(self):
-        self._event()
+    def test_confirmed_signal_builds_bounded_action_and_consumes_event_once(self):
+        self._event(
+            action_type=ActionType.CONFIRM_LONG,
+            max_position_factor=0.7,
+        )
         consumer = AlphaSignalConsumer(
             FakeExchange(),
             config={
@@ -145,7 +154,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
                     "mode": "testnet_live",
                     "market_env": "mainnet",
                     "max_alpha_positions": 2,
-                    "probe_stage_cap": 0.30,
+                    "confirmed_stage_cap": 0.70,
                 },
             },
             repository=self.repo,
@@ -171,13 +180,13 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(actions[0]["strategy_source"], "alpha")
         self.assertEqual(actions[0]["market_data_env"], "mainnet")
         self.assertEqual(actions[0]["execution_env"], "testnet")
-        self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.30)
+        self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.70)
         self.assertLessEqual(
             actions[0]["quantity"]
             * (actions[0]["entry_price"] - actions[0]["stop_loss"]),
             1000
             * TRADING_CONFIG["position_sizing"]["alpha"][
-                "probe_risk_per_trade_pct"
+                "risk_per_trade_pct"
             ],
         )
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
@@ -220,7 +229,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             conn.close()
         self.assertEqual(status, "SIGNAL_ONLY")
 
-    def test_sentiment_reversal_probe_uses_half_position_cap(self):
+    def test_probe_signal_is_observation_only(self):
         self._event(
             reasons=(
                 "square_extreme_bearishness",
@@ -252,11 +261,18 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             run_id="run-square",
         )
 
-        self.assertEqual(len(actions), 1)
-        self.assertLessEqual(
-            actions[0]["alpha_suggested_position_pct"],
-            0.50,
-        )
+        self.assertEqual(actions, [])
+        conn = db.get_conn()
+        try:
+            row = conn.execute(
+                """SELECT status, rejection_reason
+                   FROM alpha_signal_consumptions
+                   WHERE account_id=7"""
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["status"], "OBSERVED")
+        self.assertEqual(row["rejection_reason"], "probe_observation_only")
 
     def test_restart_releases_unsubmitted_plan_for_safe_retry(self):
         applied = self._event()

@@ -11,6 +11,14 @@ from shared.directional_scoring import compute_short_entry_alpha
 from trader.config import HARD_FILTERS, TRADING_CONFIG
 
 
+_PROBE_ENTRY_MODES = {"probe", "normal_review_probe", "trend_probe"}
+
+
+def should_execute_entry_mode(entry_mode: str | None) -> bool:
+    """Probe signals are observation-only and never create live orders."""
+    return str(entry_mode or "confirmed").lower() not in _PROBE_ENTRY_MODES
+
+
 def _ensure_dict(row: Any) -> dict:
     if isinstance(row, dict):
         return row
@@ -124,7 +132,7 @@ def calculate_position(
     stop_distance = price * stop_pct
 
     mode = str(entry_mode or "confirmed").lower()
-    if mode in {"probe", "normal_review_probe", "trend_probe"}:
+    if mode in _PROBE_ENTRY_MODES:
         margin_pct = float(sizing.get("probe_margin_pct", cfg.get("position_size_pct", 0.20)))
     elif mode in {"strong", "trend_confirmed", "confirmed_strong"}:
         margin_pct = float(sizing.get("strong_margin_pct", sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20))))
@@ -138,11 +146,22 @@ def calculate_position(
     target_margin = balance * margin_pct
     target_notional = target_margin * leverage
 
-    risk_per_trade_pct = float(
-        sizing.get("probe_risk_per_trade_pct", sizing.get("risk_per_trade_pct", cfg.get("risk_per_trade_pct", 0.005)))
-        if mode in {"probe", "normal_review_probe", "trend_probe"}
-        else sizing.get("risk_per_trade_pct", cfg.get("risk_per_trade_pct", 0.005))
+    base_risk_pct = sizing.get(
+        "risk_per_trade_pct",
+        cfg.get("risk_per_trade_pct", 0.005),
     )
+    if mode in _PROBE_ENTRY_MODES:
+        risk_per_trade_pct = float(
+            sizing.get("probe_risk_per_trade_pct", base_risk_pct)
+        )
+    elif mode in {"strong", "trend_confirmed", "confirmed_strong"}:
+        risk_per_trade_pct = float(
+            sizing.get("strong_risk_per_trade_pct", base_risk_pct)
+        )
+    else:
+        risk_per_trade_pct = float(
+            sizing.get("confirmed_risk_per_trade_pct", base_risk_pct)
+        )
     risk_budget = balance * risk_per_trade_pct
     risk_notional = risk_budget / stop_pct
     capped_notional = min(target_notional, risk_notional)
