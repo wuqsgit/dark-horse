@@ -445,11 +445,8 @@ async def fast_path_cache(request, call_next):
 
 @app.on_event("startup")
 async def startup():
-    global _scan_refresh_task, _account_status_refresher_task
+    global _scan_refresh_task
     init_db()
-    _load_persisted_trading_account_status_snapshot()
-    if _account_status_refresher_task is None:
-        _account_status_refresher_task = asyncio.create_task(_account_status_snapshot_refresher())
     _ensure_trading_runtime_status_refresh()
     try:
         await asyncio.to_thread(_refresh_scan_payload_sync)
@@ -1559,7 +1556,7 @@ def _account_decision_panel(conn, account_id: int) -> dict:
     return panel
 
 
-def _account_status_payload(account: dict) -> dict:
+def _exchange_account_status_payload(account: dict) -> dict:
     from shared.accounts import account_exchange_config
     from shared.db import (
         get_conn,
@@ -1735,17 +1732,238 @@ def _account_status_payload(account: dict) -> dict:
         reset_account_context(account_token)
 
 
+def _parse_snapshot_time(value) -> float | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _account_status_payload(account: dict) -> dict:
+    """Build one live-account view from bounded current-state database reads."""
+    from shared.db import get_conn
+    from shared.live_account_store import fetch_live_account_snapshot
+
+    snapshot = fetch_live_account_snapshot(account["id"])
+    balance = snapshot.get("balance")
+    stream_state = snapshot.get("state") or {}
+    raw_positions = snapshot.get("positions") or []
+    updated_timestamp = _parse_snapshot_time(
+        stream_state.get("last_success_at")
+        or stream_state.get("updated_at")
+        or (balance or {}).get("updated_at")
+    )
+    age_seconds = (
+        max(0.0, time.time() - updated_timestamp)
+        if updated_timestamp is not None
+        else None
+    )
+    stale = balance is None or age_seconds is None or age_seconds >= _TRADING_ACCOUNT_STATUS_STALE_AFTER
+    stream_status = str(stream_state.get("status") or "starting")
+    status = "ok" if balance is not None and not stale and stream_status == "ok" else "degraded"
+
+    conn = get_conn()
+    try:
+        adjustments = float(conn.execute(
+            """SELECT COALESCE(SUM(CASE
+                   WHEN adjustment_type IN ('deposit','transfer_in') THEN amount
+                   WHEN adjustment_type IN ('withdraw','transfer_out') THEN -amount
+                   ELSE amount END), 0)
+               FROM account_capital_adjustments WHERE account_id=?""",
+            (account["id"],),
+        ).fetchone()[0] or 0)
+        position_states = {
+            row["symbol"]: dict(row)
+            for row in conn.execute(
+                "SELECT * FROM account_position_history WHERE account_id=?",
+                (account["id"],),
+            ).fetchall()
+        }
+        positions = []
+        equity = float((balance or {}).get("equity") or 0)
+        total_maint_margin = float((balance or {}).get("total_maint_margin") or 0)
+        cross_margin_ratio = (
+            total_maint_margin / equity * 100 if equity > 0 else None
+        )
+        for raw_position in raw_positions:
+            position = dict(raw_position)
+            symbol = str(position.get("symbol") or "")
+            state = position_states.get(symbol) or {}
+            open_order = conn.execute(
+                """SELECT created_at FROM orders
+                   WHERE account_id=? AND symbol=? AND order_type='MARKET'
+                   ORDER BY id DESC LIMIT 1""",
+                (account["id"], symbol),
+            ).fetchone()
+            latest_action = conn.execute(
+                """SELECT filter_reason, decision_result
+                   FROM strategy_decisions
+                   WHERE account_id=? AND symbol=?
+                     AND decision_stage IN
+                         ('position_management','roll_position','execution')
+                   ORDER BY id DESC LIMIT 1""",
+                (account["id"], symbol),
+            ).fetchone()
+            score_row = conn.execute(
+                """SELECT raw_features FROM alpha_scores
+                   WHERE symbol=? ORDER BY time DESC LIMIT 1""",
+                (symbol,),
+            ).fetchone()
+            if score_row:
+                market_phase = (_parse_json(score_row["raw_features"], {}) or {}).get(
+                    "market_phase"
+                ) or {}
+            else:
+                alpha_row = conn.execute(
+                    """SELECT raw_features FROM alpha_scan_scores
+                       WHERE futures_symbol=? ORDER BY time DESC LIMIT 1""",
+                    (symbol,),
+                ).fetchone()
+                market_phase = (
+                    (_parse_json(alpha_row["raw_features"], {}) or {}).get("market_phase")
+                    if alpha_row
+                    else {}
+                ) or {}
+
+            position["positionSide"] = position.get("position_side") or "BOTH"
+            position["account_id"] = account["id"]
+            position["account_name"] = account["name"]
+            entry_time = state.get("entry_time") or (
+                open_order["created_at"] if open_order else None
+            )
+            position.update(_live_holding_fields(entry_time))
+            position.update(_live_position_management_fields(state))
+            position["market_phase"] = market_phase
+            position["last_system_action"] = (
+                latest_action["filter_reason"] or latest_action["decision_result"]
+                if latest_action
+                else None
+            )
+            position["invested"] = round(
+                float(position.get("notional") or 0)
+                or abs(
+                    float(position.get("entry_price") or 0)
+                    * float(position.get("quantity") or 0)
+                ),
+                2,
+            )
+            if state.get("strategy_source") == "alpha":
+                from shared.db import fetch_latest_alpha_position_context
+
+                alpha_context = fetch_latest_alpha_position_context(
+                    symbol=symbol,
+                    alpha_symbol=state.get("alpha_symbol"),
+                ) or {}
+                reasons = _parse_json(
+                    alpha_context.get("volume_price_reasons_json"), []
+                )
+                position.update({
+                    "alpha_current_score": (
+                        float(alpha_context.get("alpha_score") or 0)
+                        if alpha_context
+                        else None
+                    ),
+                    "alpha_volume_price_state": alpha_context.get("volume_price_state"),
+                    "alpha_volume_price_action": alpha_context.get("volume_price_action"),
+                    "alpha_volume_price_reason": reasons[0] if reasons else None,
+                })
+            entry_price = float(position.get("entry_price") or 0)
+            quantity = float(position.get("quantity") or 0)
+            tracked_price = (
+                float(position.get("highest_price") or entry_price)
+                if position.get("side") == "LONG"
+                else float(position.get("lowest_price") or entry_price)
+            )
+            tracked_pnl = (
+                (tracked_price - entry_price) * quantity
+                if position.get("side") == "LONG"
+                else (entry_price - tracked_price) * quantity
+            )
+            position["max_floating_pnl"] = round(
+                max(float(position.get("max_floating_pnl") or 0), tracked_pnl, 0),
+                2,
+            )
+            position_margin = float(
+                position.get("margin")
+                or position.get("position_initial_margin")
+                or 0
+            )
+            position["pnl_pct"] = (
+                round(float(position.get("unrealized_pnl") or 0) / position_margin * 100, 2)
+                if position_margin > 0
+                else None
+            )
+            if str(position.get("margin_type") or "").lower() in {"cross", "crossed"}:
+                position["margin_ratio"] = (
+                    round(cross_margin_ratio, 4)
+                    if cross_margin_ratio is not None
+                    else None
+                )
+            else:
+                isolated_balance = float(position.get("isolated_margin") or 0) + float(
+                    position.get("unrealized_pnl") or 0
+                )
+                position["margin_ratio"] = (
+                    round(
+                        float(position.get("maint_margin") or 0)
+                        / isolated_balance
+                        * 100,
+                        4,
+                    )
+                    if isolated_balance > 0
+                    else None
+                )
+            positions.append(position)
+    finally:
+        conn.close()
+
+    initial = float(account.get("initial_capital") or 0)
+    wallet = float((balance or {}).get("wallet_balance") or 0)
+    equity = float((balance or {}).get("equity") or wallet)
+    total_pnl = equity - initial - adjustments
+    base = initial + adjustments
+    return {
+        "account_id": account["id"],
+        "account_name": account["name"],
+        "environment": account["environment"],
+        "status": status,
+        "stale": stale,
+        "error": stream_state.get("last_error"),
+        "snapshot_at": updated_timestamp,
+        "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+        "initial_capital": initial,
+        "net_capital_adjustments": adjustments,
+        "wallet_balance": wallet,
+        "equity": equity,
+        "available_balance": float((balance or {}).get("available_balance") or 0),
+        "unrealized_pnl": float((balance or {}).get("unrealized_pnl") or 0),
+        "total_pnl": total_pnl,
+        "return_pct": total_pnl / base * 100 if base else 0,
+        "max_positions": int(account.get("max_positions") or 5),
+        "position_count": len(positions),
+        "positions": positions,
+        "open_orders": snapshot.get("orders") or [],
+        "normal_trading_enabled": bool(account.get("normal_trading_enabled")),
+        "alpha_trading_enabled": bool(account.get("alpha_trading_enabled")),
+        "auto_trading_enabled": bool(account.get("auto_trading_enabled")),
+    }
+
+
 def _refresh_all_account_statuses_sync() -> dict:
     from shared.accounts import list_accounts
 
-    accounts = list_accounts(include_secrets=True, enabled_only=True)
+    accounts = list_accounts(enabled_only=True)
     results = [_account_status_payload(account) for account in accounts]
-    failures = [row for row in results if row.get("status") != "ok"]
-    if failures:
-        names = ", ".join(str(row.get("account_name") or row.get("account_id")) for row in failures)
-        raise RuntimeError(f"Account status refresh failed for: {names}")
-    healthy = [row for row in results if row.get("status") == "ok"]
-    environments = {row.get("environment") for row in healthy}
+    available = [row for row in results if row.get("snapshot_at") is not None]
+    environments = {row.get("environment") for row in results}
     if len(environments) > 1:
         environment_status = "MIXED"
     elif environments == {"prod"}:
@@ -1758,12 +1976,19 @@ def _refresh_all_account_statuses_sync() -> dict:
         "accounts": results,
         "environment_status": environment_status,
         "summary": {
-            "initial_capital": sum(float(r.get("initial_capital") or 0) for r in healthy),
-            "equity": sum(float(r.get("equity") or 0) for r in healthy),
-            "total_pnl": sum(float(r.get("total_pnl") or 0) for r in healthy),
-            "unrealized_pnl": sum(float(r.get("unrealized_pnl") or 0) for r in healthy),
-            "position_count": sum(len(r.get("positions") or []) for r in healthy),
+            "initial_capital": sum(float(r.get("initial_capital") or 0) for r in results),
+            "equity": sum(float(r.get("equity") or 0) for r in available),
+            "total_pnl": sum(float(r.get("total_pnl") or 0) for r in available),
+            "unrealized_pnl": sum(float(r.get("unrealized_pnl") or 0) for r in available),
+            "position_count": sum(len(r.get("positions") or []) for r in available),
         },
+        "snapshot_at": min((r["snapshot_at"] for r in available), default=None),
+        "age_seconds": max((float(r.get("age_seconds") or 0) for r in available), default=None),
+        "fresh": bool(results) and all(
+            row.get("status") == "ok" and not row.get("stale")
+            for row in results
+        ),
+        "last_error": next((row.get("error") for row in results if row.get("error")), None),
     }
 
 
@@ -1901,7 +2126,7 @@ async def test_trading_account(account_id: int, user=Depends(require_admin)):
     account = get_account(account_id, include_secrets=True)
     if not account:
         return {"error": "账户不存在"}
-    result = await asyncio.to_thread(_account_status_payload, account)
+    result = await asyncio.to_thread(_exchange_account_status_payload, account)
     return result
 
 
@@ -1927,8 +2152,8 @@ async def add_account_capital_adjustment(account_id: int, body: dict, user=Depen
 
 @app.get("/api/trading/accounts/status")
 async def get_all_trading_account_status(response: Response, user=Depends(get_user)):
-    payload, cache_status = await _get_trading_account_status_snapshot()
-    response.headers["X-Cache"] = cache_status
+    payload = await asyncio.to_thread(_refresh_all_account_statuses_sync)
+    response.headers["X-Cache"] = "DB"
     return payload
 
 

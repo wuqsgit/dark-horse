@@ -917,6 +917,87 @@ CREATE TABLE alpha_signal_events (
             ai_decision_json TEXT,
             created_at TEXT NOT NULL
         );
+CREATE TABLE account_live_balances (
+            account_id INTEGER PRIMARY KEY REFERENCES trading_accounts(id) ON DELETE CASCADE,
+            asset TEXT NOT NULL DEFAULT 'USDT',
+            wallet_balance REAL NOT NULL DEFAULT 0,
+            equity REAL NOT NULL DEFAULT 0,
+            available_balance REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
+            total_maint_margin REAL NOT NULL DEFAULT 0,
+            total_initial_margin REAL NOT NULL DEFAULT 0,
+            snapshot_version TEXT NOT NULL,
+            exchange_event_time TEXT,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+CREATE TABLE account_live_positions (
+            account_id INTEGER NOT NULL REFERENCES trading_accounts(id) ON DELETE CASCADE,
+            symbol TEXT NOT NULL,
+            position_side TEXT NOT NULL DEFAULT 'BOTH',
+            side TEXT NOT NULL,
+            quantity REAL NOT NULL DEFAULT 0,
+            entry_price REAL NOT NULL DEFAULT 0,
+            mark_price REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
+            leverage INTEGER NOT NULL DEFAULT 0,
+            margin REAL NOT NULL DEFAULT 0,
+            initial_margin REAL NOT NULL DEFAULT 0,
+            maint_margin REAL NOT NULL DEFAULT 0,
+            position_initial_margin REAL NOT NULL DEFAULT 0,
+            open_order_initial_margin REAL NOT NULL DEFAULT 0,
+            isolated_margin REAL NOT NULL DEFAULT 0,
+            notional REAL NOT NULL DEFAULT 0,
+            margin_asset TEXT,
+            margin_type TEXT,
+            liquidation_price REAL NOT NULL DEFAULT 0,
+            break_even_price REAL NOT NULL DEFAULT 0,
+            risk_api_version TEXT,
+            snapshot_version TEXT NOT NULL,
+            exchange_event_time TEXT,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, symbol, position_side)
+        );
+CREATE INDEX idx_account_live_positions_account
+            ON account_live_positions(account_id, symbol);
+CREATE TABLE account_live_orders (
+            account_id INTEGER NOT NULL REFERENCES trading_accounts(id) ON DELETE CASCADE,
+            exchange_order_id TEXT NOT NULL,
+            client_order_id TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT,
+            position_side TEXT,
+            order_type TEXT,
+            status TEXT,
+            quantity REAL NOT NULL DEFAULT 0,
+            executed_quantity REAL NOT NULL DEFAULT 0,
+            price REAL NOT NULL DEFAULT 0,
+            stop_price REAL NOT NULL DEFAULT 0,
+            reduce_only INTEGER NOT NULL DEFAULT 0,
+            close_position INTEGER NOT NULL DEFAULT 0,
+            time_in_force TEXT,
+            snapshot_version TEXT NOT NULL,
+            exchange_event_time TEXT,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, exchange_order_id)
+        );
+CREATE INDEX idx_account_live_orders_account_symbol
+            ON account_live_orders(account_id, symbol);
+CREATE TABLE account_stream_state (
+            account_id INTEGER PRIMARY KEY REFERENCES trading_accounts(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'starting',
+            ws_connected INTEGER NOT NULL DEFAULT 0,
+            snapshot_version TEXT,
+            exchange_event_time TEXT,
+            source TEXT,
+            last_success_at TEXT,
+            last_error_at TEXT,
+            last_error TEXT,
+            listen_key_expires_at TEXT,
+            updated_at TEXT NOT NULL
+        );
 CREATE TABLE alpha_signal_consumptions (
             account_id INTEGER NOT NULL,
             event_id TEXT NOT NULL,
@@ -1146,6 +1227,9 @@ CREATE INDEX idx_strategy_decisions_symbol ON strategy_decisions(symbol);
 CREATE INDEX idx_strategy_decisions_symbol_time ON strategy_decisions(symbol, time DESC);
 CREATE INDEX idx_strategy_decisions_time ON strategy_decisions(time);
 CREATE INDEX idx_strategy_decisions_time_id ON strategy_decisions(time DESC, id DESC);
+CREATE INDEX idx_strategy_decisions_account_symbol_stage_id
+            ON strategy_decisions(account_id, symbol, decision_stage, id DESC);
+CREATE INDEX idx_alpha_scan_futures_time ON alpha_scan_scores(futures_symbol, time DESC);
 CREATE INDEX idx_symbol_snapshots_active_volume ON symbol_snapshots(active, quote_volume DESC);
 CREATE INDEX idx_symbol_snapshots_symbol_date ON symbol_snapshots(symbol, date DESC);
 CREATE INDEX idx_symbols_active_last_seen ON symbols(is_active, last_seen DESC);

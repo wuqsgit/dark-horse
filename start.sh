@@ -270,6 +270,7 @@ stop_service "Minute Pipeline" "$RUNTIME_DIR/alphadog_minute_pipeline.pid" "minu
 stop_service "Engine" "$RUNTIME_DIR/alphadog_engine.pid" "engine/run.py"
 stop_service "Alpha Engine" "$RUNTIME_DIR/alphadog_alpha_engine.pid" "alpha_engine.run"
 stop_service "AI Entry Quality" "$RUNTIME_DIR/alphadog_ai.pid" "ai_service.main:app" 8010
+stop_service "Account Stream" "$RUNTIME_DIR/alphadog_account_stream.pid" "account_stream.main"
 stop_service "Trader" "$RUNTIME_DIR/alphadog_trader.pid" "trader.runner"
 stop_service "API" "$RUNTIME_DIR/alphadog_api.pid" "api.main:app" 8000
 stop_service "Frontend" "$RUNTIME_DIR/alphadog_frontend.pid" "vite" 3000
@@ -302,6 +303,12 @@ sleep 1
 
 start_service "Alpha Engine" "$RUNTIME_DIR/alphadog_alpha_engine.pid" "$RUNTIME_DIR/alphadog_alpha_engine.log" \
   "$PYTHON_BIN" -m alpha_engine.run
+sleep 1
+
+start_service "Account Stream" "$RUNTIME_DIR/alphadog_account_stream.pid" "$RUNTIME_DIR/alphadog_account_stream.log" \
+  "$PYTHON_BIN" -m account_stream.main
+wait_for_worker_ready "Account Stream" "$RUNTIME_DIR/alphadog_account_stream.pid" \
+  "$RUNTIME_DIR/alphadog_account_stream.log" "account stream supervisor started" 30
 sleep 1
 
 start_service "Trader" "$RUNTIME_DIR/alphadog_trader.pid" "$RUNTIME_DIR/alphadog_trader.log" \

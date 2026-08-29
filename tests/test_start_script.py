@@ -24,6 +24,7 @@ class StartScriptTest(unittest.TestCase):
             "Engine",
             "Alpha Engine",
             "AI Entry Quality",
+            "Account Stream",
             "Trader",
             "API",
             "Frontend",

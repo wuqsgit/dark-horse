@@ -258,6 +258,11 @@ class MultiAccountTradingTest(unittest.TestCase):
         conn = db.get_conn()
         try:
             conn.execute(
+                """INSERT INTO trading_accounts
+                   (id, name, environment, initial_capital, enabled)
+                   VALUES (1, 'test', 'testnet', 5000, 1)"""
+            )
+            conn.execute(
                 """INSERT INTO account_position_history
                    (account_id, symbol, side, quantity, entry_price, entry_time,
                     entry_score, stop_model, initial_stop_loss, stop_pct,
@@ -322,19 +327,39 @@ class MultiAccountTradingTest(unittest.TestCase):
             "normal_trading_enabled": 1, "alpha_trading_enabled": 1,
             "auto_trading_enabled": 1,
         }
+        from shared.live_account_store import replace_live_account_snapshot
+
+        fake_exchange = FakeExchange()
+        margin = fake_exchange.get_margin_balance()
+        replace_live_account_snapshot(
+            1,
+            {
+                "asset": "USDT",
+                "wallet_balance": margin["totalWalletBalance"],
+                "equity": margin["totalMarginBalance"],
+                "available_balance": margin["availableBalance"],
+                "unrealized_pnl": margin["totalUnrealizedProfit"],
+                "total_maint_margin": margin["totalMaintMargin"],
+                "total_initial_margin": 0,
+            },
+            fake_exchange.get_positions(),
+            [],
+            source="http_reconcile",
+        )
         alpha_context = {
             "alpha_score": 88.0,
             "volume_price_state": "momentum_continuation",
             "volume_price_action": "normal_review",
             "volume_price_reasons_json": '["dual market volume confirmed"]',
         }
-        with patch("trader.exchange.BinanceFutures", FakeExchange), \
+        with patch("trader.exchange.BinanceFutures", side_effect=AssertionError("snapshot must not access exchange")), \
              patch("shared.db.fetch_position_trade_groups", side_effect=AssertionError("snapshot must not load history")), \
              patch("shared.db.fetch_latest_alpha_position_context", return_value=alpha_context):
             payload = _account_status_payload(account)
 
         self.assertEqual(payload["status"], "ok")
-        eth, btc = payload["positions"]
+        positions = {row["symbol"]: row for row in payload["positions"]}
+        eth, btc = positions["ETHUSDT"], positions["BTCUSDT"]
         self.assertEqual(eth["margin_ratio"], 2.0)
         self.assertEqual(btc["margin_ratio"], 2.0)
         self.assertEqual(eth["pnl_pct"], 25.0)

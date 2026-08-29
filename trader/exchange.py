@@ -257,6 +257,43 @@ class BinanceFutures:
             })
         return positions
 
+    def get_live_account_snapshot(self) -> dict:
+        """Load the complete current account state for the account-stream worker."""
+        margin = self.get_margin_balance()
+        positions = self.get_positions()
+        raw_orders = self._request("GET", "/fapi/v1/openOrders", signed=True)
+        orders = []
+        for order in raw_orders or []:
+            orders.append({
+                "exchange_order_id": str(order.get("orderId") or ""),
+                "client_order_id": order.get("clientOrderId"),
+                "symbol": order.get("symbol"),
+                "side": order.get("side"),
+                "position_side": order.get("positionSide"),
+                "order_type": order.get("type"),
+                "status": order.get("status"),
+                "quantity": self._safe_float(order.get("origQty")),
+                "executed_quantity": self._safe_float(order.get("executedQty")),
+                "price": self._safe_float(order.get("price")),
+                "stop_price": self._safe_float(order.get("stopPrice")),
+                "reduce_only": bool(order.get("reduceOnly")),
+                "close_position": bool(order.get("closePosition")),
+                "time_in_force": order.get("timeInForce"),
+            })
+        return {
+            "balance": {
+                "asset": "USDT",
+                "wallet_balance": float(margin.get("totalWalletBalance") or 0),
+                "equity": float(margin.get("totalMarginBalance") or 0),
+                "available_balance": float(margin.get("availableBalance") or 0),
+                "unrealized_pnl": float(margin.get("totalUnrealizedProfit") or 0),
+                "total_maint_margin": float(margin.get("totalMaintMargin") or 0),
+                "total_initial_margin": float(margin.get("totalInitialMargin") or 0),
+            },
+            "positions": positions,
+            "orders": orders,
+        }
+
     def fetch_income(self, income_type: str = "REALIZED_PNL", limit: int = 1000) -> list:
         params = {
             "incomeType": income_type,

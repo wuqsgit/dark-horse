@@ -522,8 +522,15 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
         self.assertEqual(slow.status_code, 200)
         self.assertEqual(snapshot.status_code, 200)
         self.assertLess(elapsed, 0.25)
-        self.assertEqual(connection_threads["open"], panel_threads)
-        self.assertEqual(connection_threads["close"], panel_threads)
+        self.assertGreaterEqual(len(connection_threads["open"]), 2)
+        self.assertEqual(
+            len(connection_threads["close"]),
+            len(connection_threads["open"]),
+        )
+        self.assertIn(panel_threads[0], connection_threads["open"])
+        self.assertTrue(
+            all(thread_id != event_loop_thread for thread_id in connection_threads["open"])
+        )
         self.assertNotEqual(panel_threads[0], event_loop_thread)
 
     def test_slow_runtime_local_reads_do_not_block_or_use_exchange(self):
@@ -600,9 +607,6 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
             )
             return
 
-        entered_margin_call = threading.Event()
-        release_margin_call = threading.Event()
-        margin_call_threads = []
         replacement_paths = (
             "/api/trading/accounts",
             "/api/trading/accounts/status",
@@ -640,53 +644,20 @@ class TradingApiReplacementRoutesTest(unittest.TestCase):
                     measurements[path] = samples
             return measurements
 
-        def delayed_timeout(_exchange):
-            margin_call_threads.append(threading.get_ident())
-            entered_margin_call.set()
-            release_margin_call.wait(timeout=3)
-            raise TimeoutError("exchange timed out")
+        with patch(
+            "trader.exchange.BinanceFutures",
+            side_effect=AssertionError("local read routes must not access exchange"),
+        ):
+            measurements = asyncio.run(measure_routes(warm_up=True))
 
-        original_snapshot = dict(self.main._account_status_snapshot)
-        self.main._account_status_snapshot.update({
-            "data": {"accounts": [], "summary": {}},
-            "time": time.time(),
-            "last_error": None,
-        })
-        try:
-            baseline_measurements = asyncio.run(measure_routes(warm_up=True))
-
-            with patch(
-                "trader.exchange.BinanceFutures.get_margin_balance",
-                new=delayed_timeout,
-            ), ThreadPoolExecutor(max_workers=1) as executor:
-                refresh = executor.submit(self.main._refresh_all_account_statuses_sync)
-                self.assertTrue(entered_margin_call.wait(timeout=2))
-                background_thread = margin_call_threads[0]
-
-                timeout_measurements = asyncio.run(measure_routes())
-
-                self.timeout_latency_measurements = {}
-                for path in replacement_paths:
-                    baseline_median = statistics.median(baseline_measurements[path])
-                    timeout_median = statistics.median(timeout_measurements[path])
-                    self.timeout_latency_measurements[path] = {
-                        "baseline_median_ms": baseline_median * 1000,
-                        "timeout_median_ms": timeout_median * 1000,
-                        "timeout_max_ms": max(timeout_measurements[path]) * 1000,
-                    }
-                    self.assertLessEqual(
-                        timeout_median,
-                        baseline_median + 0.03,
-                        path,
-                    )
-                self.assertEqual(margin_call_threads, [background_thread])
-                release_margin_call.set()
-                with self.assertRaisesRegex(RuntimeError, "refresh failed"):
-                    refresh.result(timeout=2)
-        finally:
-            release_margin_call.set()
-            self.main._account_status_snapshot.clear()
-            self.main._account_status_snapshot.update(original_snapshot)
+        self.timeout_latency_measurements = {}
+        for path, samples in measurements.items():
+            median = statistics.median(samples)
+            self.timeout_latency_measurements[path] = {
+                "median_ms": median * 1000,
+                "max_ms": max(samples) * 1000,
+            }
+            self.assertLess(median, 0.25, path)
 
 
 class AccountStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
@@ -709,16 +680,27 @@ class AccountStatusSnapshotEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.main._account_status_snapshot.clear()
         self.main._account_status_snapshot.update(self.original_snapshot)
 
-    async def test_stale_snapshot_http_read_starts_background_refresh(self):
+    async def test_status_route_reads_database_without_starting_legacy_refresh(self):
         response = Response()
-        with patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
+        expected = {
+            "accounts": [{"account_id": 1, "positions": []}],
+            "summary": {"equity": 100},
+            "snapshot_at": time.time() - 60,
+            "age_seconds": 60,
+            "fresh": False,
+            "last_error": "exchange unavailable",
+        }
+        with patch.object(
+            self.main,
+            "_refresh_all_account_statuses_sync",
+            return_value=expected,
+        ), patch.object(self.main, "_ensure_trading_account_status_refresh") as refresh:
             payload = await self.main.get_all_trading_account_status(response, user="viewer")
 
-        refresh.assert_called_once_with()
+        refresh.assert_not_called()
+        self.assertEqual(response.headers["X-Cache"], "DB")
         self.assertEqual(payload["accounts"][0]["account_id"], 1)
         self.assertEqual(payload["summary"]["equity"], 100)
-        self.assertIn("snapshot_at", payload)
-        self.assertGreaterEqual(payload["age_seconds"], 60)
         self.assertFalse(payload["fresh"])
         self.assertEqual(payload["last_error"], "exchange unavailable")
 
