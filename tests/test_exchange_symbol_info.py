@@ -62,6 +62,25 @@ class ExchangeSymbolInfoTest(unittest.TestCase):
         self.assertEqual(requests[0]["triggerPrice"], 3968.0)
         self.assertEqual(requests[1]["triggerPrice"], 3968.1)
 
+    def test_hedge_stop_sends_position_side_without_reduce_only(self):
+        exchange = BinanceFutures.__new__(BinanceFutures)
+        exchange.adjust_quantity = lambda symbol, quantity: quantity
+        exchange.adjust_trigger_price = lambda symbol, side, price: price
+        exchange._hedge_mode = True
+        captured = {}
+        exchange._request = lambda method, path, signed, params: captured.update(params) or {"algoId": 1}
+
+        exchange.place_stop_order(
+            "AKEUSDT",
+            "SELL",
+            3621,
+            0.009,
+            position_side="LONG",
+        )
+
+        self.assertEqual(captured["positionSide"], "LONG")
+        self.assertNotIn("reduceOnly", captured)
+
     def test_cancel_protective_stops_uses_algo_order_type_field(self):
         exchange = BinanceFutures.__new__(BinanceFutures)
         requests = []

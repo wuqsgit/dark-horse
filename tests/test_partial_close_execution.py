@@ -40,6 +40,58 @@ class PartialCloseExchange:
 
 
 class PartialCloseExecutionTest(unittest.TestCase):
+    def test_hedge_partial_close_selects_and_closes_only_requested_side(self):
+        class HedgeExchange:
+            def __init__(self):
+                self.closed = None
+                self.positions = [
+                    {
+                        "symbol": "AKEUSDT", "positionSide": "LONG", "side": "LONG",
+                        "quantity": 10.0, "entry_price": 0.009, "mark_price": 0.01,
+                        "unrealized_pnl": 1.0, "leverage": 2,
+                    },
+                    {
+                        "symbol": "AKEUSDT", "positionSide": "SHORT", "side": "SHORT",
+                        "quantity": 4.0, "entry_price": 0.011, "mark_price": 0.01,
+                        "unrealized_pnl": 0.4, "leverage": 2,
+                    },
+                ]
+
+            def get_positions(self):
+                return list(self.positions)
+
+            def get_symbol_info(self, symbol):
+                return {"min_notional": 5.0, "min_qty": 1.0}
+
+            def close_position_market(
+                self, symbol, side, quantity, *, position_side=None,
+            ):
+                self.closed = (symbol, side, quantity, position_side)
+                self.positions = [
+                    position for position in self.positions
+                    if position["positionSide"] != position_side
+                ]
+                return {"orderId": 123, "executedQty": str(quantity), "avgPrice": "0.01"}
+
+        exchange = HedgeExchange()
+        engine = ExecutionEngine(exchange)
+        engine._record_decision = lambda *args, **kwargs: None
+        action = {
+            "action": "partial_close",
+            "symbol": "AKEUSDT",
+            "side": "BUY",
+            "position_side": "SHORT",
+            "close_pct": 1.0,
+            "reason": "close short only",
+        }
+
+        with patch("shared.db.get_position_history", return_value={}), \
+             patch("shared.db.record_trade"):
+            succeeded = engine._execute_partial_close(action, [])
+
+        self.assertTrue(succeeded)
+        self.assertEqual(exchange.closed, ("AKEUSDT", "BUY", 4.0, "SHORT"))
+
     def test_failed_exchange_close_does_not_record_trade(self):
         exchange = PartialCloseExchange(fail=True)
         engine = ExecutionEngine(exchange)

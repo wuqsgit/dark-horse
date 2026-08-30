@@ -38,6 +38,7 @@ class BinanceFutures:
         self.client = self._new_client()
         self.time_offset_ms = 0
         self._last_time_sync = 0.0
+        self._hedge_mode = None
 
     def _ensure_client(self):
         if self.client.is_closed:
@@ -365,6 +366,28 @@ class BinanceFutures:
         params = {"symbol": symbol, "leverage": leverage}
         return self._request("POST", "/fapi/v1/leverage", signed=True, params=params)
 
+    def uses_hedge_mode(self) -> bool:
+        cached = getattr(self, "_hedge_mode", None)
+        if cached is not None:
+            return bool(cached)
+        payload = self._request(
+            "GET",
+            "/fapi/v1/positionSide/dual",
+            signed=True,
+        )
+        value = payload.get("dualSidePosition") if isinstance(payload, dict) else False
+        self._hedge_mode = (
+            value if isinstance(value, bool)
+            else str(value or "").strip().lower() == "true"
+        )
+        return bool(self._hedge_mode)
+
+    def _order_position_side(self, position_side: str | None) -> str | None:
+        normalized = str(position_side or "").strip().upper()
+        if normalized not in {"LONG", "SHORT"}:
+            return None
+        return normalized if self.uses_hedge_mode() else None
+
     def adjust_quantity(self, symbol: str, quantity: float) -> float:
         info = self.get_symbol_info(symbol)
         step = info["step_size"]
@@ -401,10 +424,10 @@ class BinanceFutures:
             "type": "MARKET",
             "quantity": qty,
         }
-        normalized_position_side = str(position_side or "").upper()
-        hedge_position = normalized_position_side in {"LONG", "SHORT"}
-        if hedge_position:
-            params["positionSide"] = normalized_position_side
+        order_position_side = self._order_position_side(position_side)
+        hedge_position = order_position_side is not None
+        if order_position_side:
+            params["positionSide"] = order_position_side
         if reduce_only and not hedge_position:
             params["reduceOnly"] = True
         if reduce_only:
@@ -500,7 +523,14 @@ class BinanceFutures:
                 return None
             raise
 
-    def place_stop_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
+    def place_stop_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        position_side: str | None = None,
+    ) -> dict:
         qty = self.adjust_quantity(symbol, quantity)
         trigger_price = self.adjust_trigger_price(symbol, side, stop_price)
         params = {
@@ -510,15 +540,33 @@ class BinanceFutures:
             "type": "STOP_MARKET",
             "quantity": qty,
             "triggerPrice": trigger_price,
-            "reduceOnly": True,
             "workingType": "MARK_PRICE",
         }
+        order_position_side = self._order_position_side(position_side)
+        if order_position_side:
+            params["positionSide"] = order_position_side
+        else:
+            params["reduceOnly"] = True
         return self._request("POST", "/fapi/v1/algoOrder", signed=True, params=params)
 
-    def cancel_other_protective_stops(self, symbol: str, keep_order_id=None):
+    def cancel_other_protective_stops(
+        self,
+        symbol: str,
+        keep_order_id=None,
+        position_side: str | None = None,
+    ):
         orders = self.get_open_protective_stops(symbol)
+        target_position_side = str(position_side or "").strip().upper()
         cancelled = 0
         for order in orders:
+            order_position_side = str(
+                order.get("positionSide") or order.get("position_side") or "BOTH"
+            ).upper()
+            if (
+                target_position_side in {"LONG", "SHORT"}
+                and order_position_side != target_position_side
+            ):
+                continue
             order_id = order.get("algoId") or order.get("orderId")
             if order_id is None or str(order_id) == str(keep_order_id):
                 continue

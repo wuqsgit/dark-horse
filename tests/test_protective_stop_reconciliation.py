@@ -67,6 +67,63 @@ class ReconciliationExchange:
 
 
 class ProtectiveStopReconciliationTest(unittest.TestCase):
+    def test_hedge_reconciliation_keeps_separate_long_and_short_stops(self):
+        class HedgeExchange:
+            def __init__(self):
+                self.cancelled = []
+                self.orders = [
+                    {
+                        "algoId": "long-stop", "orderType": "STOP_MARKET",
+                        "symbol": "AKEUSDT", "positionSide": "LONG",
+                        "side": "SELL", "quantity": "1", "triggerPrice": "90",
+                    },
+                    {
+                        "algoId": "short-stop", "orderType": "STOP_MARKET",
+                        "symbol": "AKEUSDT", "positionSide": "SHORT",
+                        "side": "BUY", "quantity": "1", "triggerPrice": "110",
+                    },
+                ]
+
+            def get_open_protective_stops(self, symbol=None):
+                return list(self.orders)
+
+            def cancel_other_protective_stops(
+                self, symbol, keep_order_id=None, position_side=None,
+            ):
+                self.cancelled.append((symbol, keep_order_id, position_side))
+                return 0
+
+            def place_stop_order(
+                self, symbol, side, quantity, stop_price, *, position_side=None,
+            ):
+                raise AssertionError("matching hedge stops must be reused")
+
+        exchange = HedgeExchange()
+        engine = ExecutionEngine(exchange)
+        positions = [
+            {
+                "symbol": "AKEUSDT", "positionSide": "LONG", "side": "LONG",
+                "quantity": 1, "entry_price": 100, "mark_price": 100,
+            },
+            {
+                "symbol": "AKEUSDT", "positionSide": "SHORT", "side": "SHORT",
+                "quantity": 1, "entry_price": 100, "mark_price": 100,
+            },
+        ]
+
+        with patch("shared.db.get_position_history", return_value={}), \
+             patch("shared.db.update_position_management"):
+            result = engine.reconcile_exchange_protective_stops(positions)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            exchange.cancelled,
+            [
+                ("AKEUSDT", "long-stop", "LONG"),
+                ("AKEUSDT", "short-stop", "SHORT"),
+            ],
+        )
+
     def test_repairs_active_quantity_and_removes_orphans(self):
         exchange = ReconciliationExchange()
         engine = ExecutionEngine(exchange)

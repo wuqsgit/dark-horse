@@ -1,6 +1,7 @@
 import unittest
 
 from trader.exchange import BinanceFutures
+from trader.execution import ExecutionEngine
 
 
 class ExchangeOrderTest(unittest.TestCase):
@@ -18,6 +19,7 @@ class ExchangeOrderTest(unittest.TestCase):
     def test_hedge_position_close_sends_position_side_without_reduce_only(self):
         exchange = object.__new__(BinanceFutures)
         exchange.adjust_quantity = lambda symbol, quantity: quantity
+        exchange._hedge_mode = True
         captured = {}
         exchange._request = lambda method, path, signed=False, params=None: captured.update(params) or {}
 
@@ -31,6 +33,62 @@ class ExchangeOrderTest(unittest.TestCase):
         self.assertEqual(captured["positionSide"], "SHORT")
         self.assertNotIn("reduceOnly", captured)
         self.assertEqual(captured["newOrderRespType"], "RESULT")
+
+    def test_one_way_close_omits_directional_position_side(self):
+        exchange = object.__new__(BinanceFutures)
+        exchange.adjust_quantity = lambda symbol, quantity: quantity
+        exchange._hedge_mode = False
+        captured = {}
+        exchange._request = lambda method, path, signed=False, params=None: captured.update(params) or {}
+
+        exchange.close_position_market(
+            "ETHUSDT",
+            "SELL",
+            0.2,
+            position_side="LONG",
+        )
+
+        self.assertNotIn("positionSide", captured)
+        self.assertTrue(captured["reduceOnly"])
+
+    def test_execution_passes_position_direction_to_market_orders(self):
+        class Exchange:
+            def __init__(self):
+                self.calls = []
+
+            def place_market_order(
+                self, symbol, side, quantity, *, client_order_id=None,
+                position_side=None,
+            ):
+                self.calls.append(("open", symbol, side, quantity, position_side))
+                return {"orderId": "open-1"}
+
+            def close_position_market(
+                self, symbol, side, quantity, *, client_order_id=None,
+                position_side=None,
+            ):
+                self.calls.append(("close", symbol, side, quantity, position_side))
+                return {"orderId": "close-1"}
+
+        exchange = Exchange()
+        engine = ExecutionEngine(exchange)
+        action = {
+            "symbol": "AKEUSDT",
+            "side": "SELL",
+            "quantity": 3621,
+            "position_side": "LONG",
+        }
+
+        engine._place_market_action_order(action)
+        engine._place_market_action_order(action, reduce_only=True)
+
+        self.assertEqual(
+            exchange.calls,
+            [
+                ("open", "AKEUSDT", "SELL", 3621, "LONG"),
+                ("close", "AKEUSDT", "SELL", 3621, "LONG"),
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -1098,29 +1098,100 @@ class ExecutionEngine:
     def get_balance(self) -> float:
         return self.ex.get_balance()
 
+    @staticmethod
+    def _position_direction(position: dict | None) -> str:
+        position = position or {}
+        exchange_side = str(position.get("positionSide") or "").upper()
+        if exchange_side in {"LONG", "SHORT"}:
+            return exchange_side
+        return str(position.get("side") or "").upper()
+
+    @staticmethod
+    def _exchange_position_side(position: dict | None) -> str:
+        value = str((position or {}).get("positionSide") or "BOTH").upper()
+        return value if value in {"LONG", "SHORT"} else "BOTH"
+
+    @classmethod
+    def _position_matches_action(cls, position: dict, act: dict) -> bool:
+        if str(position.get("symbol") or "").upper() != str(
+            act.get("symbol") or ""
+        ).upper():
+            return False
+        target = str(act.get("position_side") or "").upper()
+        return target not in {"LONG", "SHORT"} or cls._position_direction(position) == target
+
+    @classmethod
+    def _action_position_side(cls, act: dict, position: dict | None = None) -> str | None:
+        requested = str(act.get("position_side") or "").upper()
+        if requested in {"LONG", "SHORT"}:
+            return requested
+        actual = cls._position_direction(position)
+        return actual if actual in {"LONG", "SHORT"} else None
+
+    def _place_protective_stop(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        position_side: str | None,
+    ):
+        try:
+            return self.ex.place_stop_order(
+                symbol,
+                side,
+                quantity,
+                stop_price,
+                position_side=position_side,
+            )
+        except TypeError:
+            return self.ex.place_stop_order(symbol, side, quantity, stop_price)
+
+    def _cancel_other_protective_stops(
+        self,
+        symbol: str,
+        keep_order_id,
+        position_side: str | None,
+    ):
+        try:
+            return self.ex.cancel_other_protective_stops(
+                symbol,
+                keep_order_id,
+                position_side=position_side,
+            )
+        except TypeError:
+            return self.ex.cancel_other_protective_stops(symbol, keep_order_id)
+
     def reconcile_exchange_protective_stops(self, positions: list) -> dict:
         """Remove orphan stops and ensure one correctly sized stop per position."""
         if not hasattr(self.ex, "get_open_protective_stops"):
             return {"status": "unsupported", "repaired": 0, "orphaned": 0, "errors": []}
 
         active = {
-            str(position.get("symbol") or "").upper(): position
+            (
+                str(position.get("symbol") or "").upper(),
+                self._exchange_position_side(position),
+            ): position
             for position in (positions or [])
             if float(position.get("quantity") or 0) > 0
         }
         open_stops = self.ex.get_open_protective_stops()
-        by_symbol = {}
+        by_position = {}
         for order in open_stops:
             symbol = str(order.get("symbol") or "").upper()
             if symbol:
-                by_symbol.setdefault(symbol, []).append(order)
+                position_side = str(
+                    order.get("positionSide") or order.get("position_side") or "BOTH"
+                ).upper()
+                by_position.setdefault((symbol, position_side), []).append(order)
 
         summary = {"status": "ok", "repaired": 0, "orphaned": 0, "errors": []}
-        for symbol in sorted(set(by_symbol) - set(active)):
+        for symbol, position_side in sorted(set(by_position) - set(active)):
             try:
-                summary["orphaned"] += self.ex.cancel_other_protective_stops(
+                summary["orphaned"] += self._cancel_other_protective_stops(
                     symbol,
                     None,
+                    position_side if position_side in {"LONG", "SHORT"} else None,
                 )
             except Exception as exc:
                 summary["errors"].append({"symbol": symbol, "error": str(exc)})
@@ -1133,7 +1204,7 @@ class ExecutionEngine:
 
         from trader.roll_policy import calculate_protected_stop
 
-        for symbol, position in active.items():
+        for (symbol, position_side), position in active.items():
             try:
                 side = str(position.get("side") or "").upper()
                 quantity = abs(float(position.get("quantity") or 0))
@@ -1163,7 +1234,10 @@ class ExecutionEngine:
                     )
 
                 valid_existing = []
-                for order in by_symbol.get(symbol, []):
+                orders_for_position = by_position.get((symbol, position_side), [])
+                if not orders_for_position and position_side not in {"LONG", "SHORT"}:
+                    orders_for_position = by_position.get((symbol, "BOTH"), [])
+                for order in orders_for_position:
                     trigger = float(
                         order.get("triggerPrice")
                         or order.get("stopPrice")
@@ -1213,19 +1287,28 @@ class ExecutionEngine:
 
                 if matching is not None:
                     keep_id = self._stop_order_id(matching)
-                    self.ex.cancel_other_protective_stops(symbol, keep_id)
+                    self._cancel_other_protective_stops(
+                        symbol,
+                        keep_id,
+                        position_side if position_side in {"LONG", "SHORT"} else None,
+                    )
                 else:
                     stop_side = "SELL" if side == "LONG" else "BUY"
-                    new_order = self.ex.place_stop_order(
+                    new_order = self._place_protective_stop(
                         symbol,
                         stop_side,
                         quantity,
                         stop_price,
+                        position_side if position_side in {"LONG", "SHORT"} else None,
                     )
                     keep_id = self._stop_order_id(new_order)
                     if keep_id is None:
                         raise RuntimeError("protective stop acknowledgement missing")
-                    self.ex.cancel_other_protective_stops(symbol, keep_id)
+                    self._cancel_other_protective_stops(
+                        symbol,
+                        keep_id,
+                        position_side if position_side in {"LONG", "SHORT"} else None,
+                    )
                     summary["repaired"] += 1
 
                 update_position_management(
@@ -3981,12 +4064,14 @@ class ExecutionEngine:
                         act["side"],
                         qty,
                         client_order_id=client_order_id,
+                        position_side=self._action_position_side(act),
                     )
                 return self.ex.place_market_order(
                     act["symbol"],
                     act["side"],
                     qty,
                     client_order_id=client_order_id,
+                    position_side=self._action_position_side(act),
                 )
             except TypeError:
                 # Compatibility for test doubles and legacy exchange adapters.
@@ -4164,11 +4249,13 @@ class ExecutionEngine:
             return None
 
         stop_side = "SELL" if side == "LONG" else "BUY"
-        stop_order = self.ex.place_stop_order(
+        position_side = self._action_position_side(act, position)
+        stop_order = self._place_protective_stop(
             symbol,
             stop_side,
             quantity,
             stop_price,
+            position_side,
         )
         stop_order_id = self._stop_order_id(stop_order)
         if stop_order_id is None:
@@ -4176,7 +4263,11 @@ class ExecutionEngine:
                 f"protective stop acknowledgement missing after partial close: {symbol}"
             )
         if hasattr(self.ex, "cancel_other_protective_stops"):
-            self.ex.cancel_other_protective_stops(symbol, stop_order_id)
+            self._cancel_other_protective_stops(
+                symbol,
+                stop_order_id,
+                position_side,
+            )
 
         try:
             from shared.db import insert_order, update_position_management
@@ -4279,30 +4370,38 @@ class ExecutionEngine:
         # Place the protective stop order.
         stop_side = "SELL" if act["position_side"] == "LONG" else "BUY"
         try:
-            stop_order = self.ex.place_stop_order(
+            stop_order = self._place_protective_stop(
                 act["symbol"],
                 stop_side,
                 act["quantity"],
                 act["stop_loss"],
+                self._action_position_side(act),
             )
             stop_order_id = self._stop_order_id(stop_order)
             if stop_order_id is None:
                 raise RuntimeError("protective stop acknowledgement missing")
             if hasattr(self.ex, "cancel_other_protective_stops"):
-                self.ex.cancel_other_protective_stops(
+                self._cancel_other_protective_stops(
                     act["symbol"],
                     stop_order_id,
+                    self._action_position_side(act),
                 )
         except Exception as exc:
             # An entry without an acknowledged exchange stop is not allowed.
             # Flatten the just-opened quantity instead of leaving a naked
             # position for the next management loop.
             try:
-                self.ex.close_position_market(
-                    act["symbol"],
-                    stop_side,
-                    act["quantity"],
-                )
+                try:
+                    self.ex.close_position_market(
+                        act["symbol"],
+                        stop_side,
+                        act["quantity"],
+                        position_side=self._action_position_side(act),
+                    )
+                except TypeError:
+                    self.ex.close_position_market(
+                        act["symbol"], stop_side, act["quantity"]
+                    )
             except Exception as rollback_exc:
                 raise RuntimeError(
                     f"protective stop failed and emergency flatten failed: "
@@ -4425,7 +4524,10 @@ class ExecutionEngine:
             f"x{act['quantity']} @${act['entry_price']:.4f}"
         )
         before_positions = self.ex.get_positions()
-        before = next((p for p in before_positions if p["symbol"] == act["symbol"]), None)
+        before = next(
+            (p for p in before_positions if self._position_matches_action(p, act)),
+            None,
+        )
         before_qty = float(before.get("quantity") or 0) if before else 0.0
         order = self._place_market_action_order(act)
         try:
@@ -4460,7 +4562,10 @@ class ExecutionEngine:
         except (TypeError, ValueError):
             confirmed_add_qty = 0.0
         positions = self.ex.get_positions()
-        pos = next((p for p in positions if p["symbol"] == act["symbol"]), None)
+        pos = next(
+            (p for p in positions if self._position_matches_action(p, act)),
+            None,
+        )
         if not pos:
             raise RuntimeError(f"roll add position refresh failed: {act['symbol']}")
         actual_qty = float(pos.get("quantity") or 0)
@@ -4485,14 +4590,28 @@ class ExecutionEngine:
                 raise RuntimeError(
                     f"protected stop would trigger immediately: stop={protected_stop} mark={mark_price}"
                 )
-            stop_order = self.ex.place_stop_order(
-                act["symbol"], stop_side, actual_qty, protected_stop
+            stop_order = self._place_protective_stop(
+                act["symbol"],
+                stop_side,
+                actual_qty,
+                protected_stop,
+                self._action_position_side(act, pos),
             )
             if not (stop_order or {}).get("orderId") and not (stop_order or {}).get("algoId"):
                 raise RuntimeError("protective stop acknowledgement missing")
         except Exception as e:
             try:
-                self.ex.close_position_market(act["symbol"], stop_side, confirmed_add_qty)
+                try:
+                    self.ex.close_position_market(
+                        act["symbol"],
+                        stop_side,
+                        confirmed_add_qty,
+                        position_side=self._action_position_side(act, pos),
+                    )
+                except TypeError:
+                    self.ex.close_position_market(
+                        act["symbol"], stop_side, confirmed_add_qty
+                    )
             finally:
                 update_position_management(
                     act["symbol"], roll_enabled=0, roll_block_reason="roll_protection_failed"
@@ -4505,8 +4624,10 @@ class ExecutionEngine:
             raise RuntimeError(f"roll protection failed: {e}") from e
 
         try:
-            self.ex.cancel_other_protective_stops(
-                act["symbol"], (stop_order or {}).get("algoId") or (stop_order or {}).get("orderId")
+            self._cancel_other_protective_stops(
+                act["symbol"],
+                (stop_order or {}).get("algoId") or (stop_order or {}).get("orderId"),
+                self._action_position_side(act, pos),
             )
         except Exception as e:
             logger.warning(f"    old protective stop cleanup failed: {e}")
@@ -4581,7 +4702,7 @@ class ExecutionEngine:
     def _execute_close(self, act, results):
         logger.info(f"  骞充粨 {act['symbol']}: {act['reason']}")
         before = self.ex.get_positions()
-        pos = next((p for p in before if p["symbol"] == act["symbol"]), None)
+        pos = next((p for p in before if self._position_matches_action(p, act)), None)
         if not pos:
             logger.warning(f"    {act['symbol']}: no current position found")
             return
@@ -4649,7 +4770,7 @@ class ExecutionEngine:
     def _execute_partial_close(self, act, results):
         """Partially close a position."""
         positions = self.ex.get_positions()
-        pos = next((p for p in positions if p["symbol"] == act["symbol"]), None)
+        pos = next((p for p in positions if self._position_matches_action(p, act)), None)
         if not pos:
             logger.warning("  %s: position not found for partial close", act["symbol"])
             return False
@@ -4686,7 +4807,15 @@ class ExecutionEngine:
             close_qty,
             act.get("reason", ""),
         )
-        order = self.ex.close_position_market(act["symbol"], act["side"], close_qty)
+        try:
+            order = self.ex.close_position_market(
+                act["symbol"],
+                act["side"],
+                close_qty,
+                position_side=self._action_position_side(act, pos),
+            )
+        except TypeError:
+            order = self.ex.close_position_market(act["symbol"], act["side"], close_qty)
         try:
             executed_qty = float((order or {}).get("executedQty") or close_qty)
         except Exception:
@@ -4694,7 +4823,7 @@ class ExecutionEngine:
         if executed_qty <= 0:
             after_positions = self.ex.get_positions()
             after_pos = next(
-                (item for item in after_positions if item["symbol"] == act["symbol"]),
+                (item for item in after_positions if self._position_matches_action(item, act)),
                 None,
             )
             remaining_qty = float(after_pos.get("quantity") or 0) if after_pos else 0.0
@@ -4719,9 +4848,17 @@ class ExecutionEngine:
             )
             remaining_qty = float(after_pos.get("quantity") or 0) if after_pos else 0.0
             if remaining_qty > 0:
-                cleanup_order = self.ex.close_position_market(
-                    act["symbol"], act["side"], remaining_qty
-                )
+                try:
+                    cleanup_order = self.ex.close_position_market(
+                        act["symbol"],
+                        act["side"],
+                        remaining_qty,
+                        position_side=self._action_position_side(act, after_pos),
+                    )
+                except TypeError:
+                    cleanup_order = self.ex.close_position_market(
+                        act["symbol"], act["side"], remaining_qty
+                    )
                 try:
                     cleanup_executed = float((cleanup_order or {}).get("executedQty") or 0)
                 except (TypeError, ValueError):
@@ -4739,7 +4876,7 @@ class ExecutionEngine:
 
             verified_positions = self.ex.get_positions()
             verified = next(
-                (item for item in verified_positions if item["symbol"] == act["symbol"]),
+                (item for item in verified_positions if self._position_matches_action(item, act)),
                 None,
             )
             if verified and float(verified.get("quantity") or 0) > 0:
@@ -4796,7 +4933,7 @@ class ExecutionEngine:
                 (
                     item
                     for item in refreshed_positions
-                    if item["symbol"] == act["symbol"]
+                    if self._position_matches_action(item, act)
                     and float(item.get("quantity") or 0) > 0
                 ),
                 None,
