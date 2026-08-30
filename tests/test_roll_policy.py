@@ -70,6 +70,26 @@ class RollPolicyTest(unittest.TestCase):
         self.assertAlmostEqual(decision.current_r, 1.4)
         self.assertEqual(decision.status, "waiting_1_5r")
 
+    def test_explosive_confirmation_add_uses_lower_r_after_tp1(self):
+        decision = evaluate_roll(
+            {
+                "side": "LONG",
+                "entry_price": 100,
+                "mark_price": 104,
+                "strategy_source": "alpha",
+            },
+            complete_state(
+                entry_reason="explosive_breakout alpha_volume_price",
+                alpha_score=89,
+            ),
+            {"ema20": 102, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config={**CONFIG, "explosive_trigger_r": 0.75},
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.trigger_mode, "explosive_confirmation")
+
     def test_trend_must_match_position_side(self):
         decision = evaluate_roll(
             {"side": "LONG", "entry_price": 100, "mark_price": 110},

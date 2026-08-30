@@ -62,12 +62,20 @@ def evaluate_roll(
     if trigger_r <= 0:
         trigger_r = (_number(config.get("trigger_r")) or 1.5) + roll_layer
     trigger_label = f"{trigger_r:g}".replace(".", "_")
+    explosive_position = (
+        "explosive_breakout" in str(state.get("entry_reason") or "").lower()
+        and _number(state.get("alpha_score"))
+        >= (_number(config.get("explosive_min_score")) or 88)
+    )
+    if roll_layer == 0 and explosive_position:
+        trigger_r = _number(config.get("explosive_trigger_r")) or 0.75
+        trigger_label = f"{trigger_r:g}".replace(".", "_")
 
     trigger_mode = ""
     if roll_layer == 0:
         if current_r < trigger_r:
             return RollDecision(False, f"waiting_{trigger_label}r", current_r)
-        trigger_mode = "sustained_profit"
+        trigger_mode = "explosive_confirmation" if explosive_position else "sustained_profit"
     else:
         atr = _number(state.get("atr_value"))
         anchor = _number(state.get("roll_price")) or entry

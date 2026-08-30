@@ -367,6 +367,104 @@ class AlphaPositionManagementTest(unittest.TestCase):
         self.assertIn("alpha_profit_lock_exit", action["reason"])
         self.assertNotIn("margin_hard_stop", action["reason"])
 
+    def test_explosive_runner_survives_first_hour_profit_lock_pullback(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "LOBSTERUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "quantity": 100.0,
+                    "leverage": 2,
+                    "unrealized_pnl": 0.43,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "entry_reason": "explosive_breakout alpha_volume_price",
+                    "alpha_score": 89.0,
+                    "stop_pct": 0.08,
+                    "initial_stop_loss": 92.0,
+                    "current_stop_loss": 92.0,
+                    "max_floating_roi": 13.7,
+                    "alpha_profit_lock_stage": 1,
+                },
+                pnl_pct=0.86,
+                mark_price=100.43,
+                close_side="SELL",
+                highest_price=106.85,
+                atr=2.0,
+                age_h=0.65,
+            )
+
+        self.assertIsNone(action)
+
+    def test_explosive_stage1_preserves_runner_floor_metadata(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "LOBSTERUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "quantity": 100.0,
+                    "leverage": 2,
+                    "unrealized_pnl": 5.1,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "entry_reason": "explosive_breakout alpha_volume_price",
+                    "alpha_score": 89.0,
+                    "initial_quantity": 100.0,
+                    "stop_pct": 0.08,
+                    "initial_stop_loss": 92.0,
+                    "current_stop_loss": 92.0,
+                },
+                pnl_pct=10.2,
+                mark_price=105.1,
+                close_side="SELL",
+                highest_price=105.1,
+                atr=2.0,
+                age_h=0.18,
+            )
+
+        self.assertEqual(action["action"], "partial_close")
+        self.assertAlmostEqual(action["close_pct"], 0.20)
+        self.assertAlmostEqual(action["min_remaining_fraction"], 0.40)
+        self.assertTrue(action["explosive_runner_grace"])
+
+    def test_explosive_runner_uses_atr_to_widen_post_grace_profit_lock(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "LOBSTERUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "quantity": 40.0,
+                    "leverage": 2,
+                    "unrealized_pnl": 0.8,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "entry_reason": "explosive_breakout alpha_volume_price",
+                    "alpha_score": 89.0,
+                    "stop_pct": 0.08,
+                    "initial_stop_loss": 92.0,
+                    "current_stop_loss": 92.0,
+                    "max_floating_roi": 20.0,
+                    "alpha_profit_lock_stage": 2,
+                },
+                pnl_pct=2.0,
+                mark_price=101.0,
+                close_side="SELL",
+                highest_price=110.0,
+                atr=4.0,
+                age_h=1.1,
+            )
+
+        self.assertIsNone(action)
+
     def test_realized_partial_profit_limits_loss_on_remaining_position(self):
         engine = ExecutionEngine(DummyExchange())
         with patch("shared.db.update_position_management"):

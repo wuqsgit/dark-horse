@@ -515,13 +515,35 @@ def _runtime_controls():
         return {"normal_trading_enabled": True, "alpha_trading_enabled": False}
 
 
-def _write_alpha_post_close_cooldown(symbol, pnl=0.0, reason="", is_stop=False, prefix="alpha close"):
+def _explosive_reentry_allowed(cooldown, score, min_score=88.0):
+    cooldown = cooldown or {}
+    if float(score or 0) < float(min_score or 88.0):
+        return False
+    if str(cooldown.get("cooldown_type") or "") != "post_close":
+        return False
+    reason = str(cooldown.get("reason") or "").lower()
+    return "profit_lock" in reason and "stop" not in reason
+
+
+def _write_alpha_post_close_cooldown(
+    symbol,
+    pnl=0.0,
+    reason="",
+    is_stop=False,
+    prefix="alpha close",
+    entry_reason="",
+):
     """Prevent immediate alpha re-entry after a position has just exited."""
     cfg = _alpha_cfg()
     pnl = float(pnl or 0)
     reason_text = str(reason or "")
     stop_like = bool(is_stop) or "stop" in reason_text.lower() or "止损" in reason_text
-    if stop_like:
+    runner_cfg = ((cfg.get("profit_lock") or {}).get("explosive_runner") or {})
+    if "explosive_reentry" in str(entry_reason or "").lower():
+        cooldown_type = "explosive_reentry_used"
+        minutes = int(runner_cfg.get("reentry_used_cooldown_minutes", 180))
+        loss_count = 0
+    elif stop_like:
         cooldown_type = "stop"
         minutes = int(cfg.get("stop_cooldown_minutes", 180))
         loss_count = 1
@@ -1540,6 +1562,10 @@ class ExecutionEngine:
         ctx = self._latest_alpha_position_context(sym, hist)
         entry_score = float(hist.get("alpha_score") or hist.get("entry_score") or 0)
 
+        explosive_runner = False
+        explosive_grace = False
+        runner_cfg = {}
+
         def add(reason, is_stop=False, score=None, action="close", close_pct=None):
             item = {
                 "action": action,
@@ -1558,16 +1584,35 @@ class ExecutionEngine:
             }
             if close_pct is not None:
                 item["close_pct"] = close_pct
+            if action == "partial_close" and explosive_runner:
+                item["min_remaining_fraction"] = float(
+                    runner_cfg.get("min_remaining_fraction", 0.40)
+                )
+                item["initial_quantity"] = float(
+                    hist.get("initial_quantity") or quantity or 0
+                )
+                item["explosive_runner_grace"] = explosive_grace
             if is_stop:
                 item["is_stop"] = True
             return item
 
         alpha_cfg = _alpha_cfg() or {}
         profit_cfg = alpha_cfg.get("profit_lock") or {}
+        runner_cfg = profit_cfg.get("explosive_runner") or {}
         profit_lock_enabled = bool(profit_cfg.get("enabled", True))
         leverage = max(float(pos.get("leverage") or 1), 1.0)
         entry_price = float(pos.get("entry_price") or 0)
         quantity = abs(float(pos.get("quantity") or 0))
+        explosive_runner = bool(runner_cfg.get("enabled", True)) and (
+            "explosive_breakout" in str(hist.get("entry_reason") or "").lower()
+            and entry_score >= float(runner_cfg.get("min_score", 88.0))
+        )
+        grace_minutes = float(runner_cfg.get("grace_minutes", 60))
+        explosive_grace = bool(
+            explosive_runner
+            and age_h is not None
+            and age_h * 60 < grace_minutes
+        )
         current_pnl = float(pos.get("unrealized_pnl") or 0)
         peak_price = (
             float(hist.get("lowest_price") or mark_price)
@@ -1592,7 +1637,36 @@ class ExecutionEngine:
             1 if int(hist.get("tp1_hit") or 0) else 0,
         )
 
-        if profit_lock_enabled:
+        if profit_lock_enabled and explosive_runner:
+            arm_peak = float(profit_cfg.get("arm_peak_roi", 6.0))
+            runner_peak = float(profit_cfg.get("runner_peak_roi", 25.0))
+            if explosive_grace:
+                locked_roi = 0.0
+            elif peak_roi >= arm_peak:
+                giveback_ratio = float(
+                    runner_cfg.get(
+                        "mature_giveback_ratio" if peak_roi >= runner_peak else "pre_runner_giveback_ratio",
+                        0.50 if peak_roi >= runner_peak else 0.60,
+                    )
+                )
+                giveback_ratio = min(max(giveback_ratio, 0.0), 0.90)
+                peak_lock_roi = peak_roi * (1 - giveback_ratio)
+                atr_lock_roi = peak_lock_roi
+                atr_multiplier = max(float(runner_cfg.get("atr_multiplier", 2.50)), 0)
+                if atr > 0 and atr_multiplier > 0:
+                    atr_stop_price = (
+                        peak_price + atr * atr_multiplier
+                        if str(side or "").upper() == "SHORT"
+                        else peak_price - atr * atr_multiplier
+                    )
+                    atr_lock_roi = max(
+                        _price_return_pct(side, entry_price, atr_stop_price)
+                        * leverage
+                        * 100,
+                        0,
+                    )
+                locked_roi = max(locked_roi, min(peak_lock_roi, atr_lock_roi))
+        elif profit_lock_enabled:
             arm_peak = float(profit_cfg.get("arm_peak_roi", 6.0))
             stage1_peak = float(profit_cfg.get("stage1_peak_roi", 10.0))
             stage2_peak = float(profit_cfg.get("stage2_peak_roi", 15.0))
@@ -1618,13 +1692,20 @@ class ExecutionEngine:
                     peak_roi * (1 - giveback_ratio),
                 )
 
-        locked_stop = _roi_stop_price(side, entry_price, leverage, locked_roi)
-        ratcheted_stop = _ratchet_stop(
-            side,
-            hist.get("current_stop_loss"),
-            locked_stop,
-            entry_price,
-        )
+        if explosive_grace:
+            ratcheted_stop = float(
+                hist.get("initial_stop_loss")
+                or hist.get("current_stop_loss")
+                or 0
+            ) or None
+        else:
+            locked_stop = _roi_stop_price(side, entry_price, leverage, locked_roi)
+            ratcheted_stop = _ratchet_stop(
+                side,
+                hist.get("current_stop_loss"),
+                locked_stop,
+                entry_price,
+            )
         if ratcheted_stop:
             hist["current_stop_loss"] = ratcheted_stop
         hist["max_floating_roi"] = peak_roi
@@ -1646,6 +1727,7 @@ class ExecutionEngine:
 
         if (
             profit_lock_enabled
+            and not explosive_grace
             and peak_roi >= float(profit_cfg.get("arm_peak_roi", 6.0))
             and pnl_pct <= locked_roi
         ):
@@ -1670,6 +1752,7 @@ class ExecutionEngine:
         )
         if (
             profit_lock_enabled
+            and not explosive_grace
             and realized_profit >= min_realized_profit
             and current_pnl <= -(realized_profit * realized_giveback)
         ):
@@ -1717,7 +1800,11 @@ class ExecutionEngine:
                     f"alpha_profit_lock_stage1 peak_roi={peak_roi:.2f}% lock_roi={locked_roi:.2f}%",
                     score=entry_score,
                     action="partial_close",
-                    close_pct=float(profit_cfg.get("stage1_close_pct", 0.25)),
+                    close_pct=float(
+                        runner_cfg.get("stage1_close_pct", 0.20)
+                        if explosive_runner
+                        else profit_cfg.get("stage1_close_pct", 0.25)
+                    ),
                 )
             if (
                 profit_lock_stage < 2
@@ -1941,7 +2028,7 @@ class ExecutionEngine:
         min_ret = float(self.cfg.get("time_stop_min_return", 0.02)) * 100
         if age_h is not None and age_h >= time_stop_h and pnl_pct < min_ret and vp_action not in {"normal_review", "normal_review_probe"}:
             soft_hold_reason = f"alpha soft hold: time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}% state={vp_state}"
-        if pnl_pct >= float(self.cfg.get("tp2_target_pct", 0.10)) * 100 and calc_trailing_stop(mark_price, highest_price, atr, self.cfg.get("trailing_stop_atr_multiplier", 1.5)):
+        if not explosive_grace and pnl_pct >= float(self.cfg.get("tp2_target_pct", 0.10)) * 100 and calc_trailing_stop(mark_price, highest_price, atr, self.cfg.get("trailing_stop_atr_multiplier", 1.5)):
             return add(f"alpha_trailing_stop high={highest_price:.4f} now={mark_price:.4f}", score=current_score)
 
         confirmation_id = str(
@@ -2706,13 +2793,26 @@ class ExecutionEngine:
                 self.ai_learning_actions.append(learning_action)
 
             cooldown = get_alpha_cooldown(symbol) or get_alpha_cooldown("*")
+            explosive_reentry = False
             if cooldown:
                 soft_cooldowns = {
                     "orderbook_reject",
                     "volume_price_overheated",
                     "chase_guard",
                 }
-                if (
+                runner_cfg = ((cfg.get("profit_lock") or {}).get("explosive_runner") or {})
+                if explosive_candidate and _explosive_reentry_allowed(
+                    cooldown,
+                    discovery_score,
+                    runner_cfg.get("reentry_min_score", 88.0),
+                ):
+                    explosive_reentry = True
+                    soft_gate_factor = min(
+                        soft_gate_factor,
+                        float(runner_cfg.get("reentry_position_factor", 0.50)),
+                    )
+                    soft_gate_reasons.append("explosive_profit_lock_reentry")
+                elif (
                     explosive_candidate
                     and cooldown.get("cooldown_type") in soft_cooldowns
                 ):
@@ -2926,6 +3026,8 @@ class ExecutionEngine:
             reason = f"alpha_volume_price->{entry_profile.get('template')} alpha_score={alpha_execution_score:.1f} {side}"
             if explosive_candidate:
                 reason = f"explosive_breakout {reason}"
+                if explosive_reentry:
+                    reason = f"explosive_reentry {reason}"
             action = {
                 "action": "open",
                 "symbol": symbol,
@@ -2972,6 +3074,8 @@ class ExecutionEngine:
                     or row.get("time")
                     or row.get("scan_id")
                 )
+                if explosive_reentry:
+                    setup_anchor = f"{setup_anchor}:reentry:{cooldown.get('updated_at') or cooldown.get('cooldown_until')}"
                 setup_id = f"{symbol}:{side}:{setup_anchor}"
                 action.update({
                     "event_type": "explosive_breakout",
@@ -3161,7 +3265,17 @@ class ExecutionEngine:
                 hist.get("initial_quantity"),
                 exchange_info,
                 mark_price,
-                cfg,
+                {
+                    **cfg,
+                    **({
+                        "layer_add_initial_qty_pct": [
+                            float(cfg.get("explosive_add_initial_qty_pct", 0.50))
+                        ],
+                        "max_total_qty_multiple": float(
+                            cfg.get("explosive_max_total_qty_multiple", 2.0)
+                        ),
+                    } if explosive_position else {}),
+                },
                 roll_layer=next_layer,
                 current_quantity=pos.get("quantity"),
                 side=side,
@@ -4217,7 +4331,10 @@ class ExecutionEngine:
                 "alpha_profit_lock_stage2",
             )
         )
-        if strategy_source == "alpha" or profit_milestone:
+        explosive_grace = bool(act.get("explosive_runner_grace"))
+        if explosive_grace:
+            stop_price = float(history.get("initial_stop_loss") or stop_price or 0)
+        elif strategy_source == "alpha" or profit_milestone:
             from trader.roll_policy import calculate_protected_stop
 
             break_even_stop = calculate_protected_stop(
@@ -4742,6 +4859,7 @@ class ExecutionEngine:
                 reason=act.get("reason", ""),
                 is_stop=bool(act.get("is_stop")),
                 prefix="alpha execution close",
+                entry_reason=hist.get("entry_reason"),
             )
         self._record_decision(
             act["symbol"],
@@ -4779,6 +4897,17 @@ class ExecutionEngine:
 
         pct = act.get("close_pct", 0.50)
         close_qty = round(pos["quantity"] * pct, 3)
+        min_remaining_fraction = max(
+            0.0,
+            min(float(act.get("min_remaining_fraction") or 0), 1.0),
+        )
+        if min_remaining_fraction > 0:
+            initial_quantity = float(
+                act.get("initial_quantity") or pos.get("quantity") or 0
+            )
+            runner_floor = initial_quantity * min_remaining_fraction
+            max_close_qty = max(0.0, float(pos["quantity"]) - runner_floor)
+            close_qty = round(min(close_qty, max_close_qty), 3)
         if close_qty <= 0:
             return False
 

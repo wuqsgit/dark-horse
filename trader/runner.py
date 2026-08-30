@@ -611,6 +611,7 @@ def _apply_recent_alpha_close_cooldowns(minutes_back=12):
                    pt.exit_time,
                    pt.strategy_source,
                    pt.alpha_symbol,
+                   pt.entry_reason,
                    EXISTS(
                        SELECT 1
                        FROM orders o
@@ -641,7 +642,12 @@ def _apply_recent_alpha_close_cooldowns(minutes_back=12):
             reason = row["exit_reason"] or "exchange income close"
             reason_l = reason.lower()
             stop_like = "stop" in reason_l or "止损" in reason
-            if stop_like:
+            if "explosive_reentry" in str(row["entry_reason"] or "").lower():
+                runner_cfg = ((cfg.get("profit_lock") or {}).get("explosive_runner") or {})
+                cooldown_type = "explosive_reentry_used"
+                minutes = int(runner_cfg.get("reentry_used_cooldown_minutes", 180))
+                loss_count = 0
+            elif stop_like:
                 cooldown_type, minutes, loss_count = "stop", stop_minutes, 1
             elif pnl < 0:
                 cooldown_type, minutes, loss_count = "loss", loss_minutes, 1

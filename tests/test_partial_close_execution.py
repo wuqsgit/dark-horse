@@ -258,6 +258,69 @@ class PartialCloseExecutionTest(unittest.TestCase):
             [("new_stop", 7.5, 100.15), ("cancel_old", "new-stop-1")],
         )
 
+    def test_explosive_grace_keeps_exchange_stop_at_initial_structure(self):
+        exchange = PartialCloseExchange()
+        engine = ExecutionEngine(exchange)
+        engine._record_decision = lambda *args, **kwargs: None
+        history = {
+            "strategy_source": "alpha",
+            "entry_reason": "explosive_breakout alpha_volume_price",
+            "initial_quantity": 10.0,
+            "initial_stop_loss": 95.0,
+            "current_stop_loss": 95.0,
+        }
+
+        with patch("shared.db.get_position_history", return_value=history), \
+             patch("shared.db.record_trade"), \
+             patch("shared.db.update_position_management") as update:
+            succeeded = engine._execute_partial_close(
+                {
+                    "action": "partial_close",
+                    "symbol": "B2USDT",
+                    "side": "SELL",
+                    "strategy_source": "alpha",
+                    "close_pct": 0.20,
+                    "min_remaining_fraction": 0.40,
+                    "initial_quantity": 10.0,
+                    "explosive_runner_grace": True,
+                    "reason": "alpha_profit_lock_stage1 peak_roi=10.2%",
+                },
+                [],
+            )
+
+        self.assertTrue(succeeded)
+        protection = next(
+            call.kwargs for call in update.call_args_list
+            if "protected_stop" in call.kwargs
+        )
+        self.assertAlmostEqual(protection["protected_stop"], 95.0)
+        self.assertEqual(exchange.events[-2:], [("new_stop", 8.0, 95.0), ("cancel_old", "new-stop-1")])
+
+    def test_explosive_partial_close_never_consumes_forty_percent_runner(self):
+        exchange = PartialCloseExchange()
+        exchange.quantity = 5.0
+        engine = ExecutionEngine(exchange)
+        engine._record_decision = lambda *args, **kwargs: None
+
+        with patch("shared.db.get_position_history", return_value={}), \
+             patch("shared.db.record_trade"), \
+             patch("shared.db.update_position_management"):
+            succeeded = engine._execute_partial_close(
+                {
+                    "action": "partial_close",
+                    "symbol": "B2USDT",
+                    "side": "SELL",
+                    "close_pct": 0.50,
+                    "min_remaining_fraction": 0.40,
+                    "initial_quantity": 10.0,
+                    "reason": "explosive runner protect",
+                },
+                [],
+            )
+
+        self.assertTrue(succeeded)
+        self.assertAlmostEqual(exchange.quantity, 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()
