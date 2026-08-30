@@ -4052,6 +4052,7 @@ class ExecutionEngine:
         *,
         reduce_only: bool = False,
         quantity: float | None = None,
+        position: dict | None = None,
     ):
         qty = float(quantity if quantity is not None else act["quantity"])
         client_order_id = act.get("client_order_id")
@@ -4064,14 +4065,14 @@ class ExecutionEngine:
                         act["side"],
                         qty,
                         client_order_id=client_order_id,
-                        position_side=self._action_position_side(act),
+                        position_side=self._action_position_side(act, position),
                     )
                 return self.ex.place_market_order(
                     act["symbol"],
                     act["side"],
                     qty,
                     client_order_id=client_order_id,
-                    position_side=self._action_position_side(act),
+                    position_side=self._action_position_side(act, position),
                 )
             except TypeError:
                 # Compatibility for test doubles and legacy exchange adapters.
@@ -4710,6 +4711,7 @@ class ExecutionEngine:
             act,
             reduce_only=True,
             quantity=pos["quantity"],
+            position=pos,
         )
         from shared.db import delete_position_history, get_position_history, record_trade
         hist = get_position_history(act["symbol"]) or {}

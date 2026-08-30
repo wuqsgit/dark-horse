@@ -90,6 +90,29 @@ class ExchangeOrderTest(unittest.TestCase):
             ],
         )
 
+    def test_close_infers_hedge_direction_from_selected_position(self):
+        class Exchange:
+            def __init__(self):
+                self.position_side = None
+
+            def close_position_market(
+                self, symbol, side, quantity, *, client_order_id=None,
+                position_side=None,
+            ):
+                self.position_side = position_side
+                return {"orderId": "close-1"}
+
+        exchange = Exchange()
+        engine = ExecutionEngine(exchange)
+
+        engine._place_market_action_order(
+            {"symbol": "AKEUSDT", "side": "SELL", "quantity": 3621},
+            reduce_only=True,
+            position={"symbol": "AKEUSDT", "positionSide": "LONG", "side": "LONG"},
+        )
+
+        self.assertEqual(exchange.position_side, "LONG")
+
 
 if __name__ == "__main__":
     unittest.main()
