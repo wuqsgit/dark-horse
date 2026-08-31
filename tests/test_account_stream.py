@@ -1,8 +1,20 @@
 import asyncio
+import sqlite3
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from trader.exchange import BinanceFutures
+
+
+class AccountStreamRuntimeStatusTest(unittest.TestCase):
+    def test_runtime_status_lock_is_telemetry_only(self):
+        from account_stream.main import report_runtime_status
+
+        with patch(
+            "account_stream.main.upsert_service_runtime_status",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            self.assertFalse(report_runtime_status("ok"))
 
 
 class BinanceLiveSnapshotTest(unittest.TestCase):

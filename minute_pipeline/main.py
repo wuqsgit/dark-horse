@@ -126,6 +126,17 @@ class MinutePipeline:
     def symbols(self, market_kind: str):
         return getattr(self.universe, market_kind)
 
+    async def _run_resilient(self, name, operation):
+        while not self.stop.is_set():
+            try:
+                await operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("%s stopped unexpectedly; restarting: %s", name, exc)
+            if not self.stop.is_set():
+                await self._sleep(1)
+
     async def run(self):
         self.universe = await asyncio.to_thread(load_minute_universe)
         logger.info(
@@ -138,33 +149,39 @@ class MinutePipeline:
         tasks = [
             asyncio.create_task(self.writer.run(self.writer_stop)),
             asyncio.create_task(self._bootstrap_with_signal()),
-            asyncio.create_task(self._refresh_universe()),
-            asyncio.create_task(self._alpha_poll_loop()),
-            asyncio.create_task(self._futures_fallback_loop()),
-            asyncio.create_task(self._gap_repair_loop()),
-            asyncio.create_task(self._readiness_loop()),
-            asyncio.create_task(self._maintenance_loop()),
+            asyncio.create_task(self._run_resilient("universe refresh", self._refresh_universe)),
+            asyncio.create_task(self._run_resilient("alpha REST poll", self._alpha_poll_loop)),
+            asyncio.create_task(self._run_resilient("futures REST fallback", self._futures_fallback_loop)),
+            asyncio.create_task(self._run_resilient("gap repair", self._gap_repair_loop)),
+            asyncio.create_task(self._run_resilient("readiness refresh", self._readiness_loop)),
+            asyncio.create_task(self._run_resilient("maintenance", self._maintenance_loop)),
             asyncio.create_task(
-                BinanceKlineStream(
-                    collector_id="spot_ws_1m",
-                    market_kind="spot",
-                    ws_url=SPOT_WS_URL,
-                    symbols_provider=lambda: self.symbols("spot"),
-                    writer=self.writer,
-                    max_streams_per_connection=WS_MAX_STREAMS_PER_CONNECTION,
-                    reconnect_seconds=WS_RECONNECT_SECONDS,
-                ).run(self.stop)
+                self._run_resilient(
+                    "spot WebSocket",
+                    lambda: BinanceKlineStream(
+                        collector_id="spot_ws_1m",
+                        market_kind="spot",
+                        ws_url=SPOT_WS_URL,
+                        symbols_provider=lambda: self.symbols("spot"),
+                        writer=self.writer,
+                        max_streams_per_connection=WS_MAX_STREAMS_PER_CONNECTION,
+                        reconnect_seconds=WS_RECONNECT_SECONDS,
+                    ).run(self.stop),
+                )
             ),
             asyncio.create_task(
-                BinanceKlineStream(
-                    collector_id="futures_ws_1m",
-                    market_kind="futures",
-                    ws_url=FUTURES_WS_URL,
-                    symbols_provider=lambda: self.symbols("futures"),
-                    writer=self.writer,
-                    max_streams_per_connection=WS_MAX_STREAMS_PER_CONNECTION,
-                    reconnect_seconds=WS_RECONNECT_SECONDS,
-                ).run(self.stop)
+                self._run_resilient(
+                    "futures WebSocket",
+                    lambda: BinanceKlineStream(
+                        collector_id="futures_ws_1m",
+                        market_kind="futures",
+                        ws_url=FUTURES_WS_URL,
+                        symbols_provider=lambda: self.symbols("futures"),
+                        writer=self.writer,
+                        max_streams_per_connection=WS_MAX_STREAMS_PER_CONNECTION,
+                        reconnect_seconds=WS_RECONNECT_SECONDS,
+                    ).run(self.stop),
+                )
             ),
         ]
         try:

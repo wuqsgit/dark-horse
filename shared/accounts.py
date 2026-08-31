@@ -162,6 +162,35 @@ def account_allows_new_exposure(account_id: int, strategy_source: str = "normal"
         conn.close()
 
 
+def set_account_trading_enabled(account_id: int, mode: str, enabled: bool) -> dict:
+    """Update one exposure switch without accepting general account fields."""
+    columns = {
+        "normal": "normal_trading_enabled",
+        "alpha": "alpha_trading_enabled",
+    }
+    column = columns.get(str(mode or "").strip().lower())
+    if not column:
+        raise ValueError("unsupported trading mode")
+    account_id = int(account_id)
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            f"""UPDATE trading_accounts
+                SET {column}=?, updated_at=datetime('now')
+                WHERE id=?""",
+            (int(bool(enabled)), account_id),
+        )
+        if cursor.rowcount != 1:
+            raise LookupError("account not found")
+        conn.commit()
+    finally:
+        conn.close()
+    account = get_account(account_id)
+    if not account:
+        raise LookupError("account not found")
+    return account
+
+
 def prepare_account_deletion(account_id: int) -> dict:
     """Validate deletion and freeze every switch that can increase exposure."""
     ensure_default_account()

@@ -29,14 +29,27 @@ def _signature(account: dict) -> tuple:
     )
 
 
+def report_runtime_status(status: str, **fields) -> bool:
+    """Keep telemetry write failures from stopping account reconciliation."""
+    try:
+        upsert_service_runtime_status(
+            "account_stream",
+            status=status,
+            **fields,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("account stream runtime status write failed: %s", exc)
+        return False
+
+
 async def run_supervisor(stop: asyncio.Event) -> None:
     tasks: dict[int, asyncio.Task] = {}
     signatures: dict[int, tuple] = {}
     child_stops: dict[int, asyncio.Event] = {}
     logger.info("account stream supervisor started")
-    upsert_service_runtime_status(
-        "account_stream",
-        status="starting",
+    report_runtime_status(
+        "starting",
         details={"reconcile_seconds": RECONCILE_INTERVAL},
     )
     while not stop.is_set():
@@ -85,9 +98,8 @@ async def run_supervisor(stop: asyncio.Event) -> None:
                 tasks.pop(account_id, None)
                 child_stops.pop(account_id, None)
                 signatures.pop(account_id, None)
-            upsert_service_runtime_status(
-                "account_stream",
-                status="ok",
+            report_runtime_status(
+                "ok",
                 details={
                     "account_count": len(active_ids),
                     "reconcile_seconds": RECONCILE_INTERVAL,
@@ -95,9 +107,8 @@ async def run_supervisor(stop: asyncio.Event) -> None:
             )
         except Exception as exc:
             logger.exception("account stream supervisor failed")
-            upsert_service_runtime_status(
-                "account_stream",
-                status="error",
+            report_runtime_status(
+                "error",
                 error_code="account_stream_supervisor_failed",
                 last_error=f"{type(exc).__name__}: {exc}",
             )

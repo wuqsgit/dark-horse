@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
 import shared.db as db
 from shared.live_account_store import replace_live_account_snapshot
 
@@ -65,10 +67,40 @@ class LiveAccountApiReadPathTest(unittest.TestCase):
             source="http_reconcile",
             exchange_event_time="2026-08-29T09:00:00Z",
         )
+        self.client = TestClient(self.main.app)
 
     def tearDown(self):
+        self.client.close()
         db.DB_PATH = self.original_db_path
         self.temp.cleanup()
+
+    def test_account_trading_switch_does_not_require_admin_token(self):
+        response = self.client.post(
+            "/api/trading/accounts/1/controls",
+            json={"mode": "normal", "enabled": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        connection = db.get_conn()
+        try:
+            account = connection.execute(
+                "SELECT normal_trading_enabled, alpha_trading_enabled, name "
+                "FROM trading_accounts WHERE id=1"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(account["normal_trading_enabled"], 0)
+        self.assertEqual(account["alpha_trading_enabled"], 1)
+        self.assertEqual(account["name"], "primary")
+
+    def test_account_trading_switch_rejects_non_switch_fields(self):
+        response = self.client.post(
+            "/api/trading/accounts/1/controls",
+            json={"mode": "api_key", "enabled": False, "api_key": "replace-me"},
+        )
+
+        self.assertEqual(response.status_code, 400)
 
     def test_status_payload_reads_current_tables_without_exchange_client(self):
         with patch(

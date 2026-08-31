@@ -133,6 +133,23 @@ class MinutePipelineDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.retry_count, 1)
         self.assertIsNone(writer.last_error)
 
+    async def test_resilient_loop_restarts_after_database_lock(self):
+        pipeline = object.__new__(MinutePipeline)
+        pipeline.stop = asyncio.Event()
+        calls = 0
+
+        async def operation():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            pipeline.stop.set()
+
+        with patch.object(pipeline, "_sleep", AsyncMock()):
+            await pipeline._run_resilient("test-loop", operation)
+
+        self.assertEqual(calls, 2)
+
     async def test_recent_replay_excludes_old_aggregates(self):
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         recent_start = (now - timedelta(hours=1)).replace(

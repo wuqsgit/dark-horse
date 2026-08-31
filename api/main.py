@@ -2105,6 +2105,36 @@ async def update_trading_account(account_id: int, body: dict, user=Depends(requi
         return {"error": str(exc)}
 
 
+@app.post("/api/trading/accounts/{account_id}/controls")
+async def update_account_trading_control(
+    account_id: int,
+    body: dict,
+    user=Depends(get_user),
+):
+    from shared.accounts import set_account_trading_enabled
+
+    mode = str(body.get("mode") or "").strip().lower()
+    if mode not in {"normal", "alpha"} or not isinstance(body.get("enabled"), bool):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_trading_control"},
+        )
+    try:
+        account = await asyncio.to_thread(
+            set_account_trading_enabled,
+            account_id,
+            mode,
+            body["enabled"],
+        )
+    except LookupError:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "account_not_found"},
+        ) from None
+    _clear_api_caches()
+    return {"ok": True, "account": account}
+
+
 @app.delete("/api/trading/accounts/{account_id}")
 async def delete_trading_account(account_id: int, user=Depends(require_admin)):
     from trader.account_lifecycle import close_positions_and_delete_account

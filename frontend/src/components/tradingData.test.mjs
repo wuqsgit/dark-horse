@@ -65,6 +65,24 @@ test('account and runtime clients request their exact endpoints', async () => {
   ]);
 });
 
+test('account control posts only mode and enabled without an admin header', async () => {
+  const calls = [];
+  const client = createTradingDataClient(async (url, options) => {
+    calls.push([url, options]);
+    return response({ ok: true });
+  });
+
+  await client.updateAccountControl(7, 'normal', false);
+
+  assert.equal(calls[0][0], '/api/trading/accounts/7/controls');
+  assert.equal(calls[0][1].method, 'POST');
+  assert.deepEqual(JSON.parse(calls[0][1].body), {
+    mode: 'normal',
+    enabled: false,
+  });
+  assert.equal(calls[0][1].headers['X-Dark-Horse-Token'], undefined);
+});
+
 test('status deduplicates concurrent and cached requests for 30 seconds', async () => {
   let calls = 0;
   let release;

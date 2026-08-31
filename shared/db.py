@@ -3,6 +3,7 @@ import os
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -3321,7 +3322,12 @@ def fetch_spot_klines_1h(symbols, hours=72):
         conn.close()
 
 
-def cleanup_old_operational_data(retention_days=RETENTION_DAYS, now=None, batch_size=5000):
+def cleanup_old_operational_data(
+    retention_days=RETENTION_DAYS,
+    now=None,
+    batch_size=5000,
+    batch_pause_seconds=0.01,
+):
     """Delete expired regenerable data without touching accounting/current-state tables."""
     if retention_days < 1:
         raise ValueError("retention_days must be at least 1")
@@ -3366,13 +3372,15 @@ def cleanup_old_operational_data(retention_days=RETENTION_DAYS, now=None, batch_
                 total += count
                 if count < batch_size:
                     break
+                if batch_pause_seconds > 0:
+                    time.sleep(batch_pause_seconds)
             deleted[table] = total
         finally:
             conn.close()
 
     checkpoint = get_conn()
     try:
-        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        checkpoint.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
     finally:
         checkpoint.close()
     return deleted

@@ -309,6 +309,11 @@ test('live trading consumers use only the split trading data client', () => {
   assert.doesNotMatch(environmentStatusSource, /tradingAccountsStatus|\/api\/trading\/status/);
 });
 
+test('account trading switches use the viewer control endpoint without admin token', () => {
+  assert.match(liveTradingSource, /updateAccountTradingControl\(/);
+  assert.doesNotMatch(liveTradingSource, /adminFetch\(`\/api\/trading\/accounts\/\$\{account\.id\}`/);
+});
+
 test('components wire the tested environment and strategy source helpers', () => {
   assert.match(environmentStatusSource, /tradingEnvironmentDisplay\(data\)/);
   assert.match(environmentStatusSource, /display\.degraded/);

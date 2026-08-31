@@ -85,7 +85,19 @@ export function createTradingDataClient(fetchImpl = fetch, dedupeMs = 30000) {
     signal,
   );
 
-  return { accounts, status, history, decisions, runtime };
+  const updateAccountControl = async (accountId, mode, enabled, { signal } = {}) => {
+    const url = `/api/trading/accounts/${encodeURIComponent(String(accountId))}/controls`;
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, enabled }),
+      signal,
+    });
+    if (!response.ok) throw new Error(`${url}: ${response.status}`);
+    return response.json();
+  };
+
+  return { accounts, status, history, decisions, runtime, updateAccountControl };
 }
 
 const tradingDataClient = createTradingDataClient();
@@ -99,3 +111,6 @@ export const fetchTradingDecisions = (accountId, options) => (
   tradingDataClient.decisions(accountId, options)
 );
 export const fetchTradingRuntimeStatus = (options) => tradingDataClient.runtime(options);
+export const updateAccountTradingControl = (accountId, mode, enabled, options) => (
+  tradingDataClient.updateAccountControl(accountId, mode, enabled, options)
+);

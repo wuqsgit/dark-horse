@@ -72,6 +72,32 @@ class DataRetentionTest(unittest.TestCase):
         self.assertEqual(deleted["futures_candles_1h"], 0)
         self.assertEqual(deleted["strategy_decisions"], 1)
 
+    def test_cleanup_yields_between_full_delete_batches(self):
+        now = datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc)
+        conn = db.get_conn()
+        try:
+            conn.executemany(
+                """INSERT INTO candles_1h
+                   (time, symbol, open, high, low, close, volume, quote_vol, trades)
+                   VALUES (?, ?, 1, 1, 1, 1, 1, 1, 1)""",
+                [
+                    (iso_z(now - timedelta(days=7)), "BTCUSDT"),
+                    (iso_z(now - timedelta(days=6)), "ETHUSDT"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch("shared.db.time.sleep") as sleep:
+            db.cleanup_old_operational_data(
+                retention_days=5,
+                now=now,
+                batch_size=1,
+            )
+
+        self.assertGreaterEqual(sleep.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

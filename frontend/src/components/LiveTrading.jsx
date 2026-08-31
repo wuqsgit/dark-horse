@@ -4,8 +4,8 @@ import {
   fetchTradingAccountsStatus,
   fetchTradingHistory,
   fetchTradingRuntimeStatus,
+  updateAccountTradingControl,
 } from '../api/tradingData';
-import { adminFetch } from '../api/adminFetch';
 import TradingAccountManager from './TradingAccountManager';
 import {
   accountSnapshotAvailability,
@@ -410,13 +410,8 @@ export default function LiveTrading() {
     try {
       const targets = accountConfigs.filter((item) => String(item.id) === String(selectedAccount));
       if (!targets.length) throw new Error('请先选择具体账户');
-      const key = mode === 'alpha' ? 'alpha_trading_enabled' : 'normal_trading_enabled';
       const results = await Promise.all(targets.map(async (account) => {
-        const res = await adminFetch(`/api/trading/accounts/${account.id}`, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...account, [key]: enabled }),
-        });
-        return res.json();
+        return updateAccountTradingControl(account.id, mode, enabled);
       }));
       const failed = results.find((item) => item.error);
       if (failed) throw new Error(failed.error);
