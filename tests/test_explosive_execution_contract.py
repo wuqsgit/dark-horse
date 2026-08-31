@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import patch
 
-from trader.execution import ExecutionEngine
+from trader.execution import (
+    ExecutionEngine,
+    _alpha_profile_is_blocked,
+    _evaluate_explosive_loss_guard,
+)
 
 
 class ExplosiveExchange:
@@ -76,6 +80,36 @@ def explosive_action():
 
 
 class ExplosiveExecutionContractTest(unittest.TestCase):
+    def test_high_risk_watch_remains_hard_blocked_for_explosive_entry(self):
+        self.assertTrue(
+            _alpha_profile_is_blocked(
+                "high_risk_watch",
+                {"high_risk_watch"},
+            )
+        )
+
+    def test_two_recent_explosive_losses_pause_new_entries(self):
+        allowed, reason = _evaluate_explosive_loss_guard(
+            [
+                {"net_pnl": -3.0},
+                {"net_pnl": -2.0},
+                {"net_pnl": 4.0},
+            ],
+            balance=707.0,
+        )
+
+        self.assertFalse(allowed)
+        self.assertIn("consecutive_losses=2", reason)
+
+    def test_two_percent_explosive_loss_pauses_new_entries(self):
+        allowed, reason = _evaluate_explosive_loss_guard(
+            [{"net_pnl": -15.0}],
+            balance=707.0,
+        )
+
+        self.assertFalse(allowed)
+        self.assertIn("loss_pct", reason)
+
     def _db_patches(self):
         return patch.multiple(
             "shared.db",

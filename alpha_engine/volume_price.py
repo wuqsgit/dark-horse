@@ -184,6 +184,16 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
             metrics=metrics,
         )
 
+    if volume_regime in {"overheated", "extreme"}:
+        return _state(
+            "overheated_climax",
+            "observe",
+            reasons=[
+                f"volume regime {volume_regime} indicates a climax rather than a fresh impulse"
+            ],
+            metrics=metrics,
+        )
+
     if square_reversal.get("candidate"):
         return _state(
             "alpha_square_sentiment_reversal",
@@ -202,6 +212,24 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
         if oi_24h_available
         else oi_change_4h >= 0.02
     )
+    continuation_quality = (
+        volume_regime == "impulse"
+        and trend_score >= 70.0
+        and sync_score >= 85.0
+        and oi_change_4h >= 0.03
+    )
+    squeeze_quality = (
+        volume_regime in {"impulse", "suspicious"}
+        and _num(alpha_score) >= 88.0
+        and sync_score >= 90.0
+        and oi_change_4h >= 0.03
+        and futures_volume_growth_6h >= 2.5
+    )
+    explosive_quality = continuation_quality or squeeze_quality
+    quality_lane = (
+        "continuation" if continuation_quality else
+        ("structural_squeeze" if squeeze_quality else "insufficient")
+    )
     conditions = {
         "alpha_score_80": _num(alpha_score) >= 80.0,
         "futures_available": bool(futures_sync.get("available")),
@@ -212,7 +240,9 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
         "price_strong_1h": ret_1h >= 2.0,
         "price_strong_6h": ret_6h > 0,
         "oi_expanded": oi_expanded,
+        "explosive_quality": explosive_quality,
     }
+    metrics["explosive_quality_lane"] = quality_lane
     metrics["entry_conditions"] = conditions
     if all(conditions.values()):
         reasons = [
@@ -222,6 +252,7 @@ def evaluate_alpha_volume_price(raw_features, market_price=0, alpha_score=0):
             f"sync score {sync_score:.1f} >= 75",
             f"price strengthened: 15m {ret_15m:.2f}%, 1h {ret_1h:.2f}%, 6h {ret_6h:.2f}%",
             f"OI expanded: 4h {oi_change_4h:.2%}, 24h {oi_change_24h:.2%}",
+            f"explosive quality lane: {quality_lane}",
             "waiting for breakout bar and next closed 15m hold",
             f"position adjusted by spread to {spread_position_factor:.2f}x",
         ]

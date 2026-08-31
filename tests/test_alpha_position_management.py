@@ -465,6 +465,68 @@ class AlphaPositionManagementTest(unittest.TestCase):
 
         self.assertIsNone(action)
 
+    def test_explosive_position_exits_after_two_closed_bars_fail_entry(self):
+        engine = ExecutionEngine(DummyExchange())
+        engine._latest_alpha_position_context = lambda symbol, hist: {
+            "alpha_score": 86.0,
+            "volume_price_state": "explosive_volume_watch",
+            "volume_price_action": "observe",
+            "volume_price_metrics_json": json.dumps({
+                "volume_regime": "normal",
+                "trend_score": 62,
+                "ret_15m": -0.8,
+                "ret_1h": -1.2,
+                "ret_6h": 2.0,
+                "spread_pct": 0.01,
+                "entry_conditions": {
+                    "price_strong_15m": False,
+                    "oi_expanded": False,
+                },
+            }),
+            "volume_price_reasons_json": "[]",
+        }
+        engine._record_decision = lambda *args, **kwargs: None
+        candles = [
+            {"high": 101.0, "low": 99.0, "close": 100.5, "quote_vol": 1000},
+            {"high": 100.2, "low": 98.0, "close": 98.8, "quote_vol": 800},
+            {"high": 99.4, "low": 97.8, "close": 98.5, "quote_vol": 700},
+            {"high": 99.0, "low": 97.5, "close": 98.2, "quote_vol": 650},
+        ]
+
+        with patch.object(
+            execution,
+            "_fetch_closed_futures_15m",
+            return_value=candles,
+        ), patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "STARUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "quantity": 10.0,
+                    "leverage": 3,
+                    "unrealized_pnl": -18.0,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "entry_reason": "explosive_breakout alpha_volume_price",
+                    "alpha_score": 89.0,
+                    "initial_stop_loss": 92.0,
+                    "current_stop_loss": 92.0,
+                    "stop_pct": 0.08,
+                },
+                pnl_pct=-5.4,
+                mark_price=98.2,
+                close_side="SELL",
+                highest_price=100.2,
+                atr=2.0,
+                age_h=0.75,
+            )
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "close")
+        self.assertIn("explosive_breakout_failed", action["reason"])
+
     def test_realized_partial_profit_limits_loss_on_remaining_position(self):
         engine = ExecutionEngine(DummyExchange())
         with patch("shared.db.update_position_management"):

@@ -121,6 +121,83 @@ def _cap_explosive_add_quantity(
     return min(proposed, remaining)
 
 
+def _alpha_profile_is_blocked(profile, blocked_profiles) -> bool:
+    return str(profile or "") in set(blocked_profiles or ())
+
+
+def _evaluate_explosive_loss_guard(
+    trades,
+    balance,
+    *,
+    max_consecutive_losses=2,
+    max_loss_pct=0.02,
+):
+    rows = [dict(row) for row in (trades or [])]
+    equity = max(float(balance or 0), 0)
+    total_pnl = sum(float(row.get("net_pnl") or 0) for row in rows)
+    consecutive_losses = 0
+    for row in rows:
+        if float(row.get("net_pnl") or 0) >= 0:
+            break
+        consecutive_losses += 1
+    if consecutive_losses >= int(max_consecutive_losses or 2):
+        return False, f"explosive_loss_guard consecutive_losses={consecutive_losses}"
+    loss_pct = (-total_pnl / equity) if equity > 0 and total_pnl < 0 else 0
+    if loss_pct >= float(max_loss_pct or 0.02):
+        return False, f"explosive_loss_guard loss_pct={loss_pct:.2%}"
+    return True, "OK"
+
+
+def _recent_explosive_loss_guard(balance, hours=4):
+    from shared.db import current_account_id, get_conn
+
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT net_pnl
+               FROM position_trades
+               WHERE account_id=?
+                 AND entry_reason LIKE '%explosive_breakout%'
+                 AND datetime(exit_time) >= datetime('now', ?)
+               ORDER BY datetime(exit_time) DESC, id DESC""",
+            (current_account_id(), f"-{max(1, int(hours or 4))} hours"),
+        ).fetchall()
+        return _evaluate_explosive_loss_guard(rows, balance)
+    finally:
+        conn.close()
+
+
+def _explosive_entry_failed(
+    side,
+    closed_candles,
+    entry_price,
+    metrics,
+    volume_price_action,
+    age_h,
+) -> bool:
+    if age_h is None or float(age_h) < 0.5:
+        return False
+    if str(volume_price_action or "").lower() not in {"observe", "cooldown"}:
+        return False
+    bars = [dict(row) for row in (closed_candles or [])]
+    if len(bars) < 2 or float(entry_price or 0) <= 0:
+        return False
+    conditions = (metrics or {}).get("entry_conditions") or {}
+    signal_failed = (
+        conditions.get("price_strong_15m") is False
+        or conditions.get("oi_expanded") is False
+    )
+    if not signal_failed:
+        return False
+    closes = [float(bar.get("close") or 0) for bar in bars[-2:]]
+    buffer = 0.003
+    if str(side or "").upper() == "SHORT":
+        threshold = float(entry_price) * (1 + buffer)
+        return all(close > threshold for close in closes)
+    threshold = float(entry_price) * (1 - buffer)
+    return all(0 < close < threshold for close in closes)
+
+
 def _explosive_client_order_id(setup_id) -> str:
     digest = hashlib.sha256(str(setup_id or "explosive").encode("utf-8")).hexdigest()[:24]
     return f"DH-EXP-{digest}"
@@ -890,7 +967,11 @@ def _json_or_empty(value):
     return {}
 
 
-def _evaluate_alpha_breakout_bars(rows, expected_confirmation_time=None):
+def _evaluate_alpha_breakout_bars(
+    rows,
+    expected_confirmation_time=None,
+    max_confirmation_distance_pct=4.0,
+):
     """Require a closed 15m breakout bar followed by a holding confirmation."""
     bars = [dict(row) for row in (rows or [])]
     if len(bars) < 6:
@@ -946,12 +1027,20 @@ def _evaluate_alpha_breakout_bars(rows, expected_confirmation_time=None):
         return False, f"15m confirmation low broke level: low {confirmation_low:.8g}, level {breakout_level:.8g}", details
     if confirmation_volume_ratio < 1.5:
         return False, f"15m confirmation volume weak: {confirmation_volume_ratio:.2f}x < 1.50x", details
-    if confirmation_close > breakout_level * 1.15:
-        return False, f"15m confirmation extended too far: {confirmation_distance_pct:.2f}% > 15.00%", details
+    max_distance = max(0.0, float(max_confirmation_distance_pct or 0))
+    if max_distance and confirmation_distance_pct > max_distance:
+        return False, (
+            f"15m confirmation extended too far: {confirmation_distance_pct:.2f}% "
+            f"> {max_distance:.2f}%"
+        ), details
     return True, "15m breakout and hold confirmed", details
 
 
-def _check_alpha_futures_breakout_confirmation(symbol, now=None):
+def _check_alpha_futures_breakout_confirmation(
+    symbol,
+    now=None,
+    max_confirmation_distance_pct=4.0,
+):
     from shared.db import get_conn
 
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -975,13 +1064,22 @@ def _check_alpha_futures_breakout_confirmation(symbol, now=None):
     return _evaluate_alpha_breakout_bars(
         list(reversed(rows)),
         expected_confirmation_time=cutoff,
+        max_confirmation_distance_pct=max_confirmation_distance_pct,
     )
 
 
-def _safe_alpha_futures_breakout_confirmation(symbol, now=None):
+def _safe_alpha_futures_breakout_confirmation(
+    symbol,
+    now=None,
+    max_confirmation_distance_pct=4.0,
+):
     """Return a structured rejection instead of aborting the Alpha decision loop."""
     try:
-        ok, reason, details = _check_alpha_futures_breakout_confirmation(symbol, now=now)
+        ok, reason, details = _check_alpha_futures_breakout_confirmation(
+            symbol,
+            now=now,
+            max_confirmation_distance_pct=max_confirmation_distance_pct,
+        )
     except Exception as exc:
         return False, f"15m breakout confirmation failed: {exc}", {"error": str(exc)}
     info = dict(details or {})
@@ -1562,6 +1660,7 @@ class ExecutionEngine:
         ctx = self._latest_alpha_position_context(sym, hist)
         entry_score = float(hist.get("alpha_score") or hist.get("entry_score") or 0)
 
+        explosive_position = False
         explosive_runner = False
         explosive_grace = False
         runner_cfg = {}
@@ -1603,8 +1702,12 @@ class ExecutionEngine:
         leverage = max(float(pos.get("leverage") or 1), 1.0)
         entry_price = float(pos.get("entry_price") or 0)
         quantity = abs(float(pos.get("quantity") or 0))
-        explosive_runner = bool(runner_cfg.get("enabled", True)) and (
+        explosive_position = (
             "explosive_breakout" in str(hist.get("entry_reason") or "").lower()
+        )
+        explosive_runner = (
+            bool(runner_cfg.get("enabled", True))
+            and explosive_position
             and entry_score >= float(runner_cfg.get("min_score", 88.0))
         )
         grace_minutes = float(runner_cfg.get("grace_minutes", 60))
@@ -1882,6 +1985,25 @@ class ExecutionEngine:
         except Exception as exc:
             logger.warning("Alpha closed 15m candles unavailable for %s: %s", sym, exc)
             closed_candles = []
+
+        if (
+            explosive_position
+            and pnl_pct < 0
+            and _explosive_entry_failed(
+                side,
+                closed_candles,
+                entry_price,
+                metrics,
+                vp_action,
+                age_h,
+            )
+        ):
+            return add(
+                f"explosive_breakout_failed two_closed_15m_below_entry "
+                f"pnl={pnl_pct:.2f}% ret15={ret_15m:.2f}%",
+                is_stop=True,
+                score=current_score,
+            )
 
         one_hour_weak = _alpha_one_hour_trend_weak(
             side,
@@ -2652,6 +2774,7 @@ class ExecutionEngine:
         min_score = float(cfg.get("min_score", 68))
         full_position_score = float(cfg.get("full_position_score", 80))
         actions = []
+        explosive_guard = None
 
         candidates = sorted(
             [dict(r) for r in rows],
@@ -2747,12 +2870,18 @@ class ExecutionEngine:
             if vp_ttl and age is not None and age > vp_ttl:
                 reject(f"stale volume-price state age={age:.1f}m > {vp_ttl:.0f}m")
                 continue
-            if profile in blocked_profiles:
-                if explosive_candidate:
-                    soft_gate_factor = min(soft_gate_factor, 0.5)
-                    soft_gate_reasons.append(f"alpha_profile:{profile}")
-                else:
-                    reject(f"blocked alpha profile: {profile}")
+            if _alpha_profile_is_blocked(profile, blocked_profiles):
+                reject(f"blocked alpha profile: {profile}")
+                continue
+            if explosive_candidate:
+                if explosive_guard is None:
+                    try:
+                        explosive_guard = _recent_explosive_loss_guard(balance)
+                    except Exception as exc:
+                        logger.warning("Explosive loss guard unavailable: %s", exc)
+                        explosive_guard = (True, "guard_unavailable")
+                if not explosive_guard[0]:
+                    reject(explosive_guard[1])
                     continue
             if discovery_score < min_score:
                 reject(f"alpha_discovery_score {discovery_score:.1f} < {min_score:.1f}")
@@ -2894,8 +3023,17 @@ class ExecutionEngine:
                 "volume_price_state": volume_price.get("state"),
                 "volume_price_action": vp_action,
             }
+            quality_lane = str(
+                (volume_price.get("metrics") or {}).get("explosive_quality_lane")
+                or ""
+            )
             breakout_ok, _breakout_reason, breakout_info = (
-                _safe_alpha_futures_breakout_confirmation(symbol)
+                _safe_alpha_futures_breakout_confirmation(
+                    symbol,
+                    max_confirmation_distance_pct=(
+                        8.0 if quality_lane == "structural_squeeze" else 4.0
+                    ),
+                )
             )
             entry_profile["breakout_confirmation"] = breakout_info
             if explosive_candidate and not breakout_ok:
@@ -3007,6 +3145,7 @@ class ExecutionEngine:
                 category="alpha",
                 entry_mode=alpha_entry_mode,
                 size_multiplier=size_multiplier,
+                enforce_risk_budget=explosive_candidate,
             )
             lev = int(pos_info.get("leverage") or self.cfg.get("leverage_max", 3))
             qty = float(pos_info.get("quantity") or 0)

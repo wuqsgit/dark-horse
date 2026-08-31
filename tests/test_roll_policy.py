@@ -70,7 +70,7 @@ class RollPolicyTest(unittest.TestCase):
         self.assertAlmostEqual(decision.current_r, 1.4)
         self.assertEqual(decision.status, "waiting_1_5r")
 
-    def test_explosive_confirmation_add_uses_lower_r_after_tp1(self):
+    def test_explosive_confirmation_add_uses_lower_r_without_waiting_for_tp1(self):
         decision = evaluate_roll(
             {
                 "side": "LONG",
@@ -81,6 +81,7 @@ class RollPolicyTest(unittest.TestCase):
             complete_state(
                 entry_reason="explosive_breakout alpha_volume_price",
                 alpha_score=89,
+                tp1_hit=0,
             ),
             {"ema20": 102, "ema20_slope": 1.0},
             alpha_sync=True,

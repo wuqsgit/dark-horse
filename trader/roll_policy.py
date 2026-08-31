@@ -35,7 +35,12 @@ def evaluate_roll(
     max_layers = int(_number(config.get("max_layers")) or 1)
     if roll_layer >= max_layers:
         return RollDecision(False, "roll_completed")
-    if not bool(state.get("tp1_hit")):
+    explosive_position = (
+        "explosive_breakout" in str(state.get("entry_reason") or "").lower()
+        and _number(state.get("alpha_score"))
+        >= (_number(config.get("explosive_min_score")) or 88)
+    )
+    if not bool(state.get("tp1_hit")) and not explosive_position:
         return RollDecision(False, "waiting_tp1")
 
     side = str(position.get("side") or "").upper()
@@ -62,11 +67,6 @@ def evaluate_roll(
     if trigger_r <= 0:
         trigger_r = (_number(config.get("trigger_r")) or 1.5) + roll_layer
     trigger_label = f"{trigger_r:g}".replace(".", "_")
-    explosive_position = (
-        "explosive_breakout" in str(state.get("entry_reason") or "").lower()
-        and _number(state.get("alpha_score"))
-        >= (_number(config.get("explosive_min_score")) or 88)
-    )
     if roll_layer == 0 and explosive_position:
         trigger_r = _number(config.get("explosive_trigger_r")) or 0.75
         trigger_label = f"{trigger_r:g}".replace(".", "_")

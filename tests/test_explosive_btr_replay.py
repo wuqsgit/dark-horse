@@ -24,7 +24,11 @@ class ExplosiveBtrReplayTest(unittest.TestCase):
         )
         self.assertTrue(signal["allow_long"])
         self.assertEqual(signal["event_type"], "explosive_breakout")
-        breakout_ok, _, breakout = _evaluate_alpha_breakout_bars(snapshot["breakout_bars"])
+        self.assertEqual(signal["metrics"]["explosive_quality_lane"], "structural_squeeze")
+        breakout_ok, _, breakout = _evaluate_alpha_breakout_bars(
+            snapshot["breakout_bars"],
+            max_confirmation_distance_pct=8.0,
+        )
         self.assertTrue(breakout_ok)
         self.assertGreaterEqual(breakout["confirmation_volume_ratio"], 1.5)
 

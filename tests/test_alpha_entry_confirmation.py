@@ -64,6 +64,7 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         }
         raw["depth"]["spread_pct"] = 0.0
         raw["futures_sync"]["sync_score"] = 100
+        raw["alpha_trend"]["volume_regime"] = "suspicious"
 
         result = evaluate_alpha_volume_price(
             raw,
@@ -89,7 +90,7 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         self.assertFalse(allowed["allow_long"])
         self.assertEqual(allowed["state"], "alpha_entry_conditions_missing")
 
-    def test_dual_market_sync_enters_normal_position_with_degraded_spread(self):
+    def test_weak_dual_market_sync_stays_watch_with_degraded_spread(self):
         raw = _features(alpha_volume=4.05, futures_volume=1.85, oi4=0.012, oi24=0.015, trend=61.25)
         raw["alpha_trend"]["volume_regime"] = "impulse"
         raw["depth"]["spread_pct"] = 0.20
@@ -98,13 +99,11 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
 
         result = evaluate_alpha_volume_price(raw, alpha_score=85)
 
-        self.assertTrue(result["allow_long"])
-        self.assertEqual(result["action"], "normal_review")
-        self.assertEqual(result["state"], "explosive_breakout_pending")
-        self.assertGreater(result["max_position_factor"], 0.5)
-        self.assertLess(result["max_position_factor"], 1.0)
+        self.assertFalse(result["allow_long"])
+        self.assertEqual(result["action"], "observe")
+        self.assertEqual(result["state"], "explosive_volume_watch")
 
-    def test_dual_market_sync_uses_normal_position_at_tight_spread(self):
+    def test_weak_dual_market_sync_stays_watch_at_tight_spread(self):
         raw = _features(alpha_volume=4.05, futures_volume=1.85, oi4=0.012, oi24=0.015, trend=61.25)
         raw["alpha_trend"]["volume_regime"] = "impulse"
         raw["returns"]["ret_1h"] = 2.6
@@ -112,8 +111,8 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
 
         result = evaluate_alpha_volume_price(raw, alpha_score=85)
 
-        self.assertEqual(result["state"], "explosive_breakout_pending")
-        self.assertEqual(result["max_position_factor"], 1.0)
+        self.assertFalse(result["allow_long"])
+        self.assertEqual(result["state"], "explosive_volume_watch")
 
     def test_execution_preserves_double_position_factor(self):
         self.assertEqual(_alpha_position_factor({"max_position_factor": 2.0}), 2.0)
@@ -136,10 +135,11 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         self.assertNotEqual(result["regime"], "suspicious")
 
     def test_orderbook_imbalance_is_not_an_entry_parameter(self):
-        raw = _features(alpha_volume=4.0, futures_volume=1.8, oi4=0.012, oi24=0.015)
+        raw = _features(alpha_volume=4.0, futures_volume=2.0, oi4=0.035, oi24=0.04, trend=76)
         raw["depth"].update({"bid_depth": 100, "ask_depth": 140})
         raw["returns"]["ret_1h"] = 2.5
-        raw["futures_sync"]["sync_score"] = 75
+        raw["futures_sync"]["sync_score"] = 88
+        raw["alpha_trend"]["volume_regime"] = "impulse"
 
         result = evaluate_alpha_volume_price(raw, alpha_score=85)
 
@@ -213,6 +213,40 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("low broke level", reason)
 
+    def test_continuation_breakout_rejects_more_than_four_percent_chase(self):
+        bars = [
+            {"time": f"2026-08-26T0{1 + (i // 4)}:{(i % 4) * 15:02d}:00Z", "high": high, "low": low, "close": close, "quote_vol": volume}
+            for i, (high, low, close, volume) in enumerate([
+                (10.0, 9.7, 9.8, 100), (10.2, 9.8, 10.0, 100),
+                (10.1, 9.7, 9.9, 100), (10.3, 9.9, 10.1, 100),
+                (10.7, 10.2, 10.6, 180), (10.9, 10.4, 10.8, 200),
+            ])
+        ]
+
+        ok, reason, details = _evaluate_alpha_breakout_bars(bars)
+
+        self.assertFalse(ok)
+        self.assertGreater(details["confirmation_distance_pct"], 4.0)
+        self.assertIn("4.00%", reason)
+
+    def test_structural_squeeze_can_use_eight_percent_chase_ceiling(self):
+        bars = [
+            {"time": f"2026-08-26T0{1 + (i // 4)}:{(i % 4) * 15:02d}:00Z", "high": high, "low": low, "close": close, "quote_vol": volume}
+            for i, (high, low, close, volume) in enumerate([
+                (10.0, 9.7, 9.8, 100), (10.2, 9.8, 10.0, 100),
+                (10.1, 9.7, 9.9, 100), (10.3, 9.9, 10.1, 100),
+                (10.7, 10.2, 10.6, 180), (11.0, 10.4, 10.75, 200),
+            ])
+        ]
+
+        ok, _, details = _evaluate_alpha_breakout_bars(
+            bars,
+            max_confirmation_distance_pct=8.0,
+        )
+
+        self.assertTrue(ok)
+        self.assertLessEqual(details["confirmation_distance_pct"], 8.0)
+
     def test_breakout_requires_the_expected_latest_closed_candle(self):
         bars = [
             {"time": f"2026-08-26T0{hour}:{minute:02d}:00Z", "high": high, "low": low, "close": close, "quote_vol": volume}
@@ -260,15 +294,58 @@ class AlphaEntryConfirmationTest(unittest.TestCase):
         self.assertIn("database unavailable", reason)
         self.assertEqual(info["error"], "database unavailable")
 
-    def test_trend_score_is_not_an_entry_parameter(self):
+    def test_low_trend_score_requires_structural_squeeze_confirmation(self):
         raw = _features(alpha_volume=4.2, futures_volume=1.8, oi4=0.012, oi24=0.01, trend=20)
         raw["alpha_trend"]["volume_regime"] = "impulse"
         raw["returns"]["ret_1h"] = 2.5
         raw["futures_sync"]["sync_score"] = 75
-        result = evaluate_alpha_volume_price(raw, alpha_score=85)
-        self.assertTrue(result["allow_long"])
-        self.assertEqual(result["action"], "normal_review")
-        self.assertEqual(result["state"], "explosive_breakout_pending")
+        weak = evaluate_alpha_volume_price(raw, alpha_score=85)
+        self.assertFalse(weak["allow_long"])
+
+        raw["alpha_trend"]["volume_regime"] = "suspicious"
+        raw["futures_sync"].update({
+            "futures_volume_growth_6h": 2.6,
+            "oi_change_4h": 0.035,
+            "sync_score": 92,
+        })
+        strong = evaluate_alpha_volume_price(raw, alpha_score=89)
+        self.assertTrue(strong["allow_long"])
+        self.assertEqual(strong["metrics"]["explosive_quality_lane"], "structural_squeeze")
+
+    def test_high_score_with_weak_oi_and_sync_stays_watch_only(self):
+        raw = _features(
+            alpha_volume=4.1,
+            futures_volume=2.1,
+            oi4=0.0134,
+            oi24=0.006,
+            trend=82,
+        )
+        raw["alpha_trend"]["volume_regime"] = "impulse"
+        raw["returns"].update({"ret_15m": 2.0, "ret_1h": 9.4, "ret_6h": 8.9})
+        raw["futures_sync"]["sync_score"] = 75
+
+        result = evaluate_alpha_volume_price(raw, alpha_score=91.4)
+
+        self.assertFalse(result["allow_long"])
+        self.assertEqual(result["state"], "explosive_volume_watch")
+        self.assertFalse(result["metrics"]["entry_conditions"]["explosive_quality"])
+
+    def test_overheated_climax_is_rejected_even_with_strong_oi(self):
+        raw = _features(
+            alpha_volume=8.8,
+            futures_volume=8.8,
+            oi4=0.161,
+            oi24=0.117,
+            trend=68.5,
+        )
+        raw["alpha_trend"].update({"volume_regime": "overheated", "trend_state": "probe"})
+        raw["returns"].update({"ret_15m": 3.9, "ret_1h": 7.5, "ret_6h": 18.0})
+        raw["futures_sync"]["sync_score"] = 100
+
+        result = evaluate_alpha_volume_price(raw, alpha_score=91.5)
+
+        self.assertFalse(result["allow_long"])
+        self.assertEqual(result["state"], "overheated_climax")
 
     def test_jct_impulse_snapshot_stays_watch_only_without_price_and_oi_confirmation(self):
         raw = _features(alpha_volume=4.3734, futures_volume=1.5454, oi4=-0.001733, oi24=-0.027692, trend=66.95)

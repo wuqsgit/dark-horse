@@ -105,6 +105,7 @@ def calculate_position(
     category: str | None = None,
     entry_mode: str | None = None,
     size_multiplier: float = 1.0,
+    enforce_risk_budget: bool = False,
 ) -> dict:
     cfg = TRADING_CONFIG
     try:
@@ -145,7 +146,10 @@ def calculate_position(
         margin_pct *= score_adj * max(0.1, min(1.5, float(size_multiplier or 1.0)))
     max_margin_pct = float(sizing.get("max_margin_pct", margin_pct))
     margin_pct = min(margin_pct, max_margin_pct)
+    effective_size_multiplier = max(0.1, min(1.5, float(size_multiplier or 1.0)))
     target_margin = balance * margin_pct
+    if enforce_risk_budget:
+        target_margin *= effective_size_multiplier
     target_notional = target_margin * leverage
 
     base_risk_pct = sizing.get(
@@ -168,7 +172,11 @@ def calculate_position(
     risk_notional = risk_budget / stop_pct
     # Strong confirmations use the configured balance-based margin directly.
     # The risk budget remains observable, but does not silently shrink the order.
-    position_value = target_notional if strong_entry else min(target_notional, risk_notional)
+    position_value = (
+        min(target_notional, risk_notional)
+        if enforce_risk_budget or not strong_entry
+        else target_notional
+    )
 
     max_notional = balance * max_margin_pct * leverage
     position_value = min(position_value, max_notional)

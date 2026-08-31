@@ -129,6 +129,27 @@ class DynamicLeverageTest(unittest.TestCase):
         self.assertAlmostEqual(result["margin"], 106.05)
         self.assertAlmostEqual(result["position_value"], 212.10)
 
+    def test_explosive_strong_entry_applies_size_factor_and_risk_cap(self):
+        balance = 707.0
+
+        result = calculate_position(
+            AtrExchange(0.08),
+            "STARUSDT",
+            price=100.0,
+            balance=balance,
+            score=89,
+            category="alpha",
+            entry_mode="strong",
+            size_multiplier=0.5,
+            enforce_risk_budget=True,
+        )
+
+        self.assertLessEqual(result["margin"], balance * 0.075)
+        self.assertLessEqual(
+            result["position_value"] * result["stop_pct"],
+            result["risk_budget"],
+        )
+
     def test_high_quality_sol_snapshot_is_promoted_to_strong(self):
         row = {
             "symbol": "SOLUSDT",

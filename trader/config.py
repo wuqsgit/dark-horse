@@ -181,6 +181,7 @@ TRADING_CONFIG = {
             "strong_margin_pct": 0.15,
             "max_margin_pct": 0.15,
             "risk_per_trade_pct": 0.0075,
+            "strong_risk_per_trade_pct": 0.0200,
             "probe_risk_per_trade_pct": 0.0045,
             "min_effective_margin_pct": 0.018,
             "min_effective_stop_pct": 0.050
