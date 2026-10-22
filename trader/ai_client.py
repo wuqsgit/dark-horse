@@ -23,7 +23,7 @@ def _json_object(value):
 
 
 class AIEntryQualityClient:
-    def __init__(self, base_url="http://127.0.0.1:8010", timeout_seconds=0.3):
+    def __init__(self, base_url="http://127.0.0.1:8010", timeout_seconds=2.0):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
 
@@ -56,6 +56,18 @@ def _flatten_features(value, result=None):
         elif isinstance(item, (int, float)) and not isinstance(item, bool):
             result.setdefault(key, item)
     return result
+
+
+def _position_side(action):
+    position_side = str(action.get("position_side") or "").upper()
+    if position_side in {"LONG", "SHORT"}:
+        return position_side
+    order_side = str(action.get("side") or "").upper()
+    if order_side in {"BUY", "LONG"}:
+        return "LONG"
+    if order_side in {"SELL", "SHORT"}:
+        return "SHORT"
+    return ""
 
 
 def build_learning_action(
@@ -107,18 +119,20 @@ def build_candidate(action, scan_rows, account_id):
         "hold_alpha": row.get("hold_alpha"),
         "relative_strength": row.get("relative_strength"),
     }
+    side = _position_side(action)
     features, feature_quality = extract_feature_payload(
         action_context,
         _json_object(action.get("ai_features")),
         row,
         _json_object(row.get("raw_features")),
         category=category,
+        side=side,
     )
     return {
         "account_id": int(account_id),
         "model_key": "alpha" if is_alpha else "normal",
         "symbol": action["symbol"],
-        "side": action.get("position_side") or ("LONG" if action.get("side") == "BUY" else "SHORT"),
+        "side": side,
         "template": action.get("ai_sample_template") or ("alpha_entry" if is_alpha else "normal_entry"),
         "category": category,
         "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -132,38 +146,12 @@ def build_candidate(action, scan_rows, account_id):
 
 def observe_entry_quality_candidates(actions, scan_rows, *, account_id, observe=None):
     observe = observe or AIEntryQualityClient().observe_many
-    learning_actions = list(actions or [])
-    existing = {
-        (
-            str(action.get("symbol") or "").upper(),
-            str(action.get("strategy_source") or "normal"),
-        )
-        for action in learning_actions
-    }
-    try:
-        from trader.risk import determine_side
-        from trader.symbol_risk import get_symbol_risk
-
-        for row in scan_rows or []:
-            symbol = str(row.get("symbol") or "").upper()
-            key = (symbol, "normal")
-            if not symbol or key in existing:
-                continue
-            action = build_learning_action(
-                row,
-                side=determine_side(row),
-                strategy_source="normal",
-                category=(get_symbol_risk(symbol) or {}).get("class"),
-            )
-            if action:
-                learning_actions.append(action)
-                existing.add(key)
-    except Exception as exc:
-        logger.warning("AI full-scan candidate expansion unavailable: %s", exc)
-
     candidates = [
         build_candidate(action, scan_rows, account_id)
-        for action in learning_actions
+        for action in (actions or [])
+        if action.get("action") == "open"
+        and float(action.get("entry_price") or 0) > 0
+        and (action.get("position_side") or action.get("side"))
     ]
     if not candidates:
         return {"sent": 0}
@@ -175,8 +163,18 @@ def observe_entry_quality_candidates(actions, scan_rows, *, account_id, observe=
         return {"sent": 0, "error": str(exc)}
 
 
-def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_id, evaluate=None):
+def apply_entry_quality_gate(
+    actions,
+    scan_rows,
+    *,
+    balance,
+    exchange,
+    account_id,
+    evaluate=None,
+    policy="advisory",
+):
     evaluate = evaluate or AIEntryQualityClient().evaluate
+    policy = "enforce" if str(policy).lower() == "enforce" else "advisory"
     filtered = []
     for action in actions:
         if action.get("action") != "open":
@@ -209,7 +207,7 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
             filtered.append(action)
             continue
         if decision.get("decision") == "reject":
-            if action.get("event_type") == "explosive_breakout":
+            if policy == "advisory" or action.get("event_type") == "explosive_breakout":
                 action["ai_quality_decision"] = "reject_advisory"
                 action["soft_gate_reasons"] = [
                     *(action.get("soft_gate_reasons") or []),
@@ -220,6 +218,14 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
             logger.info("AI rejected %s entry at quality=%s", action.get("symbol"), decision.get("quality_score"))
             continue
         if decision.get("decision") == "probe":
+            if policy == "advisory":
+                action["ai_quality_decision"] = "probe_advisory"
+                action["soft_gate_reasons"] = [
+                    *(action.get("soft_gate_reasons") or []),
+                    "ai_quality_probe",
+                ]
+                filtered.append(action)
+                continue
             margin_pct = float(decision.get("target_margin_pct") or 0.05)
             price = float(action.get("entry_price") or 0)
             leverage = max(1.0, float(action.get("leverage") or 1))
@@ -234,7 +240,7 @@ def apply_entry_quality_gate(actions, scan_rows, *, balance, exchange, account_i
                 continue
             action["invested"] = round(price * action["quantity"], 2)
             action["ai_target_margin_pct"] = margin_pct
-        elif decision.get("position_factor") is not None:
+        elif policy == "enforce" and decision.get("position_factor") is not None:
             factor = max(0.0, float(decision["position_factor"]))
             action["quantity"] = exchange.adjust_quantity(
                 action["symbol"], float(action.get("quantity") or 0) * factor,

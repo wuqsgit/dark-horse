@@ -601,16 +601,28 @@ class AIStore:
         *,
         model_key: str,
         target: str,
+        limit: int | None = None,
     ) -> list[dict]:
         conn = self.connect()
         try:
-            rows = conn.execute(
-                """SELECT * FROM alpha_strategy_samples
-                   WHERE model_key=? AND label_status='ready'
-                     AND labels_json IS NOT NULL
-                   ORDER BY datetime(candle_close_time), id""",
-                (model_key,),
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(
+                    """SELECT * FROM alpha_strategy_samples
+                       WHERE model_key=? AND label_status='ready'
+                         AND labels_json IS NOT NULL
+                       ORDER BY candle_close_time, id""",
+                    (model_key,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM (
+                           SELECT * FROM alpha_strategy_samples
+                           WHERE model_key=? AND label_status='ready'
+                             AND labels_json IS NOT NULL
+                           ORDER BY candle_close_time DESC, id DESC LIMIT ?
+                       ) ORDER BY candle_close_time, id""",
+                    (model_key, int(limit)),
+                ).fetchall()
             result = []
             for row in rows:
                 item = dict(row)
@@ -1057,15 +1069,32 @@ class AIStore:
         finally:
             conn.close()
 
-    def labeled_samples(self, model_key: str) -> list[dict]:
+    def labeled_samples(
+        self,
+        model_key: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict]:
         conn = self.connect()
         try:
-            rows = conn.execute(
-                """SELECT * FROM entry_quality_samples
-                   WHERE model_key=? AND label_status='ready' AND label IS NOT NULL
-                   ORDER BY datetime(observed_at), id""",
-                (model_key,),
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(
+                    """SELECT * FROM entry_quality_samples
+                       WHERE model_key=? AND label_status='ready'
+                         AND label IS NOT NULL
+                       ORDER BY observed_at, id""",
+                    (model_key,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM (
+                           SELECT * FROM entry_quality_samples
+                           WHERE model_key=? AND label_status='ready'
+                             AND label IS NOT NULL
+                           ORDER BY observed_at DESC, id DESC LIMIT ?
+                       ) ORDER BY observed_at, id""",
+                    (model_key, int(limit)),
+                ).fetchall()
             result = []
             for row in rows:
                 item = dict(row)

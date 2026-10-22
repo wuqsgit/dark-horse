@@ -9,8 +9,11 @@ from ai_service.config import (
     AI_DB_PATH,
     AI_EXECUTION_MODE,
     MAIN_DB_PATH,
+    MAINTENANCE_START_DELAY_SECONDS,
     MODEL_DIR,
     SAMPLE_RETENTION_DAYS,
+    STATUS_REFRESH_SECONDS,
+    TRAINING_HOUR_UTC,
 )
 from ai_service.alpha_labels import AlphaStrategyLabeler
 from ai_service.alpha_strategy_service import AlphaStrategyService
@@ -44,9 +47,22 @@ def create_app(
         MAIN_DB_PATH,
     )
     maintenance = {"last_label": None, "last_label_result": None, "last_train": None, "last_error": None}
+    status_snapshot = {"value": quality.status(), "last_error": None}
+
+    async def status_refresh_loop():
+        while True:
+            await asyncio.sleep(STATUS_REFRESH_SECONDS)
+            try:
+                status_snapshot["value"] = await asyncio.to_thread(quality.status)
+                status_snapshot["last_error"] = None
+            except Exception as exc:
+                status_snapshot["last_error"] = str(exc)
+                logger.exception("AI status snapshot refresh failed")
 
     async def maintenance_loop():
         last_train_day = None
+        if MAINTENANCE_START_DELAY_SECONDS:
+            await asyncio.sleep(MAINTENANCE_START_DELAY_SECONDS)
         while True:
             try:
                 counterfactual_count = await asyncio.to_thread(
@@ -71,7 +87,10 @@ def create_app(
                 maintenance["last_alpha_execution_result"] = (
                     alpha_execution_result
                 )
-                if last_train_day != now.date():
+                if (
+                    last_train_day != now.date()
+                    and now.hour == TRAINING_HOUR_UTC
+                ):
                     train_result = await asyncio.to_thread(
                         lambda: {key: quality.train(key) for key in ("alpha", "normal")}
                     )
@@ -105,12 +124,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app):
-        task = asyncio.create_task(maintenance_loop()) if start_scheduler else None
+        tasks = []
+        if start_scheduler:
+            tasks = [
+                asyncio.create_task(status_refresh_loop()),
+                asyncio.create_task(maintenance_loop()),
+            ]
         try:
             yield
         finally:
-            if task:
+            for task in tasks:
                 task.cancel()
+            for task in tasks:
                 try:
                     await task
                 except asyncio.CancelledError:
@@ -134,8 +159,9 @@ def create_app(
     @app.get("/v1/entry-quality/status")
     def entry_quality_status():
         return {
-            **quality.status(),
+            **status_snapshot["value"],
             "maintenance": maintenance,
+            "snapshot_error": status_snapshot["last_error"],
         }
 
     @app.post("/v2/alpha-strategy/evaluate")

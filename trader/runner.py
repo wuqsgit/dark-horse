@@ -253,18 +253,9 @@ async def _account_trading_loop(account):
             actions = engine.decide(top_symbols, positions, run_id=run_id)
             strategy_v2 = engine.cfg.get("alpha_strategy_v2") or {}
             actions = _filter_legacy_alpha_entries(actions, strategy_v2)
-            actions.extend(
-                alpha_signal_consumer.build_actions(
-                    account=account,
-                    positions=positions,
-                    balance=balance,
-                    engine=engine,
-                    run_id=run_id,
-                    planned_actions=actions,
-                )
-            )
+            actions = _filter_account_entry_actions(actions, account)
             observation = observe_entry_quality_candidates(
-                engine.ai_learning_actions,
+                actions,
                 top_symbols,
                 account_id=account["id"],
             )
@@ -277,7 +268,33 @@ async def _account_trading_loop(account):
                 balance=balance,
                 exchange=ex,
                 account_id=account["id"],
+                policy=engine.cfg.get("ai_entry_policy", "advisory"),
             )
+            alpha_actions = alpha_signal_consumer.build_actions(
+                account=account,
+                positions=positions,
+                balance=balance,
+                engine=engine,
+                run_id=run_id,
+                planned_actions=actions,
+            )
+            alpha_actions = _filter_account_entry_actions(alpha_actions, account)
+            alpha_observation = observe_entry_quality_candidates(
+                alpha_actions,
+                top_symbols,
+                account_id=account["id"],
+            )
+            if alpha_observation.get("sent"):
+                logger.info("AI alpha candidates observed: %s", alpha_observation["sent"])
+            alpha_actions = apply_entry_quality_gate(
+                alpha_actions,
+                top_symbols,
+                balance=balance,
+                exchange=ex,
+                account_id=account["id"],
+                policy=engine.cfg.get("ai_entry_policy", "advisory"),
+            )
+            actions.extend(alpha_actions)
 
             # 3.5 按类别打印评分排序 + 未开仓原因
             pending = [a.get('symbol') for a in actions if a.get('action') == 'open']

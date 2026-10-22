@@ -26,6 +26,7 @@ def evaluate_roll(
     technical: Mapping[str, Any],
     alpha_sync: bool,
     config: Mapping[str, Any],
+    continuation_confirmed: bool = False,
 ) -> RollDecision:
     required = ("initial_quantity", "initial_stop_loss", "atr_value")
     if any(_number(state.get(field)) <= 0 for field in required):
@@ -40,9 +41,6 @@ def evaluate_roll(
         and _number(state.get("alpha_score"))
         >= (_number(config.get("explosive_min_score")) or 88)
     )
-    if not bool(state.get("tp1_hit")) and not explosive_position:
-        return RollDecision(False, "waiting_tp1")
-
     side = str(position.get("side") or "").upper()
     if side == "SHORT":
         max_layers = int(_number(config.get("short_max_layers")) or max_layers)
@@ -57,6 +55,7 @@ def evaluate_roll(
 
     favorable_move = mark - entry if side == "LONG" else entry - mark
     current_r = favorable_move / risk
+    tp1_hit = bool(state.get("tp1_hit"))
     cycle_peak = _number(state.get("roll_cycle_peak_price"))
     pullback_armed = bool(state.get("roll_pullback_armed"))
     layer_triggers = config.get("layer_trigger_r") or []
@@ -73,9 +72,19 @@ def evaluate_roll(
 
     trigger_mode = ""
     if roll_layer == 0:
-        if current_r < trigger_r:
-            return RollDecision(False, f"waiting_{trigger_label}r", current_r)
-        trigger_mode = "explosive_confirmation" if explosive_position else "sustained_profit"
+        if tp1_hit:
+            if current_r < trigger_r:
+                return RollDecision(False, f"waiting_{trigger_label}r", current_r)
+            trigger_mode = "explosive_confirmation" if explosive_position else "sustained_profit"
+        elif explosive_position:
+            if current_r < trigger_r:
+                return RollDecision(False, f"waiting_{trigger_label}r", current_r)
+            trigger_mode = "explosive_confirmation"
+        else:
+            continuation_min_r = _number(config.get("continuation_min_r")) or 0.75
+            if not continuation_confirmed or current_r < continuation_min_r:
+                return RollDecision(False, "waiting_tp1_or_continuation", current_r)
+            trigger_mode = "fresh_continuation"
     else:
         atr = _number(state.get("atr_value"))
         anchor = _number(state.get("roll_price")) or entry

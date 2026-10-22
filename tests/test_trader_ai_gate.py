@@ -63,6 +63,7 @@ class TraderAIGateTest(unittest.TestCase):
         self.assertEqual(candidate["features"]["trend_score"], 76)
         self.assertEqual(candidate["features"]["spread_pct"], 0.0005)
         self.assertEqual(candidate["features"]["score"], 82.0)
+        self.assertEqual(candidate["features"]["side_code"], 1.0)
 
     def test_candidate_parses_database_json_feature_payload(self):
         action = open_action(source="normal")
@@ -95,11 +96,26 @@ class TraderAIGateTest(unittest.TestCase):
             self.assertEqual(result[0]["ai_quality_decision"], decision)
             self.assertEqual(result[1], actions[1])
 
-    def test_reject_removes_only_new_entry(self):
+    def test_reject_is_advisory_by_default(self):
         close = {"action": "close", "symbol": "ETHUSDT"}
         result = apply_entry_quality_gate(
             [open_action(), close], [], balance=5000, exchange=FakeExchange(), account_id=1,
             evaluate=lambda candidate: {"status": "live", "decision": "reject", "quality_score": 42},
+        )
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["ai_quality_decision"], "reject_advisory")
+        self.assertIn("ai_quality_reject", result[0]["soft_gate_reasons"])
+        self.assertEqual(result[1], close)
+
+    def test_enforce_policy_can_remove_rejected_new_entry(self):
+        close = {"action": "close", "symbol": "ETHUSDT"}
+        result = apply_entry_quality_gate(
+            [open_action(), close], [], balance=5000, exchange=FakeExchange(), account_id=1,
+            evaluate=lambda candidate: {
+                "status": "live", "decision": "reject", "quality_score": 42,
+                "applied": True,
+            },
+            policy="enforce",
         )
         self.assertEqual(result, [close])
 
@@ -126,15 +142,31 @@ class TraderAIGateTest(unittest.TestCase):
         self.assertEqual(result[0]["ai_quality_decision"], "reject_advisory")
         self.assertIn("ai_quality_reject", result[0]["soft_gate_reasons"])
 
-    def test_probe_resizes_entry_to_five_percent_current_balance_margin(self):
+    def test_probe_is_advisory_by_default(self):
         action = open_action()
         action["quantity"] = 2000.0
         result = apply_entry_quality_gate(
             [action], [], balance=5000, exchange=FakeExchange(), account_id=1,
             evaluate=lambda candidate: {
                 "status": "live", "decision": "probe", "quality_score": 58,
-                "target_margin_pct": 0.05,
+                "target_margin_pct": 0.05, "applied": True,
             },
+        )
+
+        self.assertEqual(result[0]["quantity"], 2000.0)
+        self.assertEqual(result[0]["ai_quality_decision"], "probe_advisory")
+        self.assertIn("ai_quality_probe", result[0]["soft_gate_reasons"])
+
+    def test_enforce_probe_resizes_entry_to_five_percent_current_balance_margin(self):
+        action = open_action()
+        action["quantity"] = 2000.0
+        result = apply_entry_quality_gate(
+            [action], [], balance=5000, exchange=FakeExchange(), account_id=1,
+            evaluate=lambda candidate: {
+                "status": "live", "decision": "probe", "quality_score": 58,
+                "target_margin_pct": 0.05, "applied": True,
+            },
+            policy="enforce",
         )
 
         action = result[0]
@@ -176,6 +208,21 @@ class TraderAIGateTest(unittest.TestCase):
             observe=lambda payload: (_ for _ in ()).throw(TimeoutError("offline")),
         )
         self.assertEqual(result, {"sent": 0, "error": "offline"})
+
+    def test_candidate_observation_ignores_scan_rows_without_planned_entries(self):
+        observed = []
+        result = observe_entry_quality_candidates(
+            [],
+            [{
+                "symbol": "NOISEUSDT", "market_price": 1.0, "composite_score": 90,
+                "raw_features": {"technical": {"trend_score": 90}},
+            }],
+            account_id=1,
+            observe=lambda payload: observed.extend(payload),
+        )
+
+        self.assertEqual(result, {"sent": 0})
+        self.assertEqual(observed, [])
 
     def test_learning_action_uses_candidate_features_before_legacy_gates(self):
         action = build_learning_action(

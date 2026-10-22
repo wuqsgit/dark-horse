@@ -23,6 +23,9 @@ _load_local_env()
 _DEFAULT_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
 
 TRADING_CONFIG = {
+    # AI scores entry quality and records evidence by default. Rule strategies
+    # retain final order authority unless explicitly switched back to enforce.
+    "ai_entry_policy": os.getenv("AI_ENTRY_POLICY", "advisory").strip().lower(),
     # ── 资金管理 ──
     "total_capital": 5000,
     "position_size_pct": 0.20,          # 每仓占总资金 20%
@@ -371,7 +374,7 @@ TRADING_CONFIG = {
             "ALPHA_LEGACY_ENTRY_ENABLED",
             "false",
         ).lower() in ("1", "true", "yes", "on"),
-        "ai_timeout_ms": 300,
+        "ai_timeout_ms": 5000,
         "ai_failure_mode": "hold_state",
         "testnet_live_rule_fallback": os.getenv(
             "ALPHA_V2_TESTNET_RULE_FALLBACK",
@@ -383,6 +386,7 @@ TRADING_CONFIG = {
         "max_layers": 3,
         "short_max_layers": 2,
         "trigger_r": 1.5,
+        "continuation_min_r": 0.75,
         # Every profitable position can pyramid as R expands. A healthy
         # pullback/recovery remains an alternative trigger for later layers.
         "layer_trigger_r": [1.5, 2.5, 3.5],
