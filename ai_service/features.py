@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 
-FEATURE_SCHEMA_VERSION = 2
+FEATURE_SCHEMA_VERSION = 3
 
 FEATURE_NAMES = (
     "score", "trend_score", "entry_alpha", "hold_alpha", "relative_strength",
@@ -11,7 +11,7 @@ FEATURE_NAMES = (
     "ema20_50_ratio", "volume_change_pct", "spot_volume_ratio_6h",
     "futures_volume_ratio_6h", "volume_sync_score", "funding_rate",
     "oi_change_pct", "spread_pct", "depth_ratio_score", "p_drawdown",
-    "market_phase_confidence", "category_code",
+    "market_phase_confidence", "side_code", "category_code",
 )
 
 MODEL_FEATURE_NAMES = tuple(name for name in FEATURE_NAMES if name != "category_code")
@@ -79,6 +79,7 @@ FEATURE_PATHS = {
     "market_phase_confidence": (
         "market_phase_confidence", "market_phase.confidence",
     ),
+    "side_code": ("side_code",),
 }
 
 
@@ -112,6 +113,7 @@ def _first_number(sources: Iterable[Mapping[str, Any]], paths: tuple[str, ...]) 
 def extract_feature_payload(
     *sources: Mapping[str, Any] | None,
     category: str | None = None,
+    side: str | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     usable_sources: list[Mapping[str, Any]] = []
     for source in sources:
@@ -124,7 +126,11 @@ def extract_feature_payload(
     values: dict[str, float] = {}
     present: list[str] = []
     for name in MODEL_FEATURE_NAMES:
-        value = _first_number(usable_sources, FEATURE_PATHS[name])
+        if name == "side_code" and side:
+            normalized_side = str(side).upper()
+            value = 1.0 if normalized_side == "LONG" else -1.0 if normalized_side == "SHORT" else None
+        else:
+            value = _first_number(usable_sources, FEATURE_PATHS[name])
         if value is None:
             values[name] = 0.0
         else:
@@ -144,11 +150,19 @@ def extract_feature_payload(
     return values, quality
 
 
-def canonical_features(features: dict, category: str | None = None) -> dict[str, float]:
-    values, _ = extract_feature_payload(features or {}, category=category)
+def canonical_features(
+    features: dict,
+    category: str | None = None,
+    side: str | None = None,
+) -> dict[str, float]:
+    values, _ = extract_feature_payload(features or {}, category=category, side=side)
     return values
 
 
-def vectorize(features: dict, category: str | None = None) -> list[float]:
-    values = canonical_features(features, category)
+def vectorize(
+    features: dict,
+    category: str | None = None,
+    side: str | None = None,
+) -> list[float]:
+    values = canonical_features(features, category, side)
     return [values[name] for name in FEATURE_NAMES]

@@ -1449,7 +1449,7 @@ def _live_position_management_fields(state: dict | None) -> dict:
     elif not number("initial_quantity") or not number("initial_stop_loss") or not number("atr_value"):
         roll_status = "state_incomplete"
     elif not bool(state.get("tp1_hit")):
-        roll_status = "waiting_tp1"
+        roll_status = "waiting_tp1_or_continuation"
     else:
         roll_status = "waiting_1_5r"
 

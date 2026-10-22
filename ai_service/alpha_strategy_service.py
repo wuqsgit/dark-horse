@@ -11,7 +11,7 @@ from ai_service.alpha_features_v3 import (
     FEATURE_SCHEMA_VERSION,
     vectorize_alpha_features,
 )
-from ai_service.config import MODEL_DIR
+from ai_service.config import MAX_TRAINING_SAMPLES, MODEL_DIR
 from ai_service.model import XGBoostBackend
 
 STAGES = {"setup", "trigger", "acceptance", "retest"}
@@ -408,6 +408,7 @@ class AlphaStrategyService:
         samples = self.store.labeled_alpha_strategy_samples(
             model_key=sample_model_key,
             target=target_key,
+            limit=MAX_TRAINING_SAMPLES,
         )
         samples = [
             row for row in samples

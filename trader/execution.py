@@ -3123,12 +3123,17 @@ class ExecutionEngine:
                 block(f"market_phase_{phase_name or 'unknown'}")
                 continue
 
+            continuation_confirmed, continuation_reason = self._roll_profile_allowed(
+                hist, latest, raw,
+            )
+
             decision = evaluate_roll(
                 {**pos, "strategy_source": strategy_source, "alpha_profile": hist.get("alpha_profile")},
                 hist,
                 tech,
                 alpha_sync=alpha_sync,
                 config=cfg,
+                continuation_confirmed=continuation_confirmed,
             )
             current_layer = int(hist.get("roll_layer") or 0)
             if explosive_position and current_layer >= 1:
@@ -3182,9 +3187,15 @@ class ExecutionEngine:
             entry_price = float(pos.get("entry_price") or 0)
             blended_entry = ((entry_price * current_qty) + (mark_price * add_qty)) / (current_qty + add_qty)
             stop_price = calculate_protected_stop(side, blended_entry, cfg)
+            roll_confirmation = (
+                continuation_reason
+                if decision.trigger_mode == "fresh_continuation"
+                else "tp1_confirmed"
+            )
             reason = (
-                f"roll_add_layer_{next_layer}: tp1_confirmed current_r={decision.current_r:.2f} "
-                f"trigger={decision.trigger_mode or 'profit'} trend_confirmed"
+                f"roll_add_layer_{next_layer}: current_r={decision.current_r:.2f} "
+                f"trigger={decision.trigger_mode or 'profit'} trend_confirmed "
+                f"profile={roll_confirmation}"
             )
             planned_actions[:] = [
                 a for a in planned_actions

@@ -26,6 +26,7 @@ class AIFeatureExtractionTest(unittest.TestCase):
                 },
             },
             category="large_cap",
+            side="SHORT",
         )
 
         self.assertEqual(features["score"], 78)
@@ -33,6 +34,7 @@ class AIFeatureExtractionTest(unittest.TestCase):
         self.assertEqual(features["entry_alpha"], 72)
         self.assertEqual(features["oi_change_pct"], 0.06)
         self.assertEqual(features["market_phase_confidence"], 80)
+        self.assertEqual(features["side_code"], -1.0)
         self.assertEqual(quality["schema_version"], FEATURE_SCHEMA_VERSION)
         self.assertGreaterEqual(quality["present_count"], 12)
 

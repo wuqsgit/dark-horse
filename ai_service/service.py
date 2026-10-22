@@ -7,6 +7,7 @@ from ai_service.config import (
     ALLOW_THRESHOLD,
     ESTIMATED_COST_R,
     MAX_LIVE_POSITION_FACTOR,
+    MAX_TRAINING_SAMPLES,
     MIN_FEATURE_COVERAGE,
     MIN_TRAINING_SAMPLES,
     MIN_USABLE_FEATURES,
@@ -84,7 +85,9 @@ class EntryQualityService:
 
     def evaluate(self, candidate: dict) -> dict:
         features, inferred_quality = extract_feature_payload(
-            candidate.get("features") or {}, category=candidate.get("category"),
+            candidate.get("features") or {},
+            category=candidate.get("category"),
+            side=candidate.get("side"),
         )
         quality = candidate.get("feature_quality") or inferred_quality
         sample = {
@@ -109,7 +112,7 @@ class EntryQualityService:
                 "quality_score": None, "model_version": None, "target_margin_pct": None,
                 "expected_r": None, "position_factor": None,
                 "reasons": [
-                    "collecting feature schema v2 samples"
+                    f"collecting feature schema v{FEATURE_SCHEMA_VERSION} samples"
                     if metadata and model_schema != FEATURE_SCHEMA_VERSION
                     else "model is collecting labeled samples"
                 ],
@@ -186,13 +189,20 @@ class EntryQualityService:
         received = len(candidates or [])
         created = 0
         for candidate in candidates or []:
-            features = canonical_features(candidate.get("features") or {}, candidate.get("category"))
+            features = canonical_features(
+                candidate.get("features") or {},
+                candidate.get("category"),
+                candidate.get("side"),
+            )
             _, was_created = self.store.add_sample({**candidate, "features": features})
             created += int(was_created)
         return {"received": received, "created": created, "duplicates": received - created}
 
     def train(self, model_key: str) -> dict:
-        all_samples = self.store.labeled_samples(model_key)
+        all_samples = self.store.labeled_samples(
+            model_key,
+            limit=MAX_TRAINING_SAMPLES,
+        )
         samples = [
             row for row in all_samples
             if int(row.get("feature_schema_version") or 1) == FEATURE_SCHEMA_VERSION

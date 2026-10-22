@@ -199,6 +199,32 @@ class SimpleRollPlanningTest(unittest.TestCase):
         self.assertAlmostEqual(actions[0]["current_r"], 2.0)
         update.assert_called()
 
+    def test_builds_first_roll_before_tp1_for_fresh_high_score_continuation(self):
+        engine = ExecutionEngine(RollPlanningExchange())
+        engine._record_decision = lambda *args, **kwargs: None
+        position = {
+            "symbol": "BTCUSDT", "side": "LONG", "quantity": 6,
+            "entry_price": 100, "mark_price": 104, "leverage": 3,
+            "unrealized_pnl": 24,
+        }
+        state = {
+            "position_id": "p1", "strategy_source": "normal",
+            "initial_quantity": 10, "initial_stop_loss": 95, "atr_value": 2,
+            "tp1_hit": 0, "roll_layer": 0,
+        }
+        scores = [{
+            "symbol": "BTCUSDT", "composite_score": 80,
+            "raw_features": {"technical": {"ema20": 102, "ema20_slope": 1.2}},
+        }]
+
+        with patch("shared.db.get_position_history", return_value=state), \
+             patch("shared.db.update_position_management"):
+            actions = engine._build_roll_actions(scores, [position], [], 5000, run_id="run1")
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["roll_layer"], 1)
+        self.assertIn("trigger=fresh_continuation", actions[0]["reason"])
+
     def test_range_market_phase_allows_roll_when_trend_confirms(self):
         engine = ExecutionEngine(RollPlanningExchange())
         engine._record_decision = lambda *args, **kwargs: None

@@ -82,7 +82,7 @@ def build_strategy_worker():
         )
     )
     ai_client = AlphaStrategyAIClient(
-        timeout_seconds=float(cfg.get("ai_timeout_ms", 300)) / 1000.0,
+        timeout_seconds=float(cfg.get("ai_timeout_ms", 5000)) / 1000.0,
     )
     return AlphaStrategyWorker(
         ai_evaluate=ai_client.evaluate,

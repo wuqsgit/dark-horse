@@ -12,6 +12,7 @@ from trader.execution import _position_r_state
 CONFIG = {
     "max_layers": 3,
     "trigger_r": 1.5,
+    "continuation_min_r": 0.75,
     "layer_trigger_r": [1.5, 2.5, 3.5],
     "add_initial_qty_pct": 0.25,
     "layer_add_initial_qty_pct": [0.25, 0.20, 0.15],
@@ -49,7 +50,7 @@ class RollPolicyTest(unittest.TestCase):
         self.assertFalse(decision.eligible)
         self.assertEqual(decision.status, "roll_state_incomplete")
 
-    def test_tp1_must_be_confirmed(self):
+    def test_tp1_or_fresh_continuation_must_be_confirmed(self):
         decision = evaluate_roll(
             {"side": "LONG", "entry_price": 100, "mark_price": 110},
             complete_state(tp1_hit=0),
@@ -57,7 +58,34 @@ class RollPolicyTest(unittest.TestCase):
             alpha_sync=True,
             config=CONFIG,
         )
-        self.assertEqual(decision.status, "waiting_tp1")
+        self.assertEqual(decision.status, "waiting_tp1_or_continuation")
+
+    def test_fresh_continuation_can_roll_before_tp1(self):
+        decision = evaluate_roll(
+            {"side": "LONG", "entry_price": 100, "mark_price": 104},
+            complete_state(tp1_hit=0),
+            {"ema20": 102, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config=CONFIG,
+            continuation_confirmed=True,
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertAlmostEqual(decision.current_r, 0.8)
+        self.assertEqual(decision.trigger_mode, "fresh_continuation")
+
+    def test_fresh_continuation_below_profit_buffer_cannot_roll(self):
+        decision = evaluate_roll(
+            {"side": "LONG", "entry_price": 100, "mark_price": 103.5},
+            complete_state(tp1_hit=0),
+            {"ema20": 102, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config=CONFIG,
+            continuation_confirmed=True,
+        )
+
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.status, "waiting_tp1_or_continuation")
 
     def test_profit_must_reach_one_and_half_r(self):
         decision = evaluate_roll(
