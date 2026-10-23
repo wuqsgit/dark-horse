@@ -325,6 +325,9 @@ async def _account_trading_loop(account):
                             "run_id": run_id,
                             "action_count": len(actions),
                             "error_count": len(execution_errors),
+                            "decision_mode": engine.cfg.get(
+                                "entry_decision_mode", "rules"
+                            ),
                         },
                     )
                 else:
@@ -338,6 +341,9 @@ async def _account_trading_loop(account):
                             "position_count": len(positions),
                             "action_count": len(actions),
                             "open_action_count": sum(a.get("action") == "open" for a in actions),
+                            "decision_mode": engine.cfg.get(
+                                "entry_decision_mode", "rules"
+                            ),
                         },
                     )
             else:
@@ -352,6 +358,9 @@ async def _account_trading_loop(account):
                         "position_count": len(positions),
                         "action_count": 0,
                         "open_action_count": 0,
+                        "decision_mode": engine.cfg.get(
+                            "entry_decision_mode", "rules"
+                        ),
                         "message": "策略正常运行，当前没有满足条件的开仓。",
                     },
                 )

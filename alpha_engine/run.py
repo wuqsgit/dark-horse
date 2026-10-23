@@ -37,7 +37,13 @@ async def score_alpha():
             upsert_service_runtime_status(
                 "alpha_engine",
                 status="ok",
-                details={"scored_count": len(rows), "strategy_mode": ALPHA_STRATEGY_CFG.get("mode")},
+                details={
+                    "scored_count": len(rows),
+                    "strategy_mode": ALPHA_STRATEGY_CFG.get("mode"),
+                    "decision_mode": ALPHA_STRATEGY_CFG.get(
+                        "decision_mode", "rules"
+                    ),
+                },
             )
         else:
             upsert_service_runtime_status(
@@ -45,7 +51,12 @@ async def score_alpha():
                 status="degraded",
                 error_code="alpha_scores_empty",
                 last_error="Alpha 策略没有生成评分结果。",
-                details={"strategy_mode": ALPHA_STRATEGY_CFG.get("mode")},
+                details={
+                    "strategy_mode": ALPHA_STRATEGY_CFG.get("mode"),
+                    "decision_mode": ALPHA_STRATEGY_CFG.get(
+                        "decision_mode", "rules"
+                    ),
+                },
             )
     except Exception as exc:
         logger.error("Alpha scoring failed: %s", exc, exc_info=True)
@@ -132,6 +143,9 @@ async def process_alpha_strategy(worker):
                     "applied": result["applied"],
                     "skipped": result["skipped"],
                     "strategy_mode": ALPHA_STRATEGY_CFG.get("mode"),
+                    "decision_mode": ALPHA_STRATEGY_CFG.get(
+                        "decision_mode", "rules"
+                    ),
                 },
             )
     except Exception as exc:
