@@ -256,6 +256,8 @@ class CandidateSelector:
         scored_symbols: list,
         current_positions: list,
         max_positions: int = 3,
+        *,
+        enforce_category_limit: bool = True,
     ) -> list:
         pos_symbols = {p["symbol"].upper() for p in current_positions}
         category_limit = max(
@@ -304,7 +306,10 @@ class CandidateSelector:
         category_counts = dict(occupied_categories)
         for row in available:
             category = row["selection_category"]
-            if category_counts.get(category, 0) >= category_limit:
+            if (
+                enforce_category_limit
+                and category_counts.get(category, 0) >= category_limit
+            ):
                 continue
             selected.append(row)
             category_counts[category] = category_counts.get(category, 0) + 1

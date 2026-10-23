@@ -89,6 +89,7 @@ def build_strategy_worker():
         machine=machine,
         mode=cfg.get("mode", "shadow"),
         market_env=cfg.get("market_env", "mainnet"),
+        decision_mode=cfg.get("decision_mode", "rules"),
         testnet_live_rule_fallback=bool(
             cfg.get("testnet_live_rule_fallback", False)
         ),

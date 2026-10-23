@@ -23,8 +23,11 @@ _load_local_env()
 _DEFAULT_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
 
 TRADING_CONFIG = {
-    # AI scores entry quality and records evidence by default. Rule strategies
-    # retain final order authority unless explicitly switched back to enforce.
+    # Live orders are rule-driven by default. AI services may continue training
+    # independently, but are not called from the trading decision path.
+    "entry_decision_mode": os.getenv(
+        "ENTRY_DECISION_MODE", "rules"
+    ).strip().lower(),
     "ai_entry_policy": os.getenv("AI_ENTRY_POLICY", "advisory").strip().lower(),
     # ── 资金管理 ──
     "total_capital": 5000,
@@ -343,6 +346,9 @@ TRADING_CONFIG = {
         "enabled": os.getenv("ALPHA_STRATEGY_V2_ENABLED", "false").lower()
         in ("1", "true", "yes", "on"),
         "mode": os.getenv("ALPHA_STRATEGY_V2_MODE", "shadow").strip().lower(),
+        "decision_mode": os.getenv(
+            "ALPHA_V2_DECISION_MODE", "rules"
+        ).strip().lower(),
         "market_env": os.getenv(
             "ALPHA_FUTURES_MARKET_ENV",
             "mainnet",

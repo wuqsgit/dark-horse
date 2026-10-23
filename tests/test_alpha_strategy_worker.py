@@ -208,6 +208,33 @@ class AlphaStrategyWorkerTest(unittest.TestCase):
         self.assertEqual(result.transition.action_type.value, "PROBE_LONG")
         self.assertEqual(result.transition.max_position_factor, 0.5)
 
+    def test_rule_mode_does_not_call_ai_and_advances_state_machine(self):
+        base = _snapshot()
+        worker = AlphaStrategyWorker(
+            ai_evaluate=lambda _payload: self.fail("AI must not run in rule mode"),
+            mode="mainnet_live",
+            market_env="mainnet",
+            decision_mode="rules",
+        )
+        features = {
+            **base.features,
+            "ret_15m": 3.0,
+            "quote_volume_ratio_15m": 2.2,
+            "close_location": 0.80,
+            "upper_wick_ratio": 0.10,
+            "breakout_distance_pct": 0.8,
+            "price_efficiency_score": 70,
+        }
+
+        result = worker.process_snapshot(replace(base, features=features))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.transition.action_type, ActionType.PROBE_LONG)
+        self.assertEqual(
+            result.transition.model_versions,
+            {"rules": "alpha-v2-rules-v1"},
+        )
+
     def test_rule_fallback_emits_normal_probe_on_same_setup_bar(self):
         base = _snapshot()
         worker = AlphaStrategyWorker(

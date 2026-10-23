@@ -80,6 +80,9 @@ class PortfolioCategoryLimitTest(unittest.TestCase):
              patch.object(CandidateSelector, "_load_token_map", return_value={}):
             selector = CandidateSelector()
         selector._opportunity_score = lambda row: row["composite_score"]
+        selector._directional_opportunity_score = (
+            lambda row, side=None: row["composite_score"]
+        )
 
         selected = selector.select_candidates(rows, [], max_positions=7)
         symbols = [row["symbol"] for row in selected]
@@ -88,6 +91,30 @@ class PortfolioCategoryLimitTest(unittest.TestCase):
         self.assertNotIn("ETHUSDT", symbols)
         self.assertNotIn("PAXGUSDT", symbols)
         self.assertNotIn("OPUSDT", symbols)
+
+    def test_candidate_selector_can_build_a_deep_pool_for_rule_backfill(self):
+        rows = [
+            {"symbol": symbol, "composite_score": 100 - index}
+            for index, symbol in enumerate(
+                ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BCHUSDT", "PAXGUSDT"]
+            )
+        ]
+        with patch.object(CandidateSelector, "_load_blacklist", return_value=set()), \
+             patch.object(CandidateSelector, "_load_token_map", return_value={}):
+            selector = CandidateSelector()
+        selector._opportunity_score = lambda row: row["composite_score"]
+        selector._directional_opportunity_score = (
+            lambda row, side=None: row["composite_score"]
+        )
+
+        selected = selector.select_candidates(
+            rows,
+            [],
+            max_positions=5,
+            enforce_category_limit=False,
+        )
+
+        self.assertEqual(len(selected), 5)
 
     def test_execution_rechecks_category_before_submitting_order(self):
         engine = ExecutionEngine(ExistingCorePositionExchange())

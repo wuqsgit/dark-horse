@@ -254,22 +254,23 @@ async def _account_trading_loop(account):
             strategy_v2 = engine.cfg.get("alpha_strategy_v2") or {}
             actions = _filter_legacy_alpha_entries(actions, strategy_v2)
             actions = _filter_account_entry_actions(actions, account)
-            observation = observe_entry_quality_candidates(
-                actions,
-                top_symbols,
-                account_id=account["id"],
-            )
-            if observation.get("sent"):
-                logger.info("AI learning candidates observed: %s", observation["sent"])
-            actions = _filter_account_entry_actions(actions, account)
-            actions = apply_entry_quality_gate(
-                actions,
-                top_symbols,
-                balance=balance,
-                exchange=ex,
-                account_id=account["id"],
-                policy=engine.cfg.get("ai_entry_policy", "advisory"),
-            )
+            rule_only = engine.cfg.get("entry_decision_mode", "rules") == "rules"
+            if not rule_only:
+                observation = observe_entry_quality_candidates(
+                    actions,
+                    top_symbols,
+                    account_id=account["id"],
+                )
+                if observation.get("sent"):
+                    logger.info("AI learning candidates observed: %s", observation["sent"])
+                actions = apply_entry_quality_gate(
+                    actions,
+                    top_symbols,
+                    balance=balance,
+                    exchange=ex,
+                    account_id=account["id"],
+                    policy=engine.cfg.get("ai_entry_policy", "advisory"),
+                )
             alpha_actions = alpha_signal_consumer.build_actions(
                 account=account,
                 positions=positions,
@@ -279,21 +280,22 @@ async def _account_trading_loop(account):
                 planned_actions=actions,
             )
             alpha_actions = _filter_account_entry_actions(alpha_actions, account)
-            alpha_observation = observe_entry_quality_candidates(
-                alpha_actions,
-                top_symbols,
-                account_id=account["id"],
-            )
-            if alpha_observation.get("sent"):
-                logger.info("AI alpha candidates observed: %s", alpha_observation["sent"])
-            alpha_actions = apply_entry_quality_gate(
-                alpha_actions,
-                top_symbols,
-                balance=balance,
-                exchange=ex,
-                account_id=account["id"],
-                policy=engine.cfg.get("ai_entry_policy", "advisory"),
-            )
+            if not rule_only:
+                alpha_observation = observe_entry_quality_candidates(
+                    alpha_actions,
+                    top_symbols,
+                    account_id=account["id"],
+                )
+                if alpha_observation.get("sent"):
+                    logger.info("AI alpha candidates observed: %s", alpha_observation["sent"])
+                alpha_actions = apply_entry_quality_gate(
+                    alpha_actions,
+                    top_symbols,
+                    balance=balance,
+                    exchange=ex,
+                    account_id=account["id"],
+                    policy=engine.cfg.get("ai_entry_policy", "advisory"),
+                )
             actions.extend(alpha_actions)
 
             # 3.5 按类别打印评分排序 + 未开仓原因

@@ -65,6 +65,7 @@ class AlphaStrategyWorker:
         machine: AlphaStrategyStateMachine | None = None,
         mode: str = "shadow",
         market_env: str = "mainnet",
+        decision_mode: str = "ai",
         testnet_live_rule_fallback: bool = False,
         recovery_max_bars: int = 96,
     ):
@@ -72,10 +73,15 @@ class AlphaStrategyWorker:
         self.machine = machine or AlphaStrategyStateMachine()
         self.mode = str(mode or "shadow").lower()
         self.market_env = str(market_env or "mainnet").lower()
+        self.decision_mode = str(decision_mode or "rules").lower()
         self.testnet_live_rule_fallback = bool(testnet_live_rule_fallback)
         self.recovery_max_bars = max(0, int(recovery_max_bars))
         if self.mode not in ALLOWED_MODES:
             raise ValueError(f"unsupported Alpha Strategy mode: {self.mode}")
+        if self.decision_mode not in {"rules", "ai"}:
+            raise ValueError(
+                f"unsupported Alpha Strategy decision mode: {self.decision_mode}"
+            )
         if self.market_env != "mainnet":
             raise ValueError(
                 "Alpha Strategy market_env must be mainnet"
@@ -160,6 +166,14 @@ class AlphaStrategyWorker:
         }
         if recovery:
             prediction = self._recovery_prediction(setup.score, trigger)
+        elif self.decision_mode == "rules":
+            prediction = self._rule_prediction(
+                {},
+                setup_score=setup.score,
+                setup_type=setup_name,
+                trigger=trigger,
+                stage=stage,
+            )
         else:
             try:
                 prediction = dict(self.ai_evaluate(payload) or {})
@@ -724,6 +738,23 @@ class AlphaStrategyWorker:
         )
         if not allow_rule_fallback:
             return prediction
+        return self._rule_prediction(
+            prediction,
+            setup_score=setup_score,
+            setup_type=setup_type,
+            trigger=trigger,
+            stage=stage,
+        )
+
+    @staticmethod
+    def _rule_prediction(
+        prediction: dict,
+        *,
+        setup_score: float,
+        setup_type: str | None,
+        trigger,
+        stage: str,
+    ) -> dict:
         followthrough = 0.0
         fakeout = 0.5
         if trigger.trigger_detected:
@@ -741,11 +772,6 @@ class AlphaStrategyWorker:
             max_position_factor = 0.70
         elif trigger.retest_confirmed:
             max_position_factor = 1.0
-        fallback_name = (
-            "rule-live-v1"
-            if self.mode == "testnet_live"
-            else "rule-shadow-v1"
-        )
         return {
             **prediction,
             "status": "rule_shadow",
@@ -755,10 +781,10 @@ class AlphaStrategyWorker:
             "p_fakeout": fakeout,
             "expected_r": max(0.0, followthrough - fakeout),
             "max_position_factor": max_position_factor,
-            "model_versions": {"fallback": fallback_name},
+            "model_versions": {"rules": "alpha-v2-rules-v1"},
             "reasons": [
                 *(prediction.get("reasons") or []),
-                "AI model collecting; bounded rule probability used",
+                "deterministic rule probability used",
             ],
         }
 

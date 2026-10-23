@@ -3570,8 +3570,12 @@ class ExecutionEngine:
         if avail > 0 and normal_enabled:
             selector = CandidateSelector()
             normal_slots = max(0, avail - bluechip_reserve)
+            candidate_pool_size = max(24, normal_slots * 8)
             candidates = selector.select_candidates(
-                top_symbols, current_positions, max_positions=normal_slots
+                top_symbols,
+                current_positions,
+                max_positions=candidate_pool_size,
+                enforce_category_limit=False,
             )
             
             trading = self._get_trading_symbols()
