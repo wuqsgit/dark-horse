@@ -602,6 +602,25 @@ def _explosive_reentry_allowed(cooldown, score, min_score=88.0):
     return "profit_lock" in reason and "stop" not in reason
 
 
+def _is_v2_confirmed_position(hist):
+    hist = hist or {}
+    return (
+        str(hist.get("signal_source") or "").lower() == "alpha_strategy_v2"
+        and str(hist.get("alpha_entry_level") or "").lower() == "confirm_long"
+    )
+
+
+def _is_explosive_runner_position(hist, runner_cfg):
+    hist = hist or {}
+    score = float(hist.get("alpha_score") or hist.get("entry_score") or 0)
+    if _is_v2_confirmed_position(hist):
+        return score >= float(runner_cfg.get("v2_confirm_min_score", 68.0))
+    return (
+        "explosive_breakout" in str(hist.get("entry_reason") or "").lower()
+        and score >= float(runner_cfg.get("min_score", 88.0))
+    )
+
+
 def _write_alpha_post_close_cooldown(
     symbol,
     pnl=0.0,
@@ -1702,15 +1721,20 @@ class ExecutionEngine:
         leverage = max(float(pos.get("leverage") or 1), 1.0)
         entry_price = float(pos.get("entry_price") or 0)
         quantity = abs(float(pos.get("quantity") or 0))
+        v2_confirmed = _is_v2_confirmed_position(hist)
         explosive_position = (
             "explosive_breakout" in str(hist.get("entry_reason") or "").lower()
+            or v2_confirmed
         )
         explosive_runner = (
             bool(runner_cfg.get("enabled", True))
-            and explosive_position
-            and entry_score >= float(runner_cfg.get("min_score", 88.0))
+            and _is_explosive_runner_position(hist, runner_cfg)
         )
-        grace_minutes = float(runner_cfg.get("grace_minutes", 60))
+        grace_minutes = float(
+            runner_cfg.get("v2_confirm_grace_minutes", 240)
+            if v2_confirmed
+            else runner_cfg.get("grace_minutes", 60)
+        )
         explosive_grace = bool(
             explosive_runner
             and age_h is not None
@@ -1866,21 +1890,22 @@ class ExecutionEngine:
             )
 
         r_state = _position_r_state(side, pos.get("entry_price"), mark_price, hist, atr, highest_price=highest_price)
-        try:
-            from shared.db import update_position_management
+        if not explosive_grace:
+            try:
+                from shared.db import update_position_management
 
-            update_position_management(
-                sym,
-                stop_model=hist.get("stop_model") or "atr_clamped_legacy_default",
-                stop_pct=r_state.get("stop_pct"),
-                current_stop_loss=r_state.get("current_stop_loss"),
-                trailing_stop_price=r_state.get("trailing_stop_price"),
-                trailing_enabled=1 if r_state.get("trailing_enabled") else 0,
-                r_multiple=round(float(r_state.get("r_multiple") or 0), 3),
-            )
-        except Exception:
-            pass
-        if r_state.get("stop_triggered"):
+                update_position_management(
+                    sym,
+                    stop_model=hist.get("stop_model") or "atr_clamped_legacy_default",
+                    stop_pct=r_state.get("stop_pct"),
+                    current_stop_loss=r_state.get("current_stop_loss"),
+                    trailing_stop_price=r_state.get("trailing_stop_price"),
+                    trailing_enabled=1 if r_state.get("trailing_enabled") else 0,
+                    r_multiple=round(float(r_state.get("r_multiple") or 0), 3),
+                )
+            except Exception:
+                pass
+        if not explosive_grace and r_state.get("stop_triggered"):
             r_multiple = float(r_state.get("r_multiple") or 0)
             stop_kind = "alpha_structure_1r_stop" if r_multiple < 1 else "alpha_trailing_stop"
             return add(
@@ -1923,6 +1948,12 @@ class ExecutionEngine:
             return add("alpha_TP2 r>=2", score=entry_score, action="partial_close", close_pct=0.25)
         if float(r_state.get("r_multiple") or 0) >= 1 and not int(hist.get("tp1_hit") or 0):
             return add("alpha_TP1 r>=1", score=entry_score, action="partial_close", close_pct=0.20)
+
+        # A confirmed V2 breakout can retest violently before the main move.
+        # During grace, only the exchange structural stop and emergency margin
+        # stop may close the runner; noisy software exits remain disabled.
+        if v2_confirmed and explosive_grace:
+            return None
 
         hold_reason = None
         if not ctx:

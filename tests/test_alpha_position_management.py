@@ -399,6 +399,75 @@ class AlphaPositionManagementTest(unittest.TestCase):
 
         self.assertIsNone(action)
 
+    def test_v2_confirmed_runner_survives_birb_style_deep_retest(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management") as update:
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "BIRBUSDT",
+                    "side": "LONG",
+                    "entry_price": 0.0704170744,
+                    "quantity": 2902.0,
+                    "leverage": 2,
+                    "unrealized_pnl": -2.75,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "signal_source": "alpha_strategy_v2",
+                    "alpha_entry_level": "confirm_long",
+                    "entry_reason": "alpha_strategy_v2:confirm_long",
+                    "alpha_score": 72.0,
+                    "initial_stop_loss": 0.064584,
+                    "current_stop_loss": 0.064584,
+                    "stop_pct": 0.082836,
+                    "max_floating_roi": 8.80,
+                },
+                pnl_pct=-3.19,
+                mark_price=0.06929515,
+                close_side="SELL",
+                highest_price=0.07423,
+                atr=0.005357857,
+                age_h=1.02,
+            )
+
+        self.assertIsNone(action)
+        latest = update.call_args_list[-1].kwargs
+        self.assertEqual(latest["alpha_locked_roi"], 0.0)
+        self.assertAlmostEqual(latest["current_stop_loss"], 0.064584)
+
+    def test_v2_confirmed_runner_still_honors_emergency_margin_stop(self):
+        engine = ExecutionEngine(DummyExchange())
+        with patch("shared.db.update_position_management"):
+            action = engine._build_alpha_position_action(
+                pos={
+                    "symbol": "BIRBUSDT",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "quantity": 1.0,
+                    "leverage": 2,
+                    "unrealized_pnl": -11.0,
+                },
+                hist={
+                    "strategy_source": "alpha",
+                    "signal_source": "alpha_strategy_v2",
+                    "alpha_entry_level": "confirm_long",
+                    "alpha_score": 72.0,
+                    "initial_stop_loss": 88.0,
+                    "current_stop_loss": 88.0,
+                    "stop_pct": 0.12,
+                    "max_floating_roi": 8.8,
+                },
+                pnl_pct=-22.0,
+                mark_price=89.0,
+                close_side="SELL",
+                highest_price=104.4,
+                atr=5.0,
+                age_h=1.0,
+            )
+
+        self.assertIsNotNone(action)
+        self.assertIn("emergency_margin_stop", action["reason"])
+
     def test_explosive_stage1_preserves_runner_floor_metadata(self):
         engine = ExecutionEngine(DummyExchange())
         with patch("shared.db.update_position_management"):

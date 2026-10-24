@@ -36,10 +36,21 @@ def evaluate_roll(
     max_layers = int(_number(config.get("max_layers")) or 1)
     if roll_layer >= max_layers:
         return RollDecision(False, "roll_completed")
+    v2_confirmed = (
+        str(state.get("signal_source") or "").lower() == "alpha_strategy_v2"
+        and str(state.get("alpha_entry_level") or "").lower() == "confirm_long"
+    )
+    explosive_min_score = (
+        _number(config.get("explosive_v2_confirm_min_score")) or 68
+        if v2_confirmed
+        else _number(config.get("explosive_min_score")) or 88
+    )
     explosive_position = (
-        "explosive_breakout" in str(state.get("entry_reason") or "").lower()
-        and _number(state.get("alpha_score"))
-        >= (_number(config.get("explosive_min_score")) or 88)
+        (
+            v2_confirmed
+            or "explosive_breakout" in str(state.get("entry_reason") or "").lower()
+        )
+        and _number(state.get("alpha_score")) >= explosive_min_score
     )
     side = str(position.get("side") or "").upper()
     if side == "SHORT":

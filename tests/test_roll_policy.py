@@ -119,6 +119,32 @@ class RollPolicyTest(unittest.TestCase):
         self.assertTrue(decision.eligible)
         self.assertEqual(decision.trigger_mode, "explosive_confirmation")
 
+    def test_v2_confirmed_position_can_add_at_rule_score(self):
+        decision = evaluate_roll(
+            {
+                "side": "LONG",
+                "entry_price": 100,
+                "mark_price": 104,
+                "strategy_source": "alpha",
+            },
+            complete_state(
+                signal_source="alpha_strategy_v2",
+                alpha_entry_level="confirm_long",
+                alpha_score=72,
+                tp1_hit=0,
+            ),
+            {"ema20": 102, "ema20_slope": 1.0},
+            alpha_sync=True,
+            config={
+                **CONFIG,
+                "explosive_trigger_r": 0.75,
+                "explosive_v2_confirm_min_score": 68,
+            },
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.trigger_mode, "explosive_confirmation")
+
     def test_trend_must_match_position_side(self):
         decision = evaluate_roll(
             {"side": "LONG", "entry_price": 100, "mark_price": 110},

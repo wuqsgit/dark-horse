@@ -562,7 +562,11 @@ class AlphaSignalConsumer:
                 "client_order_id": client_id,
                 "skip_entry_quality_gate": True,
                 "run_id": run_id,
-                "reason": f"alpha_strategy_v2:{action_type.lower()}",
+                "reason": (
+                    f"explosive_breakout alpha_strategy_v2:{action_type.lower()}"
+                    if action_type == "CONFIRM_LONG"
+                    else f"alpha_strategy_v2:{action_type.lower()}"
+                ),
                 "category": symbol_risk_category(symbol),
             }
             if position:

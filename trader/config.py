@@ -325,7 +325,11 @@ TRADING_CONFIG = {
             "explosive_runner": {
                 "enabled": True,
                 "min_score": 88.0,
+                # Alpha V2 CONFIRM_LONG has passed multi-bar breakout acceptance.
+                # Keep its structural stop through the first full retest window.
+                "v2_confirm_min_score": 68.0,
                 "grace_minutes": 60,
+                "v2_confirm_grace_minutes": 240,
                 "stage1_close_pct": 0.20,
                 "min_remaining_fraction": 0.40,
                 "pre_runner_giveback_ratio": 0.60,
@@ -411,6 +415,7 @@ TRADING_CONFIG = {
         "min_notional_multiplier": 1.5,
         "explosive_trigger_r": 0.75,
         "explosive_min_score": 88.0,
+        "explosive_v2_confirm_min_score": 68.0,
         "explosive_add_initial_qty_pct": 0.50,
         "explosive_max_total_qty_multiple": 2.0,
     },
