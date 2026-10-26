@@ -154,6 +154,10 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     min_score = max(0.0, min(100.0, base_min_score + _num(symbol_risk.get("min_score_offset"), 0)))
     min_entry_alpha = max(0.0, min(100.0, base_min_entry_alpha + _num(symbol_risk.get("min_entry_alpha_offset"), 0)))
     min_vol = _num(profile.get("volume_multiplier"), 0)
+    probe_min_vol = _num(
+        profile.get("probe_volume_multiplier"),
+        min_vol * 0.75 if min_vol else 0,
+    )
     min_rr = _num(profile.get("min_rr"), 0)
     probe_min_rr = _num(profile.get("probe_min_rr"), 0)
     require_breakout = bool(profile.get("require_breakout"))
@@ -287,7 +291,28 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     confirmations_required = int(profile.get("confirmations_required_for_full_entry") or 0)
 
     if not hard_missing:
-        if profile.get("allow_probe") and confirmations_required and confirmation_count < confirmations_required:
+        misses_full_size_quality = (
+            (min_vol and not volume_ok)
+            or (min_rr and rr_used < min_rr)
+        )
+        probe_quality_ok = (
+            (not probe_min_vol or volume_ratio >= probe_min_vol)
+            and (not probe_min_rr or rr_used >= probe_min_rr)
+        )
+        if profile.get("allow_probe") and misses_full_size_quality:
+            if probe_quality_ok:
+                status = "probe"
+                reason = (
+                    f"{profile['template_name']}基础条件成立，但量能或正常仓盈亏比不足，"
+                    "只允许小仓试探。"
+                )
+            elif profile.get("allow_observe_only"):
+                status = "observe"
+                reason = f"{profile['template_name']}量能或试探仓盈亏比不足，继续观察。"
+            else:
+                status = "block"
+                reason = f"{profile['template_name']}量能或盈亏比不足，暂不开仓。"
+        elif profile.get("allow_probe") and confirmations_required and confirmation_count < confirmations_required:
             status = "probe"
             reason = f"{profile['template_name']}基础条件成立，但确认不足，只允许小仓试探。"
         else:
@@ -353,6 +378,7 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
             "effective_min_score": min_score,
             "effective_min_entry_alpha": min_entry_alpha,
             "volume_multiplier": profile.get("volume_multiplier"),
+            "probe_volume_multiplier": probe_min_vol,
             "min_rr": profile.get("min_rr"),
             "probe_min_rr": profile.get("probe_min_rr"),
             "require_breakout": require_breakout,

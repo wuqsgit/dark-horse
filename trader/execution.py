@@ -68,13 +68,12 @@ def _score_layer_gate(row, entry_profile, side=None):
     max_risk = float(thresholds.get("max_risk_score") or 100)
     min_exec = float(thresholds.get("min_execution_score") or 0)
     status = entry_profile.get("status")
-    is_short = str(side or "").upper() == "SHORT"
-    if not is_short and opportunity < min_opp:
+    if opportunity < min_opp:
         return False, f"opportunity_score {opportunity:.1f} < {min_opp:.1f}", score_layers
     if risk > max_risk:
         return False, f"risk_score {risk:.1f} > {max_risk:.1f}", score_layers
     required_entry = probe_min_entry if status == "probe" else min_entry
-    if not is_short and entry < required_entry:
+    if entry < required_entry:
         return False, f"entry_score {entry:.1f} < {required_entry:.1f}", score_layers
     if execution < min_exec:
         return False, f"execution_score {execution:.1f} < {min_exec:.1f}", score_layers
@@ -2544,6 +2543,89 @@ class ExecutionEngine:
                 if alpha_action:
                     actions.append(alpha_action)
                 continue
+
+            profit_cfg = self.cfg.get("normal_profit_lock") or {}
+            if bool(profit_cfg.get("enabled", True)):
+                peak_price = lowest_price if str(side).upper() == "SHORT" else highest_price
+                derived_peak_roi = max(
+                    _price_return_pct(side, entry_price, peak_price) * leverage * 100,
+                    0,
+                )
+                peak_roi = max(
+                    float(hist.get("max_floating_roi") or 0),
+                    float(pnl_pct or 0),
+                    derived_peak_roi,
+                )
+                arm_peak = float(profit_cfg.get("arm_peak_roi", 6.0))
+                stage1_peak = float(profit_cfg.get("stage1_peak_roi", 10.0))
+                stage2_peak = float(profit_cfg.get("stage2_peak_roi", 18.0))
+                locked_roi = max(float(hist.get("normal_locked_roi") or 0), 0)
+                if peak_roi >= arm_peak:
+                    locked_roi = max(
+                        locked_roi,
+                        float(profit_cfg.get("arm_lock_roi", 0.5)),
+                    )
+                if peak_roi >= stage1_peak:
+                    locked_roi = max(
+                        locked_roi,
+                        float(profit_cfg.get("stage1_lock_roi", 2.0)),
+                    )
+                if peak_roi >= stage2_peak:
+                    locked_roi = max(
+                        locked_roi,
+                        float(profit_cfg.get("stage2_lock_roi", 6.0)),
+                    )
+                locked_stop = _roi_stop_price(
+                    side, entry_price, leverage, locked_roi
+                )
+                protected_stop = _ratchet_stop(
+                    side,
+                    hist.get("current_stop_loss"),
+                    locked_stop,
+                    entry_price,
+                )
+                try:
+                    from shared.db import update_position_management
+
+                    update_position_management(
+                        sym,
+                        max_floating_roi=round(peak_roi, 4),
+                        normal_locked_roi=round(locked_roi, 4),
+                        current_stop_loss=protected_stop,
+                    )
+                except Exception:
+                    pass
+                if peak_roi >= arm_peak and pnl_pct <= locked_roi:
+                    add(
+                        "close",
+                        f"normal_profit_lock_exit peak_roi={peak_roi:.2f}% "
+                        f"lock_roi={locked_roi:.2f}% current_roi={pnl_pct:.2f}%",
+                    )
+                    continue
+                if (
+                    pnl_pct > 0
+                    and peak_roi >= stage1_peak
+                    and not int(hist.get("tp1_hit") or 0)
+                ):
+                    add(
+                        "partial_close",
+                        f"normal_profit_lock_TP1 peak_roi={peak_roi:.2f}% "
+                        f"lock_roi={locked_roi:.2f}%",
+                        float(profit_cfg.get("stage1_close_pct", 0.25)),
+                    )
+                    continue
+                if (
+                    pnl_pct > 0
+                    and peak_roi >= stage2_peak
+                    and not int(hist.get("tp2_hit") or 0)
+                ):
+                    add(
+                        "partial_close",
+                        f"normal_profit_lock_TP2 peak_roi={peak_roi:.2f}% "
+                        f"lock_roi={locked_roi:.2f}%",
+                        float(profit_cfg.get("stage2_close_pct", 0.20)),
+                    )
+                    continue
 
             r_multiple = float(r_state.get("r_multiple") or 0)
             if r_state.get("stop_triggered"):

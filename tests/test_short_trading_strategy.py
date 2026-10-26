@@ -122,7 +122,7 @@ class ShortTradingStrategyTest(unittest.TestCase):
         self.assertEqual(selected[0]["symbol"], "SHORTUSDT")
         self.assertEqual(selected[0]["candidate_side"], "SHORT")
 
-    def test_short_score_layer_ignores_long_opportunity_layers(self):
+    def test_short_score_layer_rejects_weak_opportunity_layers(self):
         row = {
             "raw_features": {
                 "score_layers": {
@@ -144,7 +144,23 @@ class ShortTradingStrategyTest(unittest.TestCase):
 
         ok, reason, _ = _score_layer_gate(row, {"status": "pass"}, "SHORT")
 
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok)
+        self.assertIn("opportunity_score", reason)
+
+    def test_short_below_full_volume_and_rr_is_only_probe(self):
+        row = short_row()
+        profile = evaluate_profile_entry(
+            row,
+            {
+                "breakout": {"ok": False, "volume_ratio": 0.9},
+                "rr": {"rr_used": 1.2},
+                "cooldown": {},
+            },
+            "SHORT",
+        )
+
+        self.assertEqual(profile["status"], "probe")
+        self.assertIn("只允许小仓试探", profile["reason"])
 
     def test_breakdown_market_phase_supports_short_only(self):
         long_ok, _, _ = _market_phase_entry_decision(

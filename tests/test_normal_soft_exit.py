@@ -94,6 +94,43 @@ class NormalSoftExitTest(unittest.TestCase):
         self.assertEqual(actions[0]["action"], "close")
         self.assertIn("structure_1r_stop", actions[0]["reason"])
 
+    def test_peak_profit_giveback_closes_before_turning_into_loss(self):
+        engine = ExecutionEngine(SoftExitExchange())
+        engine._record_decision = lambda *args, **kwargs: None
+        engine._pos_tracker["XPINUSDT"] = {
+            "highest_price": 108,
+            "lowest_price": 100,
+            "entry_price": 100,
+        }
+        with patch("shared.db.get_position_history", return_value=state()):
+            actions = engine._build_position_actions(
+                score({"ema20": 101, "ema20_slope": 0.1, "ema20_50_ratio": 1.0}),
+                [position(mark=100.4, pnl=40)],
+                run_id="run1",
+            )
+
+        self.assertEqual(actions[0]["action"], "close")
+        self.assertIn("normal_profit_lock_exit", actions[0]["reason"])
+
+    def test_peak_profit_stage_one_reduces_and_protects_position(self):
+        engine = ExecutionEngine(SoftExitExchange())
+        engine._record_decision = lambda *args, **kwargs: None
+        engine._pos_tracker["XPINUSDT"] = {
+            "highest_price": 110,
+            "lowest_price": 100,
+            "entry_price": 100,
+        }
+        with patch("shared.db.get_position_history", return_value=state()):
+            actions = engine._build_position_actions(
+                score({"ema20": 105, "ema20_slope": 1.0, "ema20_50_ratio": 1.01}),
+                [position(mark=110, pnl=1000)],
+                run_id="run1",
+            )
+
+        self.assertEqual(actions[0]["action"], "partial_close")
+        self.assertEqual(actions[0]["close_pct"], 0.25)
+        self.assertIn("normal_profit_lock_TP1", actions[0]["reason"])
+
     def test_weak_structure_at_minus_half_r_exits_early(self):
         actions = self._actions({
             "ema20": 101, "ema20_slope": -1.0, "ema20_50_ratio": 0.98,

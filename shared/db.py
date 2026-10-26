@@ -1569,6 +1569,7 @@ def init_db():
         "alpha_volume_protect_time": "TEXT",
         "alpha_profit_lock_stage": "INTEGER DEFAULT 0",
         "alpha_locked_roi": "REAL DEFAULT 0",
+        "normal_locked_roi": "REAL DEFAULT 0",
         "alpha_stall_protect_price": "REAL",
         "alpha_stall_protect_time": "TEXT",
     }.items():
@@ -3770,6 +3771,7 @@ def update_position_management(symbol, **fields):
         "alpha_volume_protect_time",
         "alpha_profit_lock_stage",
         "alpha_locked_roi",
+        "normal_locked_roi",
         "alpha_stall_protect_price",
         "alpha_stall_protect_time",
     }

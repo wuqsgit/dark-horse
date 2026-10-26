@@ -81,6 +81,19 @@ TRADING_CONFIG = {
         "strong_trend_close_pct": 0.20,
         "weak_trend_close_pct": 0.25,
     },
+    "normal_profit_lock": {
+        "enabled": True,
+        # Margin ROI thresholds. This protects normal positions whose
+        # structural 1R stop is intentionally wider than the first profit leg.
+        "arm_peak_roi": 6.0,
+        "arm_lock_roi": 0.5,
+        "stage1_peak_roi": 10.0,
+        "stage1_close_pct": 0.25,
+        "stage1_lock_roi": 2.0,
+        "stage2_peak_roi": 18.0,
+        "stage2_close_pct": 0.20,
+        "stage2_lock_roi": 6.0,
+    },
     "rebalance_interval_min": 5,
     "leverage_max": 8,
     "dynamic_leverage": {
