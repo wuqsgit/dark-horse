@@ -390,11 +390,11 @@ class BinanceFutures:
 
     def adjust_quantity(self, symbol: str, quantity: float) -> float:
         info = self.get_symbol_info(symbol)
-        step = info["step_size"]
+        step = Decimal(str(info["step_size"]))
         if step > 0:
-            precision = len(str(step).split(".")[-1]) if "." in str(step) else 0
-            adjusted = int(quantity / step) * step
-            return round(adjusted, precision)
+            value = Decimal(str(quantity))
+            units = (value / step).to_integral_value(rounding=ROUND_DOWN)
+            return float(units * step)
         return round(quantity, 3)
 
     def adjust_trigger_price(self, symbol: str, side: str, price: float) -> float:

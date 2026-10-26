@@ -22,6 +22,13 @@ class Response:
 
 
 class ExchangeSymbolInfoTest(unittest.TestCase):
+    def test_quantity_adjustment_does_not_drop_an_exact_float_step(self):
+        exchange = BinanceFutures.__new__(BinanceFutures)
+        exchange.get_symbol_info = lambda symbol: {"step_size": 0.1}
+
+        self.assertEqual(exchange.adjust_quantity("AAVEUSDT", 0.6), 0.6)
+        self.assertEqual(exchange.adjust_quantity("AAVEUSDT", 0.634), 0.6)
+
     def test_reads_min_notional_and_tick_size(self):
         exchange = BinanceFutures.__new__(BinanceFutures)
         exchange.base_rest = "https://example.test"
