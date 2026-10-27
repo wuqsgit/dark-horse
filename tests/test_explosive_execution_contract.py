@@ -80,11 +80,20 @@ def explosive_action():
 
 
 class ExplosiveExecutionContractTest(unittest.TestCase):
-    def test_high_risk_watch_remains_hard_blocked_for_explosive_entry(self):
+    def test_high_risk_watch_is_blocked_for_normal_alpha_entry(self):
         self.assertTrue(
             _alpha_profile_is_blocked(
                 "high_risk_watch",
                 {"high_risk_watch"},
+            )
+        )
+
+    def test_high_risk_watch_allows_strict_explosive_entry(self):
+        self.assertFalse(
+            _alpha_profile_is_blocked(
+                "high_risk_watch",
+                {"high_risk_watch"},
+                strict_explosive=True,
             )
         )
 

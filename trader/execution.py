@@ -120,7 +120,14 @@ def _cap_explosive_add_quantity(
     return min(proposed, remaining)
 
 
-def _alpha_profile_is_blocked(profile, blocked_profiles) -> bool:
+def _alpha_profile_is_blocked(
+    profile,
+    blocked_profiles,
+    *,
+    strict_explosive=False,
+) -> bool:
+    if strict_explosive and str(profile or "") == "high_risk_watch":
+        return False
     return str(profile or "") in set(blocked_profiles or ())
 
 
@@ -1226,6 +1233,7 @@ class ExecutionEngine:
         self.account_controls = None
         self._trading_symbols = None
         self.ai_learning_actions = []
+        self.explosive_alerts = []
         # V3.1: simplified in-memory position tracking
         # {symbol: {"highest_price": float, "entry_price": float}}
         self._pos_tracker = {}
@@ -2922,6 +2930,20 @@ class ExecutionEngine:
             soft_gate_factor = 1.0
             soft_gate_reasons = []
 
+            watch_states = {
+                "explosive_volume_watch",
+                "explosive_breakout_pending",
+                "overheated_climax",
+                "overheated_chase",
+                "alpha_oi_collapse",
+            }
+            volume_price_state = str(volume_price.get("state") or "")
+            explosive_watch = (
+                bool(symbol)
+                and symbol in trading
+                and discovery_score >= 85.0
+                and volume_price_state in watch_states
+            )
             def record_candidate(reason=None, status="filtered"):
                 try:
                     upsert_alpha_trade_candidate(
@@ -2983,9 +3005,40 @@ class ExecutionEngine:
             if vp_ttl and age is not None and age > vp_ttl:
                 reject(f"stale volume-price state age={age:.1f}m > {vp_ttl:.0f}m")
                 continue
-            if _alpha_profile_is_blocked(profile, blocked_profiles):
+            if explosive_watch:
+                signal_time = _parse_time(row.get("time")) or datetime.now(timezone.utc)
+                bucket_hour = signal_time.hour - signal_time.hour % 4
+                bucket = signal_time.replace(
+                    hour=bucket_hour,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                ).isoformat().replace("+00:00", "Z")
+                self.explosive_alerts.append(
+                    {
+                        "action": "observe",
+                        "event_type": "explosive_watch",
+                        "setup_id": f"watch:{symbol}:{bucket}",
+                        "symbol": symbol,
+                        "position_side": "LONG",
+                        "entry_price": float(row.get("market_price") or 0),
+                        "quantity": 0,
+                        "score": discovery_score,
+                        "status": "detected",
+                        "signal_state": volume_price_state,
+                        "error": "; ".join(volume_price.get("reasons") or [])[:500],
+                    }
+                )
+            if _alpha_profile_is_blocked(
+                profile,
+                blocked_profiles,
+                strict_explosive=explosive_candidate,
+            ):
                 reject(f"blocked alpha profile: {profile}")
                 continue
+            if explosive_candidate and profile == "high_risk_watch":
+                soft_gate_factor = min(soft_gate_factor, 0.5)
+                soft_gate_reasons.append("high_risk_watch_explosive_half_size")
             if explosive_candidate:
                 if explosive_guard is None:
                     try:
@@ -3630,6 +3683,7 @@ class ExecutionEngine:
     def decide(self, top_symbols: list, current_positions: list, run_id: str | None = None) -> list:
         """Build open, close and partial-close actions."""
         self.ai_learning_actions = []
+        self.explosive_alerts = []
         actions = []
         pos_symbols = {p["symbol"] for p in current_positions}
         balance = self.get_balance()

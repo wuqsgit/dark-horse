@@ -39,6 +39,21 @@ def explosive_result():
     }
 
 
+def explosive_watch():
+    return {
+        "action": "observe",
+        "event_type": "explosive_watch",
+        "setup_id": "watch:AINUSDT:2026-10-26T20:00:00Z",
+        "symbol": "AINUSDT",
+        "position_side": "LONG",
+        "entry_price": 0.05047,
+        "quantity": 0,
+        "score": 87.58,
+        "status": "detected",
+        "signal_state": "explosive_volume_watch",
+    }
+
+
 class ExplosiveFeishuNotificationTest(unittest.TestCase):
     def test_one_explosive_setup_sends_exactly_three_messages(self):
         calls = []
@@ -69,6 +84,22 @@ class ExplosiveFeishuNotificationTest(unittest.TestCase):
         self.assertTrue(notifier.notify(explosive_result()))
         self.assertFalse(notifier.notify(explosive_result()))
         self.assertEqual(len(calls), 3)
+
+    def test_watch_candidate_alerts_before_it_is_allowed_to_open(self):
+        calls = []
+        notifier = ExplosiveFeishuNotifier(
+            webhook="https://open.feishu.cn/example",
+            post=lambda *args, **kwargs: calls.append(kwargs) or FakeResponse(),
+            sleep=lambda seconds: None,
+            thread_factory=ImmediateThread,
+        )
+
+        self.assertTrue(notifier.notify(explosive_watch()))
+        self.assertEqual(len(calls), 3)
+        text = calls[0]["json"]["content"]["text"]
+        self.assertIn("等待严格入场确认", text)
+        self.assertIn("explosive_volume_watch", text)
+        self.assertNotIn("数量：", text)
 
     def test_missing_webhook_and_post_failures_do_not_raise(self):
         missing = ExplosiveFeishuNotifier(webhook="", thread_factory=ImmediateThread)

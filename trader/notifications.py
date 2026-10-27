@@ -17,24 +17,29 @@ def _execution_label(status):
         "ok": "已成功开仓",
         "blocked": "开仓被硬风控阻止",
         "error": "开仓失败",
+        "detected": "已检测爆发候选，等待严格入场确认",
     }.get(str(status or "").lower(), "已生成开仓计划")
 
 
 def _message_text(result: dict, copy_number: int, copies: int) -> str:
     side = "做多" if result.get("position_side") == "LONG" else "做空"
     error = result.get("error") or result.get("data_error")
+    event_type = str(result.get("event_type") or "explosive_breakout")
     lines = [
         f"【爆发行情提醒 {copy_number}/{copies}】",
         f"币种：{result.get('symbol') or '-'}",
         f"方向：{side}",
         f"状态：{_execution_label(result.get('status'))}",
         f"价格：{float(result.get('entry_price') or 0):.8g}",
-        f"数量：{float(result.get('quantity') or 0):.8g}",
         f"Alpha评分：{float(result.get('score') or result.get('alpha_score') or 0):.2f}",
     ]
+    if float(result.get("quantity") or 0) > 0:
+        lines.insert(5, f"数量：{float(result.get('quantity') or 0):.8g}")
+    if result.get("signal_state"):
+        lines.append(f"信号阶段：{result.get('signal_state')}")
     if error:
         lines.append(f"原因：{error}")
-    lines.append("类型：explosive_breakout")
+    lines.append(f"类型：{event_type}")
     return "\n".join(lines)
 
 
@@ -61,7 +66,10 @@ class ExplosiveFeishuNotifier:
         self._lock = threading.Lock()
 
     def notify(self, result: dict) -> bool:
-        if not self.webhook or result.get("event_type") != "explosive_breakout":
+        if not self.webhook or result.get("event_type") not in {
+            "explosive_breakout",
+            "explosive_watch",
+        }:
             return False
         setup_id = str(
             result.get("setup_id")

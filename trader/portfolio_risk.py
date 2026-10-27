@@ -49,11 +49,13 @@ def check_category_position_limit(
 
     if len(occupied) >= limit:
         blocker = ",".join(dict.fromkeys(occupied))
-        if allow_explosive_override:
+        # A strictly confirmed explosive setup may use one additional slot,
+        # but it must not turn the category limit into an unlimited bypass.
+        if allow_explosive_override and len(set(occupied)) < limit + 1:
             return (
                 True,
                 f"category_position_soft_override class={new_category} "
-                f"occupied={blocker} limit={limit}",
+                f"occupied={blocker} limit={limit} explosive_limit={limit + 1}",
             )
         return (
             False,

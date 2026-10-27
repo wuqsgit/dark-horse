@@ -251,6 +251,7 @@ async def _account_trading_loop(account):
                 logger.info("Alpha Strategy V2 recovery: %s", recovery)
                 alpha_signal_recovered = True
             actions = engine.decide(top_symbols, positions, run_id=run_id)
+            notify_explosive_results(engine.explosive_alerts)
             strategy_v2 = engine.cfg.get("alpha_strategy_v2") or {}
             actions = _filter_legacy_alpha_entries(actions, strategy_v2)
             actions = _filter_account_entry_actions(actions, account)
