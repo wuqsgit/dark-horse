@@ -114,8 +114,10 @@ def evaluate_trigger(
         and state.breakout_level is not None
         and current_price is not None
         and current_price >= float(state.breakout_level)
+        and volume_ratio >= 1.5
         and close_location >= 0.55
         and upper_wick <= 0.45
+        and (price_efficiency is None or price_efficiency >= 55)
     )
     pending_hold = bool(
         state
@@ -123,8 +125,10 @@ def evaluate_trigger(
         and state.reference_price is not None
         and current_price is not None
         and current_price >= float(state.reference_price) * 0.995
+        and volume_ratio >= 1.5
         and close_location >= 0.55
         and upper_wick <= 0.45
+        and (price_efficiency is None or price_efficiency >= 55)
     )
     acceptance = breakout_acceptance or pending_hold
     if acceptance:

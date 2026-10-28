@@ -141,15 +141,17 @@ def calculate_position(
     else:
         margin_pct = float(sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20)))
 
+    effective_size_multiplier = max(0.1, min(1.5, float(size_multiplier or 1.0)))
     if not strong_entry:
         score_adj = 1.0 if score is None else min(1.15, max(0.85, float(score) / 80.0))
-        margin_pct *= score_adj * max(0.1, min(1.5, float(size_multiplier or 1.0)))
+        margin_pct *= score_adj
+    # Position factors are hard risk caps, not scoring hints.  Applying them to
+    # confirmed entries is especially important because those entries otherwise
+    # receive the full balance-based margin allocation.
+    margin_pct *= effective_size_multiplier
     max_margin_pct = float(sizing.get("max_margin_pct", margin_pct))
     margin_pct = min(margin_pct, max_margin_pct)
-    effective_size_multiplier = max(0.1, min(1.5, float(size_multiplier or 1.0)))
     target_margin = balance * margin_pct
-    if enforce_risk_budget:
-        target_margin *= effective_size_multiplier
     target_notional = target_margin * leverage
 
     base_risk_pct = sizing.get(
@@ -503,6 +505,39 @@ def meets_safety_filters(score_row, side: str | None = None) -> tuple[bool, str]
         return False, f"score {score:.1f} < hard_floor {hard_score_floor:.1f}"
     if entry_alpha and entry_alpha < 55:
         return False, f"entry_alpha {entry_alpha:.1f} < 55"
+
+    min_volume = float(HARD_FILTERS.get("min_volume_usdt") or 0)
+    if min_volume > 0 and symbol:
+        try:
+            from shared.db import fetch_24h_quote_volume
+
+            quote_volume = float(fetch_24h_quote_volume(symbol) or 0)
+        except Exception:
+            quote_volume = 0
+        if 0 < quote_volume < min_volume:
+            return False, f"24h quote volume {quote_volume:.0f} < {min_volume:.0f}"
+
+    volatility = str(
+        row.get("volatility_level") or tech.get("volatility_level") or ""
+    ).strip()
+    max_volatility = str(HARD_FILTERS.get("max_volatility_level") or "").strip()
+    volatility_rank = {"极低": 0, "偏低": 1, "正常": 2, "偏高": 3, "极高": 4}
+    if (
+        volatility in volatility_rank
+        and max_volatility in volatility_rank
+        and volatility_rank[volatility] > volatility_rank[max_volatility]
+    ):
+        return False, f"volatility {volatility} > {max_volatility}"
+
+    price_position = str(
+        row.get("price_position") or tech.get("price_position") or ""
+    ).strip().lower()
+    disallowed = {
+        str(value).strip().lower()
+        for value in HARD_FILTERS.get("disallowed_price_positions", [])
+    }
+    if price_position and price_position in disallowed:
+        return False, f"price position {price_position} disallowed"
     return True, "OK"
 
 

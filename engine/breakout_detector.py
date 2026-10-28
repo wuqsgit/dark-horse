@@ -27,15 +27,14 @@ def compute_breakout_metrics(symbol: str, period: int = 20) -> dict:
             return {"breakout": False, "volume_ratio": 0, "high_price": 0, "volume_ma": 0, "volume_source": "insufficient_data"}
 
         latest = rows[0]
-        closed_window = rows[1:period + 1]
-        volume_base = rows[2:period + 2] if len(rows) >= period + 2 else rows[1:period + 1]
+        reference_window = rows[1:period + 1]
 
-        highs = [r["high"] for r in closed_window]
-        volumes = [r["volume"] for r in volume_base]
+        highs = [r["high"] for r in reference_window]
+        volumes = [r["volume"] for r in reference_window]
 
         highest_high = max(highs)
         volume_ma = np.mean(volumes) if volumes else 0
-        last_closed_volume = closed_window[0]["volume"] if closed_window else 0
+        last_closed_volume = latest["volume"]
         current_price = latest["close"]
 
         breakout = current_price > highest_high
@@ -52,7 +51,7 @@ def compute_breakout_metrics(symbol: str, period: int = 20) -> dict:
             "current_price": current_price,
             "distance_to_breakout_pct": ((highest_high - current_price) / current_price) if current_price and highest_high > current_price else 0,
             "latest_time": latest["time"],
-            "last_closed_time": closed_window[0]["time"] if closed_window else None,
+            "last_closed_time": latest["time"],
         }
     except Exception as e:
         try:
@@ -178,7 +177,7 @@ def compute_rr_detail(symbol: str, entry_price: float, atr: float, use_sr: bool 
             reward_price = resistance
             rr_structure = (resistance - entry_price) / risk
     rr_used = rr_structure if rr_structure > 0 else rr_atr
-    method = "structure" if rr_structure > 0 else "atr"
+    method = "structure" if rr_structure > 0 else "atr_projection"
     return {
         "rr_atr": round(rr_atr, 2),
         "rr_structure": round(rr_structure, 2),

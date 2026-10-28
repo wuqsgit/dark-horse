@@ -79,6 +79,25 @@ class AlphaStrategyRepository:
         finally:
             conn.close()
 
+    def get_feature_snapshot(self, snapshot_id: str | None) -> dict | None:
+        if not snapshot_id:
+            return None
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                """SELECT * FROM alpha_feature_snapshots
+                   WHERE snapshot_id=?""",
+                (str(snapshot_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        result = dict(row)
+        result["features"] = json.loads(result.get("features_json") or "{}")
+        result["quality"] = json.loads(result.get("data_quality_json") or "{}")
+        return result
+
     def get_state(self, market_env: str, futures_symbol: str) -> StateRecord | None:
         conn = get_conn()
         try:

@@ -270,6 +270,7 @@ CREATE TABLE orders (
             setup_id TEXT,
             alpha_stage TEXT,
             ai_model_versions_json TEXT,
+            source TEXT,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         , position_id TEXT, strategy_source TEXT DEFAULT 'normal', signal_source TEXT, alpha_symbol TEXT, alpha_profile TEXT, alpha_entry_level TEXT, alpha_score REAL, alpha_suggested_position_pct REAL, account_id INTEGER NOT NULL DEFAULT 1);
@@ -304,6 +305,7 @@ CREATE TABLE positions_history (
             quantity REAL,
             entry_price REAL,
             mark_price REAL,
+            current_price REAL,
             unrealized_pnl REAL,
             leverage INTEGER DEFAULT 1,
             stop_loss REAL,
@@ -413,6 +415,7 @@ CREATE TABLE symbol_snapshots (
         );
 CREATE TABLE symbols (
             symbol TEXT PRIMARY KEY,
+            base_asset TEXT,
             is_active INTEGER DEFAULT 1,
             first_seen TEXT DEFAULT (datetime('now')),
             last_seen TEXT DEFAULT (datetime('now'))
@@ -424,6 +427,7 @@ CREATE TABLE trade_cooldown (
             consecutive_stops INTEGER DEFAULT 0,
             cooldown_until TEXT,
             reason TEXT,
+            created_at TEXT,
             updated_at TEXT
         );
 CREATE TABLE trades (

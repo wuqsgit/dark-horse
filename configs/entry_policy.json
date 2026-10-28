@@ -1,5 +1,30 @@
 {
   "version": "2026-07-02T14:38:20Z",
   "mode": "active_candidates_only",
-  "rules": []
+  "rules": [
+    {
+      "name": "block_overbought_long",
+      "enabled": true,
+      "conditions": {
+        "side": "LONG",
+        "price_position_contains": ["overbought"]
+      },
+      "action": {
+        "block": true,
+        "reason": "long entry blocked at overbought price position"
+      }
+    },
+    {
+      "name": "block_extreme_positive_funding_long",
+      "enabled": true,
+      "conditions": {
+        "side": "LONG",
+        "funding_rate_gt": 0.001
+      },
+      "action": {
+        "block": true,
+        "reason": "long entry blocked by extreme positive funding"
+      }
+    }
+  ]
 }

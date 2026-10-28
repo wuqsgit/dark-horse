@@ -117,6 +117,66 @@ class AlphaSignalConsumer:
             rejection_reason=reason,
         )
 
+    def _strict_entry_confirmation(
+        self,
+        *,
+        event: dict,
+        action_type: str,
+        symbol: str,
+    ) -> tuple[bool, str, dict]:
+        snapshot = self.repository.get_feature_snapshot(event.get("snapshot_id"))
+        if not snapshot:
+            return False, "alpha_v2_snapshot_missing", {}
+        if str(snapshot.get("data_quality_status") or "").lower() != "ready":
+            return False, "alpha_v2_snapshot_not_ready", snapshot
+        features = snapshot.get("features") or {}
+        try:
+            candle_time = datetime.fromisoformat(
+                str(snapshot.get("candle_close_time") or "").replace("Z", "+00:00")
+            )
+            if candle_time.tzinfo is None:
+                candle_time = candle_time.replace(tzinfo=timezone.utc)
+            age_minutes = (
+                datetime.now(timezone.utc) - candle_time.astimezone(timezone.utc)
+            ).total_seconds() / 60
+        except (TypeError, ValueError):
+            return False, "alpha_v2_snapshot_time_invalid", features
+        max_age = float(self.strategy.get("execution_snapshot_ttl_minutes") or 25)
+        if age_minutes < -2 or age_minutes > max_age:
+            return False, f"alpha_v2_snapshot_stale:{age_minutes:.1f}m", features
+
+        if action_type == "RETEST_ADD":
+            volume_ratio = float(features.get("quote_volume_ratio_15m") or 0)
+            ret_15m = float(features.get("ret_15m") or 0)
+            if volume_ratio < 0.8 or ret_15m < 0:
+                return False, "alpha_v2_retest_not_supported", features
+            return True, "alpha_v2_retest_revalidated", features
+
+        checks = {
+            "alpha_score_80": float(features.get("alpha_discovery_score") or 0) >= 80,
+            "spot_volume_expanded": float(features.get("spot_volume_ratio_15m") or 0) >= 1.5,
+            "futures_volume_expanded": float(features.get("futures_volume_ratio_15m") or 0) >= 1.5,
+            "markets_synchronized": float(features.get("volume_sync_score") or 0) >= 65,
+            "price_strong_15m": float(features.get("ret_15m") or 0) >= 0.5,
+            "price_strong_1h": float(features.get("ret_1h") or 0) >= 1.0,
+            "oi_expanded": (
+                float(features.get("oi_change_4h") or 0) >= 0.01
+                or float(features.get("oi_change_1h") or 0) >= 0.005
+            ),
+        }
+        missing = [name for name, passed in checks.items() if not passed]
+        if missing:
+            return False, "alpha_v2_strict_missing:" + ",".join(missing), features
+
+        # The execution decision must use the latest two fully closed 15m bars,
+        # not only the feature snapshot that originally emitted the event.
+        from trader.execution import _safe_alpha_futures_breakout_confirmation
+
+        confirmed, reason, details = _safe_alpha_futures_breakout_confirmation(symbol)
+        if not confirmed:
+            return False, f"alpha_v2_breakout_not_confirmed:{reason}", details
+        return True, "alpha_v2_strict_confirmed", {**features, "breakout": details}
+
     def build_actions(
         self,
         *,
@@ -375,6 +435,21 @@ class AlphaSignalConsumer:
                 )
                 continue
 
+            confirmation_ok, confirmation_reason, confirmation_features = (
+                self._strict_entry_confirmation(
+                    event=event,
+                    action_type=action_type,
+                    symbol=symbol,
+                )
+            )
+            if not confirmation_ok:
+                self._reject(
+                    account_id=account_id,
+                    event=event,
+                    reason=confirmation_reason,
+                )
+                continue
+
             price = float(self.exchange.get_mark_price(symbol) or 0)
             invalidation = float(event.get("invalidation_price") or 0)
             if price <= 0 or invalidation <= 0 or invalidation >= price:
@@ -427,6 +502,7 @@ class AlphaSignalConsumer:
                 category="alpha",
                 entry_mode=entry_mode,
                 size_multiplier=final_factor,
+                enforce_risk_budget=True,
             )
             configured_risk_budget = balance * float(
                 account.get("risk_per_trade_pct")
@@ -441,11 +517,7 @@ class AlphaSignalConsumer:
             )
             structural_risk = price - invalidation
             risk_qty = risk_budget / structural_risk if structural_risk > 0 else 0
-            target_qty = (
-                float(pos_info["quantity"])
-                if entry_mode == "strong"
-                else min(float(pos_info["quantity"]), risk_qty)
-            )
+            target_qty = min(float(pos_info["quantity"]), risk_qty)
             existing_qty = float(position.get("quantity") or 0) if position else 0.0
             quantity = (
                 max(0.0, target_qty - existing_qty)
@@ -560,7 +632,9 @@ class AlphaSignalConsumer:
                     {},
                 ).get("model_versions") or {},
                 "client_order_id": client_id,
-                "skip_entry_quality_gate": True,
+                "rule_entry_validated": True,
+                "entry_confirmation_reason": confirmation_reason,
+                "entry_confirmation_features": confirmation_features,
                 "run_id": run_id,
                 "reason": (
                     f"explosive_breakout alpha_strategy_v2:{action_type.lower()}"

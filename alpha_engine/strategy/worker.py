@@ -755,12 +755,15 @@ class AlphaStrategyWorker:
         trigger,
         stage: str,
     ) -> dict:
+        normalized_setup = min(1.0, max(0.0, float(setup_score or 0) / 100.0))
         followthrough = 0.0
         fakeout = 0.5
         if trigger.trigger_detected:
-            followthrough, fakeout = 0.68, 0.30
+            followthrough = min(0.78, 0.50 + normalized_setup * 0.22)
+            fakeout = max(0.20, 0.48 - normalized_setup * 0.22)
         elif trigger.acceptance_confirmed:
-            followthrough, fakeout = 0.72, 0.22
+            followthrough = min(0.84, 0.56 + normalized_setup * 0.24)
+            fakeout = max(0.14, 0.43 - normalized_setup * 0.25)
         max_position_factor = 0.0
         if trigger.trigger_detected:
             max_position_factor = 0.5 if (
@@ -781,10 +784,10 @@ class AlphaStrategyWorker:
             "p_fakeout": fakeout,
             "expected_r": max(0.0, followthrough - fakeout),
             "max_position_factor": max_position_factor,
-            "model_versions": {"rules": "alpha-v2-rules-v1"},
+            "model_versions": {"rules": "alpha-v2-scored-rules-v2"},
             "reasons": [
                 *(prediction.get("reasons") or []),
-                "deterministic rule probability used",
+                "feature-derived rule confidence used",
             ],
         }
 

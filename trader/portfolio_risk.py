@@ -76,8 +76,8 @@ def check_portfolio_risk(
     Returns:
         (是否允许开仓, 原因)
     """
-    if not positions:
-        return True, "OK"
+    if balance <= 0:
+        return False, "账户余额无效"
     
     total_invested = sum(p.get("invested", 0) for p in positions)
     total_exposure_pct = (total_invested + new_invested) / balance

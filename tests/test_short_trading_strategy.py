@@ -76,7 +76,7 @@ class ShortTradingStrategyTest(unittest.TestCase):
             row,
             {
                 "breakout": {"ok": False, "volume_ratio": 1.6},
-                "rr": {"rr_used": 2.0},
+                "rr": {"rr_used": 2.0, "rr_method": "structure"},
                 "cooldown": {},
             },
             "SHORT",
@@ -153,7 +153,7 @@ class ShortTradingStrategyTest(unittest.TestCase):
             row,
             {
                 "breakout": {"ok": False, "volume_ratio": 0.9},
-                "rr": {"rr_used": 1.2},
+                "rr": {"rr_used": 1.2, "rr_method": "structure"},
                 "cooldown": {},
             },
             "SHORT",

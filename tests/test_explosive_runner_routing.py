@@ -4,7 +4,7 @@ from trader.runner import _filter_account_entry_actions, _filter_legacy_alpha_en
 
 
 class ExplosiveRunnerRoutingTest(unittest.TestCase):
-    def test_v2_live_mode_keeps_explosive_legacy_signal_only(self):
+    def test_v2_live_mode_removes_all_legacy_alpha_entries(self):
         actions = [
             {
                 "action": "open",
@@ -25,7 +25,7 @@ class ExplosiveRunnerRoutingTest(unittest.TestCase):
             {"enabled": True, "mode": "mainnet_live", "legacy_alpha_entry_enabled": False},
         )
 
-        self.assertEqual([action["symbol"] for action in filtered], ["BTRUSDT", "ETHUSDT"])
+        self.assertEqual([action["symbol"] for action in filtered], ["ETHUSDT"])
 
     def test_shadow_mode_keeps_all_actions(self):
         actions = [{"action": "open", "symbol": "OTHERUSDT", "strategy_source": "alpha"}]
@@ -35,7 +35,7 @@ class ExplosiveRunnerRoutingTest(unittest.TestCase):
             actions,
         )
 
-    def test_disabled_account_keeps_explosive_action_for_terminal_rejection(self):
+    def test_disabled_account_blocks_every_alpha_entry(self):
         actions = [
             {
                 "action": "open",
@@ -51,7 +51,7 @@ class ExplosiveRunnerRoutingTest(unittest.TestCase):
             {"alpha_trading_enabled": False, "normal_trading_enabled": True},
         )
 
-        self.assertEqual([action["symbol"] for action in filtered], ["BTRUSDT"])
+        self.assertEqual(filtered, [])
 
 
 if __name__ == "__main__":

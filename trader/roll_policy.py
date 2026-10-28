@@ -91,6 +91,10 @@ def evaluate_roll(
             if current_r < trigger_r:
                 return RollDecision(False, f"waiting_{trigger_label}r", current_r)
             trigger_mode = "explosive_confirmation"
+        elif current_r >= trigger_r:
+            # A position that has reached the configured R threshold has already
+            # supplied the continuation evidence; TP1 bookkeeping must not veto it.
+            trigger_mode = "sustained_profit"
         else:
             continuation_min_r = _number(config.get("continuation_min_r")) or 0.75
             if not continuation_confirmed or current_r < continuation_min_r:

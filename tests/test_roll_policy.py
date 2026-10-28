@@ -50,7 +50,7 @@ class RollPolicyTest(unittest.TestCase):
         self.assertFalse(decision.eligible)
         self.assertEqual(decision.status, "roll_state_incomplete")
 
-    def test_tp1_or_fresh_continuation_must_be_confirmed(self):
+    def test_r_threshold_is_itself_sufficient_continuation_confirmation(self):
         decision = evaluate_roll(
             {"side": "LONG", "entry_price": 100, "mark_price": 110},
             complete_state(tp1_hit=0),
@@ -58,7 +58,8 @@ class RollPolicyTest(unittest.TestCase):
             alpha_sync=True,
             config=CONFIG,
         )
-        self.assertEqual(decision.status, "waiting_tp1_or_continuation")
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.trigger_mode, "sustained_profit")
 
     def test_fresh_continuation_can_roll_before_tp1(self):
         decision = evaluate_roll(

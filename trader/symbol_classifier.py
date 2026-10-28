@@ -166,7 +166,7 @@ def classify_symbol(row: Any, v3_signals: dict | None = None, side: str | None =
     c["score"] = _score_item(c["score"], c["reasons"], 20 if accumulating else 0, "筹码处于吸筹/蓄力")
     c["score"] = _score_item(c["score"], c["reasons"], 16 if low_vol else 0, "波动收缩")
     c["score"] = _score_item(c["score"], c["reasons"], 14 if rs >= 60 else 0, "相对强度不弱")
-    c["score"] = _score_item(c["score"], c["reasons"], 12 if oi_change >= -3 else 0, "OI 未明显恶化")
+    c["score"] = _score_item(c["score"], c["reasons"], 12 if oi_change >= -0.03 else 0, "OI 未明显恶化")
     c["score"] = _score_item(c["score"], c["reasons"], 10 if score >= 54 and entry_alpha >= 58 else 0, "基础评分达标")
 
     ranked_pool = (

@@ -34,7 +34,7 @@ def base_asset(symbol: str) -> str:
 def get_symbol_risk(symbol: str) -> dict:
     data = _load_profiles()
     base = base_asset(symbol)
-    class_key = (data.get("symbols") or {}).get(base) or data.get("default_class") or "narrative"
+    class_key = (data.get("symbols") or {}).get(base) or data.get("default_class") or "unclassified"
     classes = data.get("classes") or {}
     cfg = dict(classes.get(class_key) or classes.get(data.get("default_class")) or {})
     cfg.setdefault("label", class_key)

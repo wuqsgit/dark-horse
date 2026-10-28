@@ -179,7 +179,7 @@ class AlphaPositionManagementTest(unittest.TestCase):
             action = self._soft_loss_action(engine)
 
         self.assertIsNone(action)
-        self.assertTrue(any("alpha soft hold" in str(item.get("filter_reason", "")) for item in engine.recorded_decisions))
+        self.assertTrue(any("alpha_soft_exit_pending_confirmation" in str(item.get("filter_reason", "")) for item in engine.recorded_decisions))
 
     def test_existing_soft_exit_confirmation_is_cancelled(self):
         engine = self._soft_loss_engine()
@@ -195,7 +195,7 @@ class AlphaPositionManagementTest(unittest.TestCase):
 
         self.assertIsNone(action)
         self.assertTrue(any(
-            "loss_soft_exit_disabled" in str(item.get("filter_reason", ""))
+            "alpha_soft_exit_waiting_next_closed_candle" in str(item.get("filter_reason", ""))
             for item in engine.recorded_decisions
         ))
 
@@ -301,7 +301,7 @@ class AlphaPositionManagementTest(unittest.TestCase):
             action = self._soft_loss_action(engine, pnl_pct=-30.3, mark_price=89.9)
 
         self.assertIsNotNone(action)
-        self.assertIn("alpha_structure_1r_stop", action["reason"])
+        self.assertIn("emergency_margin_stop", action["reason"])
         self.assertTrue(action["is_stop"])
 
     def test_margin_roi_stage1_protects_even_when_price_move_is_below_one_r(self):

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -53,6 +54,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             return_value=(True, None),
         )
         self.readiness_patch.start()
+        self.breakout_patch = patch(
+            "trader.execution._safe_alpha_futures_breakout_confirmation",
+            return_value=(True, "confirmed", {"confirmation_volume_ratio": 1.8}),
+        )
+        self.breakout_patch.start()
         db.init_db()
         self.account_token = db.set_account_context(7)
         self.repo = AlphaStrategyRepository()
@@ -76,6 +82,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
 
     def tearDown(self):
         db.reset_account_context(self.account_token)
+        self.breakout_patch.stop()
         self.readiness_patch.stop()
         self.db_patch.stop()
         self.temp_dir.cleanup()
@@ -90,6 +97,36 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         action_type=ActionType.PROBE_LONG,
     ):
         now = datetime.now(timezone.utc)
+        conn = db.get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO alpha_feature_snapshots
+               (snapshot_id, market_env, alpha_symbol, futures_symbol,
+                candle_close_time, feature_schema_version,
+                data_quality_status, data_quality_json, features_json,
+                created_at)
+               VALUES (?, 'mainnet', ?, ?, ?, 4, 'ready', ?, ?, ?)""",
+            (
+                f"snap-{symbol}",
+                alpha,
+                symbol,
+                now.isoformat().replace("+00:00", "Z"),
+                json.dumps({"status": "ready"}),
+                json.dumps({
+                    "alpha_discovery_score": 88,
+                    "spot_volume_ratio_15m": 2.0,
+                    "futures_volume_ratio_15m": 2.1,
+                    "volume_sync_score": 80,
+                    "ret_15m": 1.2,
+                    "ret_1h": 2.5,
+                    "oi_change_1h": 0.01,
+                    "oi_change_4h": 0.02,
+                    "quote_volume_ratio_15m": 2.1,
+                }),
+                now.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+        conn.commit()
+        conn.close()
         confirmed = action_type == ActionType.CONFIRM_LONG
         transition = TransitionResult(
             from_state=AlphaSignalState.ARMED,
@@ -180,11 +217,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(actions[0]["market_data_env"], "mainnet")
         self.assertEqual(actions[0]["execution_env"], "testnet")
         self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.70)
-        self.assertAlmostEqual(actions[0]["quantity"], 450.0)
+        self.assertAlmostEqual(actions[0]["quantity"], 300.0)
         self.assertAlmostEqual(
             actions[0]["quantity"] * actions[0]["entry_price"]
             / actions[0]["leverage"],
-            150.0,
+            100.0,
         )
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
         self.assertEqual(duplicate, [])
@@ -225,6 +262,51 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(status, "SIGNAL_ONLY")
+
+    def test_confirmed_signal_is_rejected_when_strict_snapshot_weakens(self):
+        self._event(
+            action_type=ActionType.CONFIRM_LONG,
+            max_position_factor=0.7,
+        )
+        conn = db.get_conn()
+        row = conn.execute(
+            "SELECT features_json FROM alpha_feature_snapshots WHERE snapshot_id='snap-AKEUSDT'"
+        ).fetchone()
+        features = json.loads(row["features_json"])
+        features["spot_volume_ratio_15m"] = 0.8
+        conn.execute(
+            "UPDATE alpha_feature_snapshots SET features_json=? WHERE snapshot_id='snap-AKEUSDT'",
+            (json.dumps(features),),
+        )
+        conn.commit()
+        conn.close()
+        consumer = AlphaSignalConsumer(
+            FakeExchange(),
+            config={
+                "alpha_strategy_v2": {
+                    "enabled": True,
+                    "mode": "testnet_live",
+                    "market_env": "mainnet",
+                },
+            },
+            repository=self.repo,
+        )
+
+        actions = consumer.build_actions(
+            account=self._account(),
+            positions=[],
+            balance=1000,
+            engine=FakeEngine(),
+            run_id="run-weak",
+        )
+
+        self.assertEqual(actions, [])
+        conn = db.get_conn()
+        rejection = conn.execute(
+            "SELECT rejection_reason FROM alpha_signal_consumptions WHERE account_id=7"
+        ).fetchone()["rejection_reason"]
+        conn.close()
+        self.assertIn("spot_volume_expanded", rejection)
 
     def test_probe_signal_is_observation_only(self):
         self._event(

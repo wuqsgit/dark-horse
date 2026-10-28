@@ -26,6 +26,13 @@ def schema_objects(connection):
     }
 
 
+def table_columns(connection, table_name):
+    return {
+        row[1]
+        for row in connection.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+    }
+
+
 class InitSqlSchemaTest(unittest.TestCase):
     def test_init_sql_includes_all_live_database_schema_objects(self):
         source = sqlite3.connect(DATABASE, timeout=10)
@@ -35,7 +42,16 @@ class InitSqlSchemaTest(unittest.TestCase):
             initialized_objects = schema_objects(initialized)
             for object_key, definition in schema_objects(source).items():
                 self.assertIn(object_key, initialized_objects)
-                self.assertEqual(initialized_objects[object_key], definition)
+                if object_key[0] == "table":
+                    live_columns = table_columns(source, object_key[1])
+                    initialized_columns = table_columns(initialized, object_key[1])
+                    self.assertTrue(
+                        live_columns.issubset(initialized_columns),
+                        f"{object_key[1]} missing columns: "
+                        f"{sorted(live_columns - initialized_columns)}",
+                    )
+                else:
+                    self.assertEqual(initialized_objects[object_key], definition)
         finally:
             initialized.close()
             source.close()

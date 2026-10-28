@@ -148,6 +148,7 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     context_text = " ".join([price_position, trend_state, trend_direction, chip_phase])
 
     rr_used = _num(rr.get("rr_used") if isinstance(rr, dict) else (v3_signals or {}).get("rr_ratio"))
+    rr_method = str(rr.get("rr_method") or "unknown")
     volume_ratio = _num(breakout.get("volume_ratio"))
     base_min_score = _num(profile.get("min_score"), 0)
     base_min_entry_alpha = _num(profile.get("min_entry_alpha"), 0)
@@ -161,6 +162,11 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     min_rr = _num(profile.get("min_rr"), 0)
     probe_min_rr = _num(profile.get("probe_min_rr"), 0)
     require_breakout = bool(profile.get("require_breakout"))
+    structure_rr_required = (
+        str(profile.get("rr_method") or "").lower() == "structure"
+        and not require_breakout
+    )
+    structure_rr_ok = not structure_rr_required or rr_method == "structure"
     allow_early_probe = bool(profile.get("allow_early_probe"))
     early_probe_max_distance = _num(profile.get("early_probe_max_distance_pct"), 0)
     early_probe_min_vol = _num(profile.get("early_probe_min_volume_multiplier"), min_vol)
@@ -188,6 +194,12 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
     risk_probe_factor = max(0.0, min(1.0, _num(symbol_risk.get("probe_position_factor"), risk_position_factor)))
     effective_position_factor = round(template_position_factor * risk_position_factor, 4)
     effective_probe_factor = round(template_probe_factor * risk_probe_factor, 4)
+    if require_breakout and rr_method != "structure":
+        # New-high breakouts naturally lack an overhead resistance target. Keep
+        # the ATR projection tradable, but cap its size because target quality is
+        # lower than a measured structure-based reward.
+        effective_position_factor = round(effective_position_factor * 0.5, 4)
+        effective_probe_factor = round(effective_probe_factor * 0.5, 4)
     distance_to_breakout = _num(breakout.get("distance_to_breakout_pct"), 999)
     early_probe_ok = (
         allow_early_probe
@@ -242,6 +254,14 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
         confirmations.append(_confirmation("成交量", volume_ok, f"成交量 {volume_ratio:.2f}x 已达到 {min_vol:.2f}x", f"成交量 {volume_ratio:.2f}x 未达到 {min_vol:.2f}x", required=False if profile.get("allow_probe") else True, kind="template"))
     if min_rr:
         confirmations.append(_confirmation("结构 R:R", rr_used >= min_rr, f"R:R {rr_used:.2f} 已达到 {min_rr:.2f}", f"R:R {rr_used:.2f} 未达到正常仓 {min_rr:.2f}", required=not (profile.get("allow_probe") and rr_used >= probe_min_rr), kind="template"))
+        confirmations.append(_confirmation(
+            "结构目标有效",
+            structure_rr_ok,
+            "支撑阻力结构可用于计算目标",
+            "缺少有效结构目标，ATR 估算不能冒充结构 R:R",
+            required=structure_rr_required,
+            kind="risk",
+        ))
 
     if allow_early_probe:
         confirmations.append(_confirmation(
@@ -276,7 +296,7 @@ def evaluate_profile_entry(row: Any, v3_signals: dict | None = None, side: str |
         confirmations.append(_confirmation("资金费率", funding_ok, "资金费率对当前方向有利或正常", f"资金费率对当前方向不利，阈值 {float(max_funding) * 100:.3f}%", kind="risk"))
 
     confirmations.append(_confirmation("冷却状态", not cooldown.get("in_cooldown"), "冷却状态正常", cooldown.get("reason") or "冷却中", kind="risk"))
-    if oi_change < -3:
+    if oi_change < -0.03:
         confirmations.append(_confirmation("OI 改善", False, "OI 同步改善", "OI 仍在下降，合约参与度不足", required=False, kind="context"))
     elif oi_change > 0:
         confirmations.append(_confirmation("OI 改善", True, "OI 同步改善", "OI 暂无明显改善", required=False, kind="context"))

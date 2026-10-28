@@ -20,7 +20,13 @@ from trader.cooldown_manager import is_in_cooldown, record_stop, record_profit
 from trader.market_regime import detect_current_regime, adjust_strategy_for_regime, get_regime_adjustment_message
 from trader.selection import BluechipTrendSelector, CandidateSelector  # V5: 鍊欓夐夋嫨鍣?
 from trader.symbol_risk import get_symbol_risk
-from trader.portfolio_risk import check_category_position_limit
+from trader.portfolio_risk import (
+    check_category_position_limit,
+    check_consecutive_losses,
+    check_daily_loss_limit,
+    check_portfolio_risk,
+    symbol_risk_category,
+)
 from trader.ai_client import build_learning_action
 from alpha_engine.volume_price import evaluate_alpha_volume_price
 logger = logging.getLogger("execution")
@@ -28,6 +34,48 @@ logger = logging.getLogger("execution")
 
 EXIT_POLICY_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "configs", "exit_policy.json"))
 _EXIT_POLICY_CACHE = {"mtime": None, "data": None}
+
+
+def _account_loss_state() -> tuple[float, int]:
+    from shared.db import current_account_id, get_conn
+
+    account_id = current_account_id()
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(pnl), 0) pnl FROM trades
+               WHERE account_id=? AND date(created_at)=date('now')""",
+            (account_id,),
+        ).fetchone()
+        recent = conn.execute(
+            """SELECT pnl FROM trades WHERE account_id=?
+               ORDER BY datetime(created_at) DESC, id DESC LIMIT 20""",
+            (account_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    consecutive = 0
+    for item in recent:
+        if float(item["pnl"] or 0) >= 0:
+            break
+        consecutive += 1
+    return float(row["pnl"] or 0), consecutive
+
+
+def _portfolio_positions(positions: list[dict]) -> list[dict]:
+    return [
+        {
+            **position,
+            "invested": float(
+                position.get("margin")
+                or position.get("initial_margin")
+                or position.get("position_initial_margin")
+                or 0
+            ),
+            "category": symbol_risk_category(position.get("symbol")),
+        }
+        for position in positions
+    ]
 
 
 def _row_to_dict(row):
@@ -58,6 +106,33 @@ def _score_layer_gate(row, entry_profile, side=None):
     score_layers = raw.get("score_layers") or {}
     layers = score_layers.get("layers") or {}
     thresholds = score_layers.get("thresholds") or {}
+    if not layers:
+        composite = float(row.get("composite_score") or 0)
+        directional_alpha = float(entry_alpha_for_side(row, side) or composite)
+        volatility = str(
+            row.get("volatility_level")
+            or (raw.get("technical") or {}).get("volatility_level")
+            or ""
+        )
+        risk_score = 75.0 if volatility == "极高" else (65.0 if volatility == "偏高" else 50.0)
+        layers = {
+            "opportunity": {"score": composite},
+            "entry": {"score": directional_alpha},
+            "risk": {"score": risk_score},
+            "execution": {"score": min(composite, directional_alpha)},
+        }
+        thresholds = {
+            "min_opportunity_score": 55,
+            "min_entry_score": 58,
+            "probe_min_entry_score": 55,
+            "max_risk_score": 70,
+            "min_execution_score": 55,
+        }
+        score_layers = {
+            "layers": layers,
+            "thresholds": thresholds,
+            "derived_fallback": True,
+        }
     opportunity = float((layers.get("opportunity") or {}).get("score") or 50)
     entry = float((layers.get("entry") or {}).get("score") or 50)
     risk = float((layers.get("risk") or {}).get("score") or 50)
@@ -1738,7 +1813,7 @@ class ExecutionEngine:
             and _is_explosive_runner_position(hist, runner_cfg)
         )
         grace_minutes = float(
-            runner_cfg.get("v2_confirm_grace_minutes", 240)
+            runner_cfg.get("v2_confirm_grace_minutes", 90)
             if v2_confirmed
             else runner_cfg.get("grace_minutes", 60)
         )
@@ -1859,6 +1934,13 @@ class ExecutionEngine:
         except Exception:
             pass
 
+        emergency_stop_pct = float(alpha_cfg.get("emergency_margin_stop_pct", 0.20)) * 100
+        if pnl_pct <= -emergency_stop_pct:
+            return add(
+                f"emergency_margin_stop roi={pnl_pct:.2f}% threshold=-{emergency_stop_pct:.2f}%",
+                is_stop=True,
+            )
+
         if (
             profit_lock_enabled
             and not explosive_grace
@@ -1920,12 +2002,6 @@ class ExecutionEngine:
                 is_stop=r_multiple < 1,
                 score=entry_score,
             )
-        emergency_stop_pct = float(alpha_cfg.get("emergency_margin_stop_pct", 0.20)) * 100
-        if pnl_pct <= -emergency_stop_pct:
-            return add(
-                f"emergency_margin_stop roi={pnl_pct:.2f}% threshold=-{emergency_stop_pct:.2f}%",
-                is_stop=True,
-            )
         if profit_lock_enabled and pnl_pct > 0:
             if (
                 profit_lock_stage < 1
@@ -1955,12 +2031,6 @@ class ExecutionEngine:
             return add("alpha_TP2 r>=2", score=entry_score, action="partial_close", close_pct=0.25)
         if float(r_state.get("r_multiple") or 0) >= 1 and not int(hist.get("tp1_hit") or 0):
             return add("alpha_TP1 r>=1", score=entry_score, action="partial_close", close_pct=0.20)
-
-        # A confirmed V2 breakout can retest violently before the main move.
-        # During grace, only the exchange structural stop and emergency margin
-        # stop may close the runner; noisy software exits remain disabled.
-        if v2_confirmed and explosive_grace:
-            return None
 
         hold_reason = None
         if not ctx:
@@ -2233,10 +2303,81 @@ class ExecutionEngine:
                 reason=state,
             )
 
+        actionable_soft_exit = bool(
+            soft_hold_reason
+            and not explosive_grace
+            and any(
+                marker in soft_hold_reason
+                for marker in (
+                    "probe_timeout",
+                    "volume_price_weak",
+                    "momentum_reversal",
+                    "structural_breakdown",
+                    "time_stop",
+                )
+            )
+        )
+        if actionable_soft_exit:
+            if "time_stop" in soft_hold_reason:
+                return add(
+                    soft_hold_reason.replace("soft hold", "soft exit"),
+                    is_stop=pnl_pct < 0,
+                    score=current_score,
+                )
+            latest_bar = closed_candles[-1] if closed_candles else None
+            latest_time = _parse_time((latest_bar or {}).get("time"))
+            trigger_time = _parse_time((confirmation_state or {}).get("trigger_candle_time"))
+            if confirmation_status not in {"pending", "waiting"}:
+                record_confirmation(
+                    "pending",
+                    "alpha_soft_exit_pending_confirmation",
+                    trigger_candle_time=(latest_bar or {}).get("time"),
+                    trigger_low=(latest_bar or {}).get("low"),
+                    trigger_high=(latest_bar or {}).get("high"),
+                )
+                return None
+            if not latest_time or not trigger_time or latest_time <= trigger_time:
+                record_confirmation(
+                    "waiting",
+                    "alpha_soft_exit_waiting_next_closed_candle",
+                    trigger_candle_time=(confirmation_state or {}).get("trigger_candle_time"),
+                    trigger_low=(confirmation_state or {}).get("trigger_low"),
+                    trigger_high=(confirmation_state or {}).get("trigger_high"),
+                )
+                return None
+            latest_close = float((latest_bar or {}).get("close") or mark_price)
+            if str(side or "").upper() == "SHORT":
+                confirmation_level = float(
+                    (confirmation_state or {}).get("trigger_high") or latest_close
+                )
+                confirmed = latest_close > confirmation_level
+            else:
+                confirmation_level = float(
+                    (confirmation_state or {}).get("trigger_low") or latest_close
+                )
+                confirmed = latest_close < confirmation_level
+            if confirmed:
+                full_exit = bool(pnl_pct <= -2.0 or "structural_breakdown" in soft_hold_reason)
+                return add(
+                    soft_hold_reason.replace("soft hold", "soft exit confirmed"),
+                    is_stop=pnl_pct < 0,
+                    score=current_score,
+                    action="close" if full_exit else "partial_close",
+                    close_pct=None if full_exit else 0.50,
+                )
+            record_confirmation(
+                "cancelled",
+                "alpha_soft_exit_cancelled candle_recovered",
+                trigger_candle_time=(confirmation_state or {}).get("trigger_candle_time"),
+                trigger_low=(confirmation_state or {}).get("trigger_low"),
+                trigger_high=(confirmation_state or {}).get("trigger_high"),
+            )
+            return None
+
         if confirmation_status in {"pending", "waiting"}:
             record_confirmation(
                 "cancelled",
-                "alpha_soft_exit_cancelled loss_soft_exit_disabled",
+                "alpha_soft_exit_cancelled signal_recovered",
                 trigger_candle_time=confirmation_state.get("trigger_candle_time"),
                 trigger_low=confirmation_state.get("trigger_low"),
                 trigger_high=confirmation_state.get("trigger_high"),
@@ -2759,7 +2900,7 @@ class ExecutionEngine:
             time_stop_h = float(self.cfg.get("time_stop_hours", 12))
             min_ret = float(self.cfg.get("time_stop_min_return", 0.02)) * 100
             if age_h is not None and age_h >= time_stop_h and pnl_pct < min_ret:
-                self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
+                add("close", f"time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
                 continue
             category_exit = self._build_category_momentum_exit(
                 sym,
@@ -3300,8 +3441,14 @@ class ExecutionEngine:
             size_multiplier *= discovery_factor
             size_multiplier *= _market_phase_size_factor(market_phase)
             size_multiplier *= soft_gate_factor
+            profile_factor_key = (
+                "effective_probe_position_size_factor"
+                if entry_profile.get("status") == "probe"
+                else "effective_position_size_factor"
+            )
+            size_multiplier *= float(entry_profile.get(profile_factor_key) or 1.0)
             if explosive_candidate:
-                size_multiplier = max(0.5, min(1.0, size_multiplier))
+                size_multiplier = min(1.0, size_multiplier)
             pos_info = calculate_position(
                 self.ex,
                 symbol,
@@ -3318,6 +3465,28 @@ class ExecutionEngine:
             qty = self.ex.adjust_quantity(symbol, qty)
             if qty <= 0:
                 reject("quantity <= 0", {"pos_info": pos_info, "volume_price_factor": vp_factor, "symbol_risk": symbol_risk})
+                continue
+
+            alpha_risk_positions = _portfolio_positions(current_positions)
+            alpha_risk_positions.extend(
+                {
+                    "symbol": action.get("symbol"),
+                    "invested": float(action.get("margin") or 0),
+                    "category": action.get("category")
+                    or symbol_risk_category(action.get("symbol")),
+                }
+                for action in (planned_actions or [])
+                if action.get("action") == "open"
+            )
+            portfolio_ok, portfolio_reason = check_portfolio_risk(
+                alpha_risk_positions,
+                balance,
+                symbol,
+                symbol_risk.get("class") or symbol_risk_category(symbol),
+                float(pos_info.get("margin") or 0),
+            )
+            if not portfolio_ok:
+                reject(portfolio_reason, {"pos_info": pos_info})
                 continue
 
             atr = float(pos_info.get("atr_value") or 0)
@@ -3354,6 +3523,7 @@ class ExecutionEngine:
                 "grade": normal_row.get("composite_summary") or normal_row.get("grade", ""),
                 "score": alpha_execution_score,
                 "invested": invested,
+                "margin": float(pos_info.get("margin") or 0),
                 "run_id": run_id,
                 "scan_id": row.get("scan_id"),
                 "entry_mode": entry_profile.get("status"),
@@ -3690,6 +3860,20 @@ class ExecutionEngine:
         controls = self.account_controls or _runtime_controls()
         normal_enabled = bool(controls.get("normal_trading_enabled", True))
         alpha_enabled = bool(controls.get("alpha_trading_enabled", False))
+        try:
+            daily_pnl, consecutive_losses = _account_loss_state()
+            daily_ok, daily_reason = check_daily_loss_limit(daily_pnl, balance)
+            loss_ok, loss_reason = check_consecutive_losses(consecutive_losses)
+            entry_risk_allowed = bool(balance > 0 and daily_ok and loss_ok)
+            entry_risk_reason = (
+                "OK"
+                if entry_risk_allowed
+                else (daily_reason if not daily_ok else loss_reason)
+            )
+        except Exception as exc:
+            entry_risk_allowed = False
+            entry_risk_reason = f"account_risk_state_unavailable:{exc}"
+            logger.error("Unable to evaluate account risk state: %s", exc)
 
         self._sync_tracker(current_positions)
         actions.extend(self._build_position_actions(top_symbols, current_positions, run_id=run_id))
@@ -3734,7 +3918,7 @@ class ExecutionEngine:
         bluechip_reserve = 1 if bluechip_cfg.get("enabled", False) and bluechip_open_count < int(bluechip_cfg.get("max_positions", 1)) and avail > 1 else 0
 
         # === V5: 浣跨敤鍊欓夐夋嫨鍣?===
-        if avail > 0 and normal_enabled:
+        if avail > 0 and normal_enabled and entry_risk_allowed:
             selector = CandidateSelector()
             normal_slots = max(0, avail - bluechip_reserve)
             candidate_pool_size = max(24, normal_slots * 8)
@@ -3816,6 +4000,18 @@ class ExecutionEngine:
                     continue
 
                 score = float(s.get("composite_score") or 0)
+                if score < float(adj_min_score):
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        decision_stage="market_regime",
+                        decision_result="filtered",
+                        filter_reason=(
+                            f"regime_adjusted_score {score:.1f} < {float(adj_min_score):.1f}"
+                        ),
+                        market_regime=regime,
+                    )
+                    continue
                 # V5: final candidate eligibility check.
                 can_open, reason = selector.can_open(sym)
                 if not can_open:
@@ -3993,6 +4189,12 @@ class ExecutionEngine:
                 sizing_mode = "probe" if entry_profile.get("status") == "probe" else "confirmed"
                 size_multiplier = float(ob_info.get("spread_size_multiplier") or 0.75) if ob_info.get("spread_degraded") else 1.0
                 size_multiplier *= _market_phase_size_factor(market_phase)
+                profile_factor_key = (
+                    "effective_probe_position_size_factor"
+                    if entry_profile.get("status") == "probe"
+                    else "effective_position_size_factor"
+                )
+                size_multiplier *= float(entry_profile.get(profile_factor_key) or 1.0)
                 directional_alpha = entry_alpha_for_side(s, side)
                 short_cfg = self.cfg.get("short_trading") or {}
                 if side == "SHORT" and directional_alpha < float(short_cfg.get("full_position_alpha", 72)):
@@ -4042,6 +4244,36 @@ class ExecutionEngine:
                     )
                     continue
 
+                planned_risk_positions = _portfolio_positions(current_positions)
+                planned_risk_positions.extend(
+                    {
+                        "symbol": action.get("symbol"),
+                        "invested": float(action.get("margin") or 0),
+                        "category": action.get("category")
+                        or symbol_risk_category(action.get("symbol")),
+                    }
+                    for action in actions
+                    if action.get("action") == "open"
+                )
+                portfolio_ok, portfolio_reason = check_portfolio_risk(
+                    planned_risk_positions,
+                    balance,
+                    sym,
+                    symbol_risk.get("class") or symbol_risk_category(sym),
+                    float(pos_info.get("margin") or 0),
+                )
+                if not portfolio_ok:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        decision_stage="portfolio_risk",
+                        decision_result="filtered",
+                        filter_reason=portfolio_reason,
+                        risk_params=pos_info,
+                    )
+                    continue
+
                 lev = pos_info.get("leverage", 3)
                 stop_distance = float(pos_info.get("stop_loss") or price * float(pos_info.get("stop_pct") or 0.05))
                 stop_price = (price - stop_distance) if side == "LONG" else (price + stop_distance)
@@ -4080,6 +4312,7 @@ class ExecutionEngine:
                     "grade": s.get("grade", ""),
                     "score": score,
                     "invested": invested,
+                    "margin": float(pos_info.get("margin") or 0),
                     "run_id": run_id,
                     "scan_id": s.get("scan_id"),
                     "entry_mode": entry_profile.get("status"),
@@ -4117,11 +4350,19 @@ class ExecutionEngine:
                 if len([a for a in actions if a.get("action") == "open"]) >= adj_max_pos:
                     break
         elif avail > 0:
-            logger.info("  normal trading runtime switch is OFF; skip normal open candidates")
+            logger.info(
+                "  skip normal open candidates: %s",
+                "runtime switch is OFF" if not normal_enabled else entry_risk_reason,
+            )
 
         open_count = len([a for a in actions if a.get("action") == "open"])
         bluechip_avail = max(0, adj_max_pos - open_count)
-        if bluechip_avail > 0 and normal_enabled and bluechip_cfg.get("enabled", False):
+        if (
+            bluechip_avail > 0
+            and normal_enabled
+            and entry_risk_allowed
+            and bluechip_cfg.get("enabled", False)
+        ):
             bluechip_selector = BluechipTrendSelector(bluechip_cfg)
             bluechip_candidates = bluechip_selector.select_candidates(
                 top_symbols,
@@ -4307,6 +4548,38 @@ class ExecutionEngine:
                     )
                     continue
 
+                bluechip_risk_positions = _portfolio_positions(current_positions)
+                bluechip_risk_positions.extend(
+                    {
+                        "symbol": action.get("symbol"),
+                        "invested": float(action.get("margin") or 0),
+                        "category": action.get("category")
+                        or symbol_risk_category(action.get("symbol")),
+                    }
+                    for action in actions
+                    if action.get("action") == "open"
+                )
+                portfolio_ok, portfolio_reason = check_portfolio_risk(
+                    bluechip_risk_positions,
+                    balance,
+                    sym,
+                    "core_bluechip",
+                    float(pos_info.get("margin") or 0),
+                )
+                if not portfolio_ok:
+                    self._record_decision(
+                        s,
+                        run_id=run_id,
+                        side=side,
+                        mode="bluechip_trend",
+                        decision_stage="portfolio_risk",
+                        decision_result="filtered",
+                        filter_reason=portfolio_reason,
+                        risk_params=pos_info,
+                        market_regime=regime,
+                    )
+                    continue
+
                 stop_distance = float(pos_info.get("stop_loss") or price * float(pos_info.get("stop_pct") or 0.03))
                 stop_price = (price - stop_distance) if side == "LONG" else (price + stop_distance)
                 tp_levels = _bluechip_tp_levels(price, side, pos_info.get("stop_pct"))
@@ -4332,6 +4605,7 @@ class ExecutionEngine:
                     "grade": s.get("grade") or s.get("composite_summary") or "",
                     "score": score,
                     "invested": invested,
+                    "margin": float(pos_info.get("margin") or 0),
                     "run_id": run_id,
                     "scan_id": s.get("scan_id"),
                     "entry_mode": s.get("bluechip_entry_mode"),
@@ -4370,7 +4644,7 @@ class ExecutionEngine:
 
         open_count = len([a for a in actions if a.get("action") == "open"])
         alpha_avail = max(0, adj_max_pos - open_count)
-        if alpha_enabled:
+        if alpha_enabled and entry_risk_allowed:
             alpha_actions = self._build_alpha_open_actions(
                 current_positions,
                 balance,
@@ -4381,7 +4655,10 @@ class ExecutionEngine:
             if alpha_actions:
                 actions.extend(alpha_actions)
         elif alpha_avail > 0:
-            logger.info("  alpha trading runtime switch is OFF; skip alpha open candidates")
+            logger.info(
+                "  skip alpha open candidates: %s",
+                "runtime switch is OFF" if not alpha_enabled else entry_risk_reason,
+            )
 
         return actions
 

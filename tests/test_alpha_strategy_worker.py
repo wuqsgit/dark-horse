@@ -232,7 +232,7 @@ class AlphaStrategyWorkerTest(unittest.TestCase):
         self.assertEqual(result.transition.action_type, ActionType.PROBE_LONG)
         self.assertEqual(
             result.transition.model_versions,
-            {"rules": "alpha-v2-rules-v1"},
+            {"rules": "alpha-v2-scored-rules-v2"},
         )
 
     def test_rule_fallback_emits_normal_probe_on_same_setup_bar(self):

@@ -55,7 +55,6 @@ def _filter_legacy_alpha_entries(actions: list, strategy_v2: dict) -> list:
         if not (
             action.get("action") == "open"
             and action.get("strategy_source") == "alpha"
-            and action.get("event_type") != "explosive_breakout"
         )
     ]
 
@@ -65,7 +64,6 @@ def _filter_account_entry_actions(actions: list, account: dict) -> list:
         action
         for action in actions
         if action.get("action") != "open"
-        or action.get("event_type") == "explosive_breakout"
         or (
             action.get("strategy_source") == "alpha"
             and bool(account.get("alpha_trading_enabled"))

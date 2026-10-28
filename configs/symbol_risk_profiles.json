@@ -1,7 +1,18 @@
 {
   "version": "2026-07-04-risk-profile-v1",
-  "default_class": "narrative",
+  "default_class": "unclassified",
   "classes": {
+    "unclassified": {
+      "label": "Unclassified / New Listing",
+      "description": "Unknown or newly listed assets use conservative sizing until explicitly classified.",
+      "min_score_offset": 8,
+      "min_entry_alpha_offset": 8,
+      "max_position_factor": 0.18,
+      "probe_position_factor": 0.1,
+      "cooldown_multiplier": 2.0,
+      "allowed_templates": ["breakout", "momentum", "short_breakdown"],
+      "require_live_depth": true
+    },
     "core_bluechip": {
       "label": "Core Bluechip",
       "description": "BTC/ETH/SOL style deep liquidity trend instruments.",
