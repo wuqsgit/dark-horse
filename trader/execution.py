@@ -49,6 +49,7 @@ def _account_loss_state() -> tuple[float, int]:
         ).fetchone()
         recent = conn.execute(
             """SELECT pnl FROM trades WHERE account_id=?
+               AND datetime(created_at) >= datetime('now', '-6 hours')
                ORDER BY datetime(created_at) DESC, id DESC LIMIT 20""",
             (account_id,),
         ).fetchall()
@@ -589,7 +590,7 @@ def _fetch_closed_futures_15m(symbol: str, limit: int = 16, now: datetime | None
         rows = conn.execute(
             """SELECT time, low, high, close, volume, quote_vol, taker_buy_quote_vol
                FROM futures_candles_15m
-               WHERE symbol = ?
+               WHERE symbol = ? AND source_env='mainnet' AND is_closed=1
                ORDER BY time DESC
                LIMIT ?""",
             (symbol, max(int(limit), 4)),
@@ -1153,7 +1154,7 @@ def _check_alpha_futures_breakout_confirmation(
             """
             SELECT time, high, low, close, quote_vol
             FROM futures_candles_15m
-            WHERE symbol = ? AND time <= ?
+            WHERE symbol = ? AND time <= ? AND source_env='mainnet' AND is_closed=1
             ORDER BY time DESC
             LIMIT 6
             """,
@@ -1553,37 +1554,24 @@ class ExecutionEngine:
         return self._trading_symbols
 
     def _sync_tracker(self, positions: list):
-        """Sync local position tracker."""
-        for p in positions:
-            sym = p["symbol"]
-            if sym not in self._pos_tracker:
-                self._pos_tracker[sym] = {
-                    "highest_price": p["mark_price"],
-                    "entry_price": p["entry_price"],
-                }
-            else:
-                # Update the highest price seen while the position is open.
-                self._pos_tracker[sym]["highest_price"] = max(
-                    self._pos_tracker[sym]["highest_price"], p["mark_price"]
-                )
-
-    def _sync_tracker(self, positions: list):
-        from shared.db import get_position_history, update_position_management
+        from shared.db import get_position_history, update_position_management, set_position_context
 
         for p in positions:
             sym = p["symbol"]
+            set_position_context(sym, p.get("side"))
+            key = (sym, p.get("side"))
             hist = get_position_history(sym) or {}
             stored_high = float(hist.get("highest_price") or 0)
             stored_low = float(hist.get("lowest_price") or 0)
             mark_price = float(p.get("mark_price") or 0)
             current_high = max(stored_high, float(p.get("mark_price") or 0))
             current_low = min([v for v in (stored_low, mark_price) if v > 0], default=mark_price)
-            if sym in self._pos_tracker:
-                current_high = max(current_high, float(self._pos_tracker[sym].get("highest_price") or 0))
-                tracked_low = float(self._pos_tracker[sym].get("lowest_price") or 0)
+            if key in self._pos_tracker:
+                current_high = max(current_high, float(self._pos_tracker[key].get("highest_price") or 0))
+                tracked_low = float(self._pos_tracker[key].get("lowest_price") or 0)
                 if tracked_low > 0:
                     current_low = min(current_low, tracked_low)
-            self._pos_tracker[sym] = {
+            self._pos_tracker[key] = {
                 "highest_price": current_high,
                 "lowest_price": current_low,
                 "entry_price": p["entry_price"],
@@ -1608,6 +1596,8 @@ class ExecutionEngine:
 
         for pos in positions:
             symbol = pos.get("symbol")
+            from shared.db import set_position_context
+            set_position_context(symbol, pos.get("side"))
             if not symbol or get_position_history(symbol):
                 continue
             side = str(pos.get("side") or "").upper()
@@ -1685,8 +1675,8 @@ class ExecutionEngine:
                 # A profitable legacy position may have lost its local TP flags
                 # during an upgrade/restart. Replaying TP1/TP2 would reduce it
                 # again, so recover flags from either evidence or current R.
-                tp1_hit=1 if evidence.get("tp1_hit") or recovered_r >= 1 else 0,
-                tp2_hit=1 if evidence.get("tp2_hit") or recovered_r >= 2 else 0,
+                tp1_hit=1 if evidence.get("tp1_hit") else 0,
+                tp2_hit=1 if evidence.get("tp2_hit") else 0,
                 last_exit_reason=evidence.get("last_exit_reason"),
                 highest_price=float(pos.get("mark_price") or entry_price),
                 lowest_price=float(pos.get("mark_price") or entry_price),
@@ -2533,6 +2523,8 @@ class ExecutionEngine:
         latest_map = _latest_by_symbol(top_symbols)
         for pos in current_positions:
             sym = pos["symbol"]
+            from shared.db import set_position_context
+            set_position_context(sym, pos.get("side"))
             latest = latest_map.get(sym) or {}
             raw = _raw_features(latest)
             hist_perf = raw.get("historical_performance") or {}
@@ -2604,7 +2596,7 @@ class ExecutionEngine:
             ret_24h = float(tech.get("return_24h") or 0)
             depth_score = float(depth.get("depth_ratio_score") or 50)
             robot_signature = bool(depth.get("robot_signature"))
-            tracker = self._pos_tracker.get(sym, {})
+            tracker = self._pos_tracker.get((sym, side), {})
             highest_price = float(tracker.get("highest_price") or mark_price)
             lowest_price = float(tracker.get("lowest_price") or mark_price)
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
@@ -2837,7 +2829,7 @@ class ExecutionEngine:
                     continue
                 if age_h is not None and age_h >= float(bluechip_cfg.get("time_stop_hours", 6)):
                     if pnl_pct < float(bluechip_cfg.get("time_stop_min_return", 0.008)) * 100:
-                        self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_bluechip_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
+                        add("close", f"bluechip_time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
                         continue
                 if hold_alpha < min_entry_alpha and pnl_pct <= 1:
                     self._record_decision(latest, run_id=run_id, side=side, decision_stage="position_management", decision_result="hold", filter_reason=f"soft_hold_bluechip_entry_alpha_fade {hold_alpha:.1f} pnl={pnl_pct:.1f}%")
@@ -2856,6 +2848,10 @@ class ExecutionEngine:
                 continue
             if float(r_state.get("r_multiple") or 0) >= 1 and not int(hist.get("tp1_hit") or 0):
                 add("partial_close", "TP1 r>=1", 0.25)
+                continue
+            if not latest:
+                # Missing scores are not evidence of score decay. Structural
+                # stops and price-based profit management above remain active.
                 continue
             if robot_signature and hold_alpha < 55 and pnl_pct <= soft_exit_loss_pct:
                 add("partial_close", f"orderbook_robot_signature_risk hold_alpha={hold_alpha:.1f} pnl={pnl_pct:.1f}%", 0.25)
@@ -3446,7 +3442,7 @@ class ExecutionEngine:
                 if entry_profile.get("status") == "probe"
                 else "effective_position_size_factor"
             )
-            size_multiplier *= float(entry_profile.get(profile_factor_key) or 1.0)
+            size_multiplier *= float((entry_profile.get("thresholds") or {}).get(profile_factor_key, 1.0))
             if explosive_candidate:
                 size_multiplier = min(1.0, size_multiplier)
             pos_info = calculate_position(
@@ -3660,6 +3656,8 @@ class ExecutionEngine:
 
         for pos in current_positions:
             sym = pos.get("symbol")
+            from shared.db import set_position_context
+            set_position_context(sym, pos.get("side"))
             if not sym or sym in blocked_symbols:
                 continue
 
@@ -3696,7 +3694,7 @@ class ExecutionEngine:
             phase_name = str(market_phase.get("phase") or "")
             phase_confidence = float(market_phase.get("confidence") or 0)
             phase_style = str(market_phase.get("position_style") or "")
-            if phase_name == "breakdown_risk" or (
+            if (phase_name == "breakdown_risk" and side != "SHORT") or (
                 phase_name == "uncertain" and (phase_confidence <= 25 or phase_style == "skip")
             ):
                 block(f"market_phase_{phase_name or 'unknown'}")
@@ -3786,10 +3784,9 @@ class ExecutionEngine:
                 f"trigger={decision.trigger_mode or 'profit'} trend_confirmed "
                 f"profile={roll_confirmation}"
             )
-            planned_actions[:] = [
-                a for a in planned_actions
-                if not (a.get("symbol") == sym and a.get("action") == "partial_close")
-            ]
+            if any(a.get("symbol") == sym and a.get("action") == "partial_close" for a in planned_actions):
+                block("risk_reduction_has_priority")
+                continue
             roll_action = {
                 "action": "roll_add",
                 "symbol": sym,
@@ -3877,7 +3874,8 @@ class ExecutionEngine:
 
         self._sync_tracker(current_positions)
         actions.extend(self._build_position_actions(top_symbols, current_positions, run_id=run_id))
-        actions.extend(self._build_roll_actions(top_symbols, current_positions, actions, balance, run_id=run_id))
+        if entry_risk_allowed:
+            actions.extend(self._build_roll_actions(top_symbols, current_positions, actions, balance, run_id=run_id))
 
         # Position management and roll actions are built above. Record them before
         # selecting any new entries so every planned exit remains auditable.
@@ -4194,7 +4192,7 @@ class ExecutionEngine:
                     if entry_profile.get("status") == "probe"
                     else "effective_position_size_factor"
                 )
-                size_multiplier *= float(entry_profile.get(profile_factor_key) or 1.0)
+                size_multiplier *= float((entry_profile.get("thresholds") or {}).get(profile_factor_key, 1.0))
                 directional_alpha = entry_alpha_for_side(s, side)
                 short_cfg = self.cfg.get("short_trading") or {}
                 if side == "SHORT" and directional_alpha < float(short_cfg.get("full_position_alpha", 72)):
@@ -4667,6 +4665,11 @@ class ExecutionEngine:
         results = []
         for act in actions:
             try:
+                from shared.db import set_position_context
+                if not act.get("position_side"):
+                    opening = act.get("action") in {"open", "roll_add"}
+                    act["position_side"] = "LONG" if (act.get("side") == "BUY") == opening else "SHORT"
+                set_position_context(act.get("symbol"), act["position_side"])
                 if act.get("action") in {"open", "roll_add"}:
                     account_id = getattr(self.ex, "account_id", None)
                     if account_id is not None:
@@ -4693,6 +4696,60 @@ class ExecutionEngine:
                                 **act,
                             })
                             continue
+                        live_risk_positions = self.ex.get_positions()
+                        live_balance = self.get_balance()
+                        if act.get("action") == "open" and len(live_risk_positions) >= int(self.cfg.get("max_positions", 5)):
+                            results.append({**act, "status": "blocked", "error": "account_max_positions"})
+                            continue
+                        from shared.db import is_market_entry_ready
+                        ready, data_error = is_market_entry_ready(act["symbol"], act.get("strategy_source", "normal"), act.get("alpha_symbol"))
+                        if not ready:
+                            results.append({**act, "status": "blocked", "error": f"market_data_not_ready:{data_error}"})
+                            continue
+                        if act.get("signal_source") == "alpha_strategy_v2":
+                            from trader.alpha_signal_consumer import AlphaSignalConsumer
+                            confirmed, confirmation_reason, _ = AlphaSignalConsumer(self.ex, config=self.cfg)._strict_entry_confirmation(
+                                event={"snapshot_id": act.get("alpha_snapshot_id"), "alpha_symbol": act.get("alpha_symbol")},
+                                action_type=act.get("alpha_action_type", "CONFIRM_LONG"), symbol=act["symbol"],
+                            )
+                            if not confirmed:
+                                results.append({**act, "status": "blocked", "error": confirmation_reason})
+                                continue
+                        from trader.cooldown_manager import is_daily_limit_reached, is_in_cooldown
+                        cooling, cooling_reason, _ = is_in_cooldown(act["symbol"])
+                        if is_daily_limit_reached(act["symbol"]) or cooling:
+                            results.append({**act, "status": "blocked", "error": cooling_reason or "daily_stop_limit"})
+                            continue
+                        from trader.symbol_risk import base_asset
+                        new_base = base_asset(act["symbol"])
+                        correlated = any(
+                            new_base in group and any(
+                                p.get("symbol") != act["symbol"] and base_asset(p.get("symbol")) in group
+                                and p.get("side") == act.get("position_side")
+                                for p in live_risk_positions
+                            )
+                            for group in self.cfg.get("correlation_groups", [])
+                        )
+                        if correlated:
+                            results.append({**act, "status": "blocked", "error": "correlated_exposure"})
+                            continue
+                        daily_pnl, loss_count = _account_loss_state()
+                        daily_ok, daily_reason = check_daily_loss_limit(daily_pnl, live_balance) if live_balance > 0 else (False, "invalid_balance")
+                        loss_ok, loss_reason = check_consecutive_losses(loss_count)
+                        margin = float(act.get("quantity") or 0) * float(act.get("entry_price") or 0) / max(float(act.get("leverage") or 1), 1)
+                        portfolio_ok, portfolio_reason = check_portfolio_risk(
+                            _portfolio_positions(live_risk_positions), live_balance,
+                            act["symbol"], symbol_risk_category(act["symbol"]), margin,
+                        )
+                        if not (daily_ok and loss_ok and portfolio_ok):
+                            reason = daily_reason if not daily_ok else (loss_reason if not loss_ok else portfolio_reason)
+                            results.append({**act, "status": "blocked", "error": reason})
+                            continue
+                        if act.get("action") == "roll_add":
+                            existing = next((p for p in live_risk_positions if self._position_matches_action(p, act)), None)
+                            if not existing or float(existing.get("unrealized_pnl") or 0) <= 0:
+                                results.append({**act, "status": "blocked", "error": "add_requires_profitable_position"})
+                                continue
                 if act["action"] == "open":
                     live_positions = self.ex.get_positions()
                     category_ok, category_reason = check_category_position_limit(
@@ -4848,7 +4905,7 @@ class ExecutionEngine:
             from shared.db import get_position_history, update_position_management
 
             positions = self.ex.get_positions()
-            pos = next((p for p in positions if p["symbol"] == act["symbol"]), None)
+            pos = next((p for p in positions if self._position_matches_action(p, act)), None)
             reason = str(act.get("reason", ""))
             updates = {"last_exit_reason": reason}
             if pos:
@@ -5182,7 +5239,6 @@ class ExecutionEngine:
         )
 
         # Record the open-position cooldown.
-        record_profit(act['symbol'], is_weak_exit=False)
         try:
             from shared.db import new_position_id, upsert_position_history
             position_id = act.get("position_id") or new_position_id(act["symbol"], act["position_side"])
@@ -5220,7 +5276,7 @@ class ExecutionEngine:
             logger.warning(f"    position history write failed: {e}")
         
         # 杩借釜鐘舵佸垵濮嬪寲
-        self._pos_tracker[act["symbol"]] = {
+        self._pos_tracker[(act["symbol"], act.get("position_side"))] = {
             "highest_price": act["entry_price"],
             "lowest_price": act["entry_price"],
             "entry_price": act["entry_price"],
@@ -5232,7 +5288,7 @@ class ExecutionEngine:
         })
 
     def _execute_roll_add(self, act, results):
-        from shared.db import insert_order, record_position_roll_event, update_position_management
+        from shared.db import get_position_history, insert_order, record_position_roll_event, update_position_management
         from trader.roll_policy import calculate_protected_stop
 
         logger.info(
@@ -5295,6 +5351,10 @@ class ExecutionEngine:
         protected_stop = calculate_protected_stop(
             act["position_side"], actual_entry, self.cfg.get("roll_trading") or {}
         )
+        history = get_position_history(act["symbol"]) or {}
+        previous_stop = float(history.get("current_stop_loss") or history.get("protected_stop") or 0)
+        if previous_stop > 0:
+            protected_stop = max(protected_stop, previous_stop) if act["position_side"] == "LONG" else min(protected_stop, previous_stop)
         stop_is_valid = (
             act["position_side"] == "LONG" and 0 < protected_stop < mark_price
         ) or (
@@ -5428,6 +5488,9 @@ class ExecutionEngine:
             quantity=pos["quantity"],
             position=pos,
         )
+        remaining = next((p for p in self.ex.get_positions() if self._position_matches_action(p, act)), None)
+        if remaining and float(remaining.get("quantity") or 0) > 0:
+            raise RuntimeError(f"close not complete; management state retained: {act['symbol']}")
         from shared.db import delete_position_history, get_position_history, record_trade
         hist = get_position_history(act["symbol"]) or {}
         pnl = pos.get("unrealized_pnl", 0)
@@ -5476,9 +5539,10 @@ class ExecutionEngine:
         if act.get("is_stop"):
             record_stop(act["symbol"], pnl)
             logger.info("    Stop-loss cooldown: %s 24h", act["symbol"])
+        elif pnl > 0:
+            record_profit(act["symbol"], is_weak_exit=False)
         
-        if act["symbol"] in self._pos_tracker:
-            del self._pos_tracker[act["symbol"]]
+        self._pos_tracker.pop((act["symbol"], pos.get("side")), None)
         results.append({
             "status": "ok",
             **act,
@@ -5494,7 +5558,9 @@ class ExecutionEngine:
             return False
 
         pct = act.get("close_pct", 0.50)
-        close_qty = round(pos["quantity"] * pct, 3)
+        close_qty = pos["quantity"] * pct
+        if hasattr(self.ex, "adjust_quantity"):
+            close_qty = self.ex.adjust_quantity(act["symbol"], close_qty)
         min_remaining_fraction = max(
             0.0,
             min(float(act.get("min_remaining_fraction") or 0), 1.0),
@@ -5505,7 +5571,9 @@ class ExecutionEngine:
             )
             runner_floor = initial_quantity * min_remaining_fraction
             max_close_qty = max(0.0, float(pos["quantity"]) - runner_floor)
-            close_qty = round(min(close_qty, max_close_qty), 3)
+            close_qty = min(close_qty, max_close_qty)
+            if hasattr(self.ex, "adjust_quantity"):
+                close_qty = self.ex.adjust_quantity(act["symbol"], close_qty)
         if close_qty <= 0:
             return False
 
@@ -5546,7 +5614,7 @@ class ExecutionEngine:
         except TypeError:
             order = self.ex.close_position_market(act["symbol"], act["side"], close_qty)
         try:
-            executed_qty = float((order or {}).get("executedQty") or close_qty)
+            executed_qty = float((order or {}).get("executedQty") or 0)
         except Exception:
             executed_qty = 0.0
         if executed_qty <= 0:
@@ -5694,5 +5762,5 @@ class ExecutionEngine:
                 delete_position_history(act["symbol"])
             except Exception as e:
                 logger.warning(f"    residual position history cleanup failed: {e}")
-            self._pos_tracker.pop(act["symbol"], None)
+            self._pos_tracker.pop((act["symbol"], pos.get("side")), None)
         return True

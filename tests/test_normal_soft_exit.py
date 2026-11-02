@@ -97,7 +97,7 @@ class NormalSoftExitTest(unittest.TestCase):
     def test_peak_profit_giveback_closes_before_turning_into_loss(self):
         engine = ExecutionEngine(SoftExitExchange())
         engine._record_decision = lambda *args, **kwargs: None
-        engine._pos_tracker["XPINUSDT"] = {
+        engine._pos_tracker[("XPINUSDT", "LONG")] = {
             "highest_price": 108,
             "lowest_price": 100,
             "entry_price": 100,
@@ -115,7 +115,7 @@ class NormalSoftExitTest(unittest.TestCase):
     def test_peak_profit_stage_one_reduces_and_protects_position(self):
         engine = ExecutionEngine(SoftExitExchange())
         engine._record_decision = lambda *args, **kwargs: None
-        engine._pos_tracker["XPINUSDT"] = {
+        engine._pos_tracker[("XPINUSDT", "LONG")] = {
             "highest_price": 110,
             "lowest_price": 100,
             "entry_price": 100,

@@ -79,7 +79,7 @@ class AlphaStrategyRepository:
         finally:
             conn.close()
 
-    def get_feature_snapshot(self, snapshot_id: str | None) -> dict | None:
+    def get_feature_snapshot(self, snapshot_id: str | None, *, latest=False) -> dict | None:
         if not snapshot_id:
             return None
         conn = get_conn()
@@ -89,6 +89,13 @@ class AlphaStrategyRepository:
                    WHERE snapshot_id=?""",
                 (str(snapshot_id),),
             ).fetchone()
+            if row and latest:
+                row = conn.execute(
+                    """SELECT * FROM alpha_feature_snapshots
+                       WHERE market_env=? AND futures_symbol=?
+                       ORDER BY datetime(candle_close_time) DESC, datetime(created_at) DESC LIMIT 1""",
+                    (row["market_env"], row["futures_symbol"]),
+                ).fetchone()
         finally:
             conn.close()
         if not row:

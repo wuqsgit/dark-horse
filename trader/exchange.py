@@ -219,7 +219,7 @@ class BinanceFutures:
         positions = []
         for pos in data:
             amt = self._safe_float(pos.get("positionAmt", "0"))
-            if abs(amt) < 0.001:
+            if amt == 0:
                 continue
 
             symbol = pos["symbol"]
@@ -598,6 +598,8 @@ class BinanceFutures:
 
     def get_atr(self, symbol: str, period: int = 14) -> float:
         klines = self.get_klines(symbol, "4h", period + 10)
+        now_ms = int(time.time() * 1000)
+        klines = [k for k in klines if len(k) > 6 and int(k[6]) < now_ms]
         highs = [float(k[2]) for k in klines[-period - 1:]]
         lows = [float(k[3]) for k in klines[-period - 1:]]
         closes = [float(k[4]) for k in klines[-period - 1:]]

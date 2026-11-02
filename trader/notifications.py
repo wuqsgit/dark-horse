@@ -26,7 +26,7 @@ def _message_text(result: dict, copy_number: int, copies: int) -> str:
     error = result.get("error") or result.get("data_error")
     event_type = str(result.get("event_type") or "explosive_breakout")
     lines = [
-        f"【爆发行情提醒 {copy_number}/{copies}】",
+        "【爆发行情提醒】" if copies == 1 else f"【爆发行情提醒 {copy_number}/{copies}】",
         f"币种：{result.get('symbol') or '-'}",
         f"方向：{side}",
         f"状态：{_execution_label(result.get('status'))}",
@@ -48,7 +48,7 @@ class ExplosiveFeishuNotifier:
         self,
         webhook=None,
         *,
-        copies=3,
+        copies=1,
         timeout_seconds=2.0,
         retry_attempts=3,
         post=None,

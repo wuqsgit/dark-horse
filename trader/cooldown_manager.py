@@ -6,7 +6,12 @@
 
 import time
 from datetime import datetime, timedelta, timezone
-from shared.db import get_conn
+from shared.db import get_conn, current_account_id
+
+
+def _scoped_symbol(symbol):
+    account_id = current_account_id()
+    return str(symbol) if account_id == 1 else f"{account_id}:{symbol}"
 
 # 冷却时间配置（秒）
 COOLDOWN_AFTER_STOP = 6 * 3600       # 单次止损后冷却6小时
@@ -17,6 +22,7 @@ def is_in_cooldown(symbol: str) -> tuple:
     """检查币种是否在冷却中
     Returns: (bool, reason, seconds_remaining)
     """
+    symbol = _scoped_symbol(symbol)
     conn = get_conn()
     try:
         row = conn.execute(
@@ -47,7 +53,7 @@ def is_in_cooldown(symbol: str) -> tuple:
             conn.close()
         except:
             pass
-        return False, "", 0
+        return True, "cooldown_state_unavailable", 60
 
 
 def record_stop(symbol: str, pnl: float = 0) -> None:
@@ -56,6 +62,7 @@ def record_stop(symbol: str, pnl: float = 0) -> None:
         symbol: 币种
         pnl: 止损亏损金额
     """
+    symbol = _scoped_symbol(symbol)
     conn = get_conn()
     try:
         now = datetime.now(timezone.utc)
@@ -135,6 +142,7 @@ def record_profit(symbol: str, is_weak_exit: bool = False) -> None:
         symbol: 币种
         is_weak_exit: 是否是弱退出（是的话不重置计数）
     """
+    symbol = _scoped_symbol(symbol)
     conn = get_conn()
     try:
         row = conn.execute(
@@ -164,6 +172,7 @@ def record_profit(symbol: str, is_weak_exit: bool = False) -> None:
                 VALUES (?, ?, 0, 0, ?, ?)
             """, (symbol, now.isoformat(), cooldown_until.isoformat(), '开仓冷却30min'))
             conn.commit()
+        conn.commit()
         conn.close()
     except Exception as e:
         try:
@@ -187,7 +196,12 @@ def get_daily_stop_count() -> dict:
         ).fetchall()
         conn.close()
         
-        return {r["symbol"]: r["stop_count_24h"] or 0 for r in rows}
+        prefix = "" if current_account_id() == 1 else f"{current_account_id()}:"
+        return {
+            r["symbol"][len(prefix):]: r["stop_count_24h"] or 0
+            for r in rows
+            if (r["symbol"].startswith(prefix) if prefix else ":" not in r["symbol"])
+        }
     except Exception as e:
         try:
             conn.close()

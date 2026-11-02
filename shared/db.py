@@ -67,10 +67,20 @@ OPERATIONAL_RETENTION_TABLES = {
 
 _local = threading.local()
 _account_context = ContextVar("darkhorse_account_id", default=1)
+_position_context = ContextVar("darkhorse_position", default=None)
+
+
+def set_position_context(symbol, side):
+    _position_context.set((str(symbol), str(side).upper()))
+
+
+def _history_side(symbol, side=None):
+    context = _position_context.get()
+    return side or (context[1] if context and context[0] == str(symbol) else None)
 _init_lock = threading.RLock()
 _database_write_lock = threading.RLock()
 _initialized_databases = set()
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 
 def _serialized_write(function):
@@ -1512,7 +1522,8 @@ def init_db():
     conn.execute(
         "CREATE TABLE IF NOT EXISTS account_position_history AS SELECT 1 AS account_id, * FROM position_history"
     )
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_account_position_history_key ON account_position_history(account_id, symbol)")
+    conn.execute("DROP INDEX IF EXISTS idx_account_position_history_key")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_account_position_history_direction ON account_position_history(account_id, symbol, side)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_account_time ON orders(account_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_account_time ON fills(account_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_account_symbol_time ON fills(account_id, symbol, created_at, id)")
@@ -3578,14 +3589,14 @@ def upsert_position_history(
     """V3.0 璁板綍/鏇存柊寮€浠撲俊鎭紝閲嶅惎鍚庡彲鎭㈠"""
     conn = get_conn()
     account_id = current_account_id()
-    existing = conn.execute("SELECT position_id FROM account_position_history WHERE account_id=? AND symbol=?", (account_id, symbol)).fetchone()
+    existing = conn.execute("SELECT position_id FROM account_position_history WHERE account_id=? AND symbol=? AND side=?", (account_id, symbol, side)).fetchone()
     if (
         existing
         and position_id
         and existing["position_id"]
         and str(existing["position_id"]) != str(position_id)
     ):
-        conn.execute("DELETE FROM account_position_history WHERE account_id=? AND symbol=?", (account_id, symbol))
+        conn.execute("DELETE FROM account_position_history WHERE account_id=? AND symbol=? AND side=?", (account_id, symbol, side))
         existing = None
     position_id = position_id or (existing["position_id"] if existing and "position_id" in existing.keys() else None) or new_position_id(symbol, side)
     conn.execute(
@@ -3596,7 +3607,7 @@ def upsert_position_history(
             lowest_price, stop_model, initial_stop_loss, stop_pct, current_stop_loss,
             trailing_atr_multiplier, update_time)
            VALUES (?,?,?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
-           ON CONFLICT(account_id, symbol) DO UPDATE SET
+           ON CONFLICT(account_id, symbol, side) DO UPDATE SET
              side=excluded.side,
              quantity=excluded.quantity,
              entry_price=excluded.entry_price,
@@ -3656,11 +3667,15 @@ def upsert_position_history(
     return position_id
 
 
-def get_position_history(symbol):
+def get_position_history(symbol, side=None):
     """Fetch persisted live position entry state."""
     conn = get_conn()
-    row = conn.execute("SELECT * FROM account_position_history WHERE account_id=? AND symbol=?", (current_account_id(), symbol)).fetchone()
+    direction = _history_side(symbol, side)
+    rows = conn.execute("SELECT * FROM account_position_history WHERE account_id=? AND symbol=? AND (? IS NULL OR side=?)", (current_account_id(), symbol, direction, direction)).fetchall()
     conn.close()
+    if len(rows) > 1:
+        raise ValueError(f"position direction required: {symbol}")
+    row = rows[0] if rows else None
     return dict(row) if row else None
 
 
@@ -3727,10 +3742,13 @@ def fetch_position_recovery_evidence(symbol, side):
         conn.close()
 
 
-def delete_position_history(symbol):
+def delete_position_history(symbol, side=None):
     """Delete persisted live position entry state after close."""
     conn = get_conn()
-    conn.execute("DELETE FROM account_position_history WHERE account_id=? AND symbol=?", (current_account_id(), symbol))
+    direction = _history_side(symbol, side)
+    if direction is None:
+        get_position_history(symbol)
+    conn.execute("DELETE FROM account_position_history WHERE account_id=? AND symbol=? AND (? IS NULL OR side=?)", (current_account_id(), symbol, direction, direction))
     if current_account_id() == 1:
         conn.execute("DELETE FROM position_history WHERE symbol=?", (symbol,))
     conn.commit()
@@ -3780,9 +3798,12 @@ def update_position_management(symbol, **fields):
         return
     conn = get_conn()
     assignments = ", ".join([f"{k}=?" for k in updates])
-    values = list(updates.values()) + [current_account_id(), symbol]
+    direction = _history_side(symbol)
+    if direction is None:
+        get_position_history(symbol)
+    values = list(updates.values()) + [current_account_id(), symbol, direction, direction]
     conn.execute(
-        f"UPDATE account_position_history SET {assignments}, update_time=datetime('now') WHERE account_id=? AND symbol=?",
+        f"UPDATE account_position_history SET {assignments}, update_time=datetime('now') WHERE account_id=? AND symbol=? AND (? IS NULL OR side=?)",
         values,
     )
     if current_account_id() == 1:
@@ -6407,13 +6428,13 @@ def fetch_24h_quote_volume(symbol):
     """鑾峰彇24h鎴愪氦棰濓紙鐢ㄤ簬璁＄畻澶у崟闃堝€硷級"""
     conn = get_conn()
     row = conn.execute(
-        """SELECT quote_vol FROM candles_1h
+        """SELECT SUM(quote_vol) AS quote_vol FROM candles_1h
            WHERE symbol = ?
-             AND julianday(time) > julianday('now', '-25 hours')
-           ORDER BY julianday(time) DESC LIMIT 1""",
+             AND julianday(time) >= julianday('now', '-24 hours')
+             AND julianday(time) <= julianday('now', '-1 hour')""",
         (symbol,),
     ).fetchone()
-    return float(row["quote_vol"]) if row else 0
+    return float(row["quote_vol"] or 0) if row else 0
 
 
 ENTRY_REVIEW_SNAPSHOT_COLUMNS = (

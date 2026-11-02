@@ -41,6 +41,9 @@ class InitSqlSchemaTest(unittest.TestCase):
             initialized.executescript(INIT_SQL.read_text(encoding="utf-8"))
             initialized_objects = schema_objects(initialized)
             for object_key, definition in schema_objects(source).items():
+                if object_key == ("index", "idx_account_position_history_key"):
+                    self.assertIn(("index", "idx_account_position_history_direction"), initialized_objects)
+                    continue
                 self.assertIn(object_key, initialized_objects)
                 if object_key[0] == "table":
                     live_columns = table_columns(source, object_key[1])

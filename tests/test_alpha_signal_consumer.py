@@ -59,6 +59,8 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             return_value=(True, "confirmed", {"confirmation_volume_ratio": 1.8}),
         )
         self.breakout_patch.start()
+        self.canonical_patch = patch("shared.db.fetch_latest_alpha_position_context", return_value={"volume_price_state": "explosive_breakout_pending", "candidate_time": datetime.now(timezone.utc).isoformat()})
+        self.canonical_patch.start()
         db.init_db()
         self.account_token = db.set_account_context(7)
         self.repo = AlphaStrategyRepository()
@@ -83,6 +85,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
     def tearDown(self):
         db.reset_account_context(self.account_token)
         self.breakout_patch.stop()
+        self.canonical_patch.stop()
         self.readiness_patch.stop()
         self.db_patch.stop()
         self.temp_dir.cleanup()
@@ -217,11 +220,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         self.assertEqual(actions[0]["market_data_env"], "mainnet")
         self.assertEqual(actions[0]["execution_env"], "testnet")
         self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.70)
-        self.assertAlmostEqual(actions[0]["quantity"], 300.0)
+        self.assertAlmostEqual(actions[0]["quantity"], 56.7)
         self.assertAlmostEqual(
             actions[0]["quantity"] * actions[0]["entry_price"]
             / actions[0]["leverage"],
-            100.0,
+            18.9,
         )
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
         self.assertEqual(duplicate, [])

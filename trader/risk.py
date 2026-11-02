@@ -141,7 +141,7 @@ def calculate_position(
     else:
         margin_pct = float(sizing.get("confirmed_margin_pct", cfg.get("position_size_pct", 0.20)))
 
-    effective_size_multiplier = max(0.1, min(1.5, float(size_multiplier or 1.0)))
+    effective_size_multiplier = max(0.0, min(1.5, float(size_multiplier if size_multiplier is not None else 1.0)))
     if not strong_entry:
         score_adj = 1.0 if score is None else min(1.15, max(0.85, float(score) / 80.0))
         margin_pct *= score_adj
@@ -172,20 +172,15 @@ def calculate_position(
         )
     risk_budget = balance * risk_per_trade_pct
     risk_notional = risk_budget / stop_pct
-    # Strong confirmations use the configured balance-based margin directly.
-    # The risk budget remains observable, but does not silently shrink the order.
-    position_value = (
-        min(target_notional, risk_notional)
-        if enforce_risk_budget or not strong_entry
-        else target_notional
-    )
+    # Margin allocation and stop-distance risk are independent hard ceilings.
+    position_value = min(target_notional, risk_notional)
 
     max_notional = balance * max_margin_pct * leverage
     position_value = min(position_value, max_notional)
     margin = position_value / leverage if leverage else 0
     quantity = position_value / price if price > 0 else 0.0
     return {
-        "quantity": round(quantity, 3),
+        "quantity": quantity,
         "stop_loss": round(stop_distance, 8),
         "take_profit": round(stop_distance * 2, 8),
         "tp1_distance": round(stop_distance, 8),
@@ -514,7 +509,9 @@ def meets_safety_filters(score_row, side: str | None = None) -> tuple[bool, str]
             quote_volume = float(fetch_24h_quote_volume(symbol) or 0)
         except Exception:
             quote_volume = 0
-        if 0 < quote_volume < min_volume:
+        if quote_volume <= 0:
+            return False, "24h quote volume unavailable"
+        if quote_volume < min_volume:
             return False, f"24h quote volume {quote_volume:.0f} < {min_volume:.0f}"
 
     volatility = str(

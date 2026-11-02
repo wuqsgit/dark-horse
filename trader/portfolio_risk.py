@@ -90,7 +90,8 @@ def check_portfolio_risk(
     
     # 2. 单币仓位限制
     max_single = PORTFOLIO_RISK.get("max_single_exposure_pct", 0.30)
-    if new_invested / balance > max_single:
+    single_invested = sum(float(p.get("invested") or 0) for p in positions if p.get("symbol") == new_symbol)
+    if (single_invested + new_invested) / balance > max_single:
         logger.info(f"  {new_symbol}: 单币{new_invested/balance:.0%}>{max_single:.0%}, 拒绝")
         return False, f"单币{new_invested/balance:.0%}>{max_single:.0%}"
     

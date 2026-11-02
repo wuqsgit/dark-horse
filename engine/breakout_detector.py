@@ -18,7 +18,7 @@ def compute_breakout_metrics(symbol: str, period: int = 20) -> dict:
     try:
         rows = conn.execute("""
             SELECT time, high, volume, close FROM futures_candles_1h
-            WHERE symbol = ?
+            WHERE symbol = ? AND source_env='mainnet' AND is_closed=1
             ORDER BY time DESC LIMIT ?
         """, (symbol, period + 2)).fetchall()
         conn.close()
@@ -70,7 +70,7 @@ def compute_sr_levels(symbol: str, period: int = 20) -> dict:
     try:
         rows = conn.execute("""
             SELECT high, low, close FROM futures_candles_1h
-            WHERE symbol = ?
+            WHERE symbol = ? AND source_env='mainnet' AND is_closed=1
             ORDER BY time DESC LIMIT ?
         """, (symbol, period)).fetchall()
         conn.close()

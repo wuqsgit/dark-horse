@@ -1276,7 +1276,7 @@ CREATE INDEX idx_account_adjustments ON account_capital_adjustments(account_id, 
 CREATE INDEX idx_trade_entry_reviews_time ON trade_entry_reviews(entry_time DESC);
 CREATE INDEX idx_trade_entry_reviews_group ON trade_entry_reviews(strategy_source, category, entry_template, review_label);
 CREATE INDEX idx_trade_entry_reviews_status ON trade_entry_reviews(position_status, reviewed_at);
-CREATE UNIQUE INDEX idx_account_position_history_key ON account_position_history(account_id, symbol);
+CREATE UNIQUE INDEX idx_account_position_history_direction ON account_position_history(account_id, symbol, side);
 CREATE INDEX idx_orders_account_time ON orders(account_id, created_at DESC);
 CREATE INDEX idx_fills_account_time ON fills(account_id, created_at DESC);
 CREATE INDEX idx_fills_account_symbol_time ON fills(account_id, symbol, created_at, id);

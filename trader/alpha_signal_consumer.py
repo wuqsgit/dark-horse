@@ -89,6 +89,7 @@ class AlphaSignalConsumer:
             ).fetchone()
             recent = conn.execute(
                 """SELECT pnl FROM trades WHERE account_id=?
+                   AND datetime(created_at) >= datetime('now', '-6 hours')
                    ORDER BY datetime(created_at) DESC, id DESC LIMIT 20""",
                 (int(account_id),),
             ).fetchall()
@@ -124,7 +125,7 @@ class AlphaSignalConsumer:
         action_type: str,
         symbol: str,
     ) -> tuple[bool, str, dict]:
-        snapshot = self.repository.get_feature_snapshot(event.get("snapshot_id"))
+        snapshot = self.repository.get_feature_snapshot(event.get("snapshot_id"), latest=True)
         if not snapshot:
             return False, "alpha_v2_snapshot_missing", {}
         if str(snapshot.get("data_quality_status") or "").lower() != "ready":
@@ -151,6 +152,20 @@ class AlphaSignalConsumer:
             if volume_ratio < 0.8 or ret_15m < 0:
                 return False, "alpha_v2_retest_not_supported", features
             return True, "alpha_v2_retest_revalidated", features
+
+        from shared.db import fetch_latest_alpha_position_context
+        context = fetch_latest_alpha_position_context(symbol=symbol, alpha_symbol=event.get("alpha_symbol"))
+        if not context or context.get("volume_price_state") != "explosive_breakout_pending":
+            return False, "alpha_v2_canonical_volume_price_not_confirmed", features
+        context_time = context.get("candidate_time") or context.get("time")
+        try:
+            parsed = datetime.fromisoformat(str(context_time).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - parsed).total_seconds() > max_age * 60:
+                return False, "alpha_v2_canonical_context_stale", features
+        except (TypeError, ValueError):
+            return False, "alpha_v2_canonical_context_time_missing", features
 
         checks = {
             "alpha_score_80": float(features.get("alpha_discovery_score") or 0) >= 80,
@@ -191,11 +206,6 @@ class AlphaSignalConsumer:
             return []
         modes = self._event_modes()
         if not modes:
-            return []
-        if (
-            any(mode in LIVE_MODES for mode in modes)
-            and not bool(account.get("alpha_trading_enabled"))
-        ):
             return []
         account_id = int(account["id"])
         execution_env = self.account_market_env(account)
@@ -252,6 +262,8 @@ class AlphaSignalConsumer:
                 )
                 continue
             symbol = str(event["futures_symbol"]).upper()
+            from shared.db import set_position_context
+            set_position_context(symbol, "LONG")
             if any(
                 action.get("symbol") == symbol
                 for action in [*preplanned, *actions]
@@ -263,14 +275,14 @@ class AlphaSignalConsumer:
                 )
                 continue
             position = position_map.get(symbol)
-            if symbol not in trading_symbols:
+            if symbol not in trading_symbols and action_type != "INVALIDATE_PROBE":
                 self._reject(
                     account_id=account_id,
                     event=event,
                     reason="contract_not_tradable",
                 )
                 continue
-            ready, data_error = is_market_entry_ready(
+            ready, data_error = (True, None) if action_type == "INVALIDATE_PROBE" else is_market_entry_ready(
                 symbol,
                 "alpha",
                 event.get("alpha_symbol"),
@@ -293,7 +305,7 @@ class AlphaSignalConsumer:
                     )
                     continue
                 hist = get_position_history(symbol) or {}
-                if (hist.get("strategy_source") or "") != "alpha":
+                if (hist.get("strategy_source") or "") != "alpha" or position.get("side") != "LONG":
                     self._reject(
                         account_id=account_id,
                         event=event,
@@ -322,6 +334,10 @@ class AlphaSignalConsumer:
                 self._mark_planned(account_id, event, action)
                 continue
 
+            if not bool(account.get("alpha_trading_enabled")):
+                self._reject(account_id=account_id, event=event, reason="account_entry_disabled")
+                continue
+
             if action_type == "PROBE_LONG" and position:
                 self._reject(
                     account_id=account_id,
@@ -335,6 +351,9 @@ class AlphaSignalConsumer:
                     event=event,
                     reason="retest_requires_existing_position",
                 )
+                continue
+            if action_type == "RETEST_ADD" and float((position or {}).get("unrealized_pnl") or 0) <= 0:
+                self._reject(account_id=account_id, event=event, reason="retest_add_requires_profit")
                 continue
             if position:
                 hist = get_position_history(symbol) or {}
@@ -363,7 +382,7 @@ class AlphaSignalConsumer:
                         reason="account_max_positions",
                     )
                     continue
-                alpha_position_count = sum(
+                alpha_position_count = sum(a.get("action") == "open" and a.get("strategy_source") == "alpha" for a in [*preplanned, *actions]) + sum(
                     1
                     for item in positions
                     if (
@@ -407,7 +426,8 @@ class AlphaSignalConsumer:
             try:
                 open_orders = self.exchange.get_open_orders(symbol)
             except Exception:
-                open_orders = []
+                self._reject(account_id=account_id, event=event, reason="open_orders_unavailable")
+                continue
             conflicting = [
                 order for order in open_orders
                 if str(order.get("reduceOnly", "")).lower() not in {"true", "1"}
@@ -481,6 +501,8 @@ class AlphaSignalConsumer:
                 )
             ai_factor = float(event.get("max_position_factor") or 0)
             final_factor = min(stage_cap, ai_factor)
+            from trader.symbol_risk import get_symbol_risk
+            final_factor *= float((get_symbol_risk(symbol) or {}).get("max_position_factor", 1.0))
             if event["strategy_mode"] == "mainnet_canary":
                 final_factor *= float(
                     self.strategy.get("mainnet_canary_factor") or 0.25
@@ -546,6 +568,10 @@ class AlphaSignalConsumer:
                 )
                 for item in positions
             )
+            current_margin += sum(
+                float(a.get("quantity") or 0) * float(a.get("entry_price") or 0) / max(float(a.get("leverage") or 1), 1)
+                for a in [*preplanned, *actions] if a.get("action") in {"open", "roll_add"}
+            )
             max_usage = float(
                 account.get("max_capital_usage_pct")
                 or self.config.get("max_total_exposure_pct")
@@ -571,7 +597,11 @@ class AlphaSignalConsumer:
                 for item in positions
             ]
             portfolio_ok, portfolio_reason = check_portfolio_risk(
-                risk_positions,
+                risk_positions + [
+                    {"symbol": a.get("symbol"), "category": symbol_risk_category(a.get("symbol")),
+                     "invested": float(a.get("quantity") or 0) * float(a.get("entry_price") or 0) / max(float(a.get("leverage") or 1), 1)}
+                    for a in [*preplanned, *actions] if a.get("action") in {"open", "roll_add"}
+                ],
                 balance,
                 symbol,
                 symbol_risk_category(symbol),
@@ -625,6 +655,7 @@ class AlphaSignalConsumer:
                 ),
                 "alpha_suggested_position_pct": final_factor,
                 "alpha_signal_event_id": event["event_id"],
+                "alpha_snapshot_id": event.get("snapshot_id"),
                 "alpha_setup_id": event.get("setup_id"),
                 "alpha_action_type": action_type,
                 "ai_model_versions": _json(
@@ -741,22 +772,6 @@ class AlphaSignalConsumer:
         for row in self.repository.recoverable_consumptions(account_id):
             symbol = str(row["futures_symbol"]).upper()
             position = by_symbol.get(symbol)
-            if row["action_type"] in {
-                "PROBE_LONG",
-                "CONFIRM_LONG",
-                "RETEST_ADD",
-            } and position:
-                self.repository.update_consumption(
-                    account_id=account_id,
-                    event_id=row["event_id"],
-                    action_type=row["action_type"],
-                    status="FILLED",
-                    client_order_id=row.get("client_order_id"),
-                    position_id=row.get("position_id"),
-                    quantity=row.get("quantity"),
-                )
-                recovered["filled"] += 1
-                continue
             order = None
             if row.get("client_order_id"):
                 try:

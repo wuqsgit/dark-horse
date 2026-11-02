@@ -23,7 +23,7 @@ def detect_current_regime() -> str:
         trends = {"向上": 0, "向下": 0, "横盘": 0}
         volatilities = {"正常": 0, "偏高": 0, "极高": 0}
         
-        for s in symbols[:50]:  # 采样前50
+        for s in symbols:
             d = dict(s)
             td = d.get("trend_direction", "横盘")
             vl = d.get("volatility_level", "正常")
@@ -66,13 +66,13 @@ def adjust_strategy_for_regime(
     """
     if regime == "Panic Market":
         # 恐慌市场：提高门槛，减少仓位
-        return min_score + 15, max_positions - 1, f"{regime} +15分门槛, 减仓"
+        return min_score + 15, max(0, max_positions - 1), f"{regime} +15分门槛, 减仓"
     elif regime == "Bear Market":
         # 熊市：提高门槛
         return min_score + 10, max_positions, f"{regime} +10分门槛"
     elif regime == "Bull Market":
         # 牛市：降低门槛，放开仓位
-        return max(50, min_score - 5), min(max_positions + 1, 5), f"{regime} -5分门槛, 放开仓位"
+        return max(50, min_score - 5), max(0, max_positions), f"{regime} -5分门槛"
     else:
         # 震荡市场：保持默认
         return min_score, max_positions, "默认"

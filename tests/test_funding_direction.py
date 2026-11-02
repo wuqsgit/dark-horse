@@ -23,7 +23,7 @@ class FundingDirectionTest(unittest.TestCase):
         self.assertFalse(is_adverse_funding_rate(0.00537, 0.001, "SHORT"))
 
     def test_safety_filter_uses_position_direction(self):
-        with patch("trader.risk.get_symbol_threshold", return_value=60):
+        with patch("trader.risk.get_symbol_threshold", return_value=60), patch("shared.db.fetch_24h_quote_volume", return_value=2000000):
             long_ok, long_reason = meets_safety_filters(_row(-0.00537), side="LONG")
             short_ok, short_reason = meets_safety_filters(_row(-0.00537), side="SHORT")
 

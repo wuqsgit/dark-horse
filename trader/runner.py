@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 
@@ -75,7 +76,7 @@ def _filter_account_entry_actions(actions: list, account: dict) -> list:
     ]
 
 
-async def _account_trading_loop(account):
+async def _account_trading_loop(account, stop_event=None):
     from shared.accounts import account_exchange_config
     from shared.db import set_account_context
     account_id = int(account["id"])
@@ -135,7 +136,7 @@ async def _account_trading_loop(account):
     last_income_sync = 0  # 上次 income 同步时间
     loop_interval = int(TRADING_CONFIG.get("rebalance_interval_min", 5) * 60)
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             run_id = f"live-a{account['id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
             now = asyncio.get_event_loop().time()
@@ -186,8 +187,8 @@ async def _account_trading_loop(account):
                     last_error="实盘交易循环没有可用评分数据，当前无法判断开仓。",
                     details={"balance": balance, "position_count": len(positions)},
                 )
-                await asyncio.sleep(60)
-                continue
+                # Missing entry scores must never disable management of live risk.
+                rows = []
 
             # 评分降序排
             top = sorted(rows, key=lambda r: -r["composite_score"])
@@ -238,7 +239,8 @@ async def _account_trading_loop(account):
                 for r in top_symbols
             ])
 
-            logger.info(f"评分 Top: {top_symbols[0]['symbol']} ({top_symbols[0]['composite_score']:.1f})")
+            if top_symbols:
+                logger.info(f"评分 Top: {top_symbols[0]['symbol']} ({top_symbols[0]['composite_score']:.1f})")
 
             # 3. 决策
             recovered = engine.recover_untracked_positions(positions, top_symbols)
@@ -374,7 +376,12 @@ async def _account_trading_loop(account):
                 last_error=f"{type(e).__name__}: {e}",
             )
 
-        await asyncio.sleep(loop_interval)
+        if stop_event is None:
+            await asyncio.sleep(loop_interval)
+        else:
+            await asyncio.to_thread(stop_event.wait, loop_interval)
+
+    ex.close()
 
     # === 以下在 while True 之外（不会执行），保留供手动调用 ===
 
@@ -384,6 +391,7 @@ async def trading_loop():
 
     tasks = {}
     signatures = {}
+    stop_events = {}
     while True:
         try:
             accounts = list_accounts(include_secrets=True, enabled_only=True)
@@ -411,15 +419,21 @@ async def trading_loop():
             if account_id in tasks and not tasks[account_id].done() and signatures.get(account_id) == signature:
                 continue
             if account_id in tasks and not tasks[account_id].done():
-                tasks[account_id].cancel()
-            tasks[account_id] = asyncio.create_task(_account_trading_loop(account))
+                stop_events[account_id].set()
+                await tasks[account_id]
+            stop_events[account_id] = threading.Event()
+            tasks[account_id] = asyncio.create_task(asyncio.to_thread(
+                lambda a=account, stop=stop_events[account_id]: asyncio.run(_account_trading_loop(a, stop))
+            ))
             signatures[account_id] = signature
         for account_id in list(tasks):
             if account_id not in active_ids:
                 if not tasks[account_id].done():
-                    tasks[account_id].cancel()
+                    stop_events[account_id].set()
+                    await tasks[account_id]
                 tasks.pop(account_id, None)
                 signatures.pop(account_id, None)
+                stop_events.pop(account_id, None)
         await asyncio.sleep(30)
 
 

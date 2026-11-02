@@ -322,7 +322,8 @@ class AlphaStrategyWorker:
             "p_setup_success": min(1.0, max(0.0, setup_score / 100.0)),
             "p_followthrough": followthrough,
             "p_fakeout": fakeout,
-            "expected_r": max(0.0, followthrough - fakeout),
+            "expected_r": None,
+            "confidence_kind": "uncalibrated_rule_score",
             "max_position_factor": max_position_factor,
             "model_versions": {"fallback": "rule-recovery-v1"},
             "reasons": ["historical_gap_recovery"],
@@ -758,23 +759,23 @@ class AlphaStrategyWorker:
         normalized_setup = min(1.0, max(0.0, float(setup_score or 0) / 100.0))
         followthrough = 0.0
         fakeout = 0.5
-        if trigger.trigger_detected:
-            followthrough = min(0.78, 0.50 + normalized_setup * 0.22)
-            fakeout = max(0.20, 0.48 - normalized_setup * 0.22)
-        elif trigger.acceptance_confirmed:
+        if trigger.acceptance_confirmed:
             followthrough = min(0.84, 0.56 + normalized_setup * 0.24)
             fakeout = max(0.14, 0.43 - normalized_setup * 0.25)
+        elif trigger.trigger_detected:
+            followthrough = min(0.78, 0.50 + normalized_setup * 0.22)
+            fakeout = max(0.20, 0.48 - normalized_setup * 0.22)
         max_position_factor = 0.0
-        if trigger.trigger_detected:
+        if trigger.retest_confirmed:
+            max_position_factor = 1.0
+        elif trigger.acceptance_confirmed:
+            max_position_factor = 0.70
+        elif trigger.trigger_detected:
             max_position_factor = 0.5 if (
                 stage == "setup"
                 and setup_type == "sentiment_reversal"
                 and setup_score >= 100
             ) else 0.30
-        elif trigger.acceptance_confirmed:
-            max_position_factor = 0.70
-        elif trigger.retest_confirmed:
-            max_position_factor = 1.0
         return {
             **prediction,
             "status": "rule_shadow",

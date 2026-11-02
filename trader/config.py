@@ -42,7 +42,6 @@ TRADING_CONFIG = {
 
     # ── 评分阈值（统一标准） ──
     "min_score": 60,                    # 🔧 统一开仓门槛从 50→60
-    "consecutive_scans_required": 2,    # 🔧 连续 2 轮评分确认
     "max_signal_age_minutes": 75,       # Allow for collection/scoring jitter without accepting old signals
 
     # ── 时间止损（alpha-prd.md §5.4.3） ──

@@ -55,7 +55,7 @@ def explosive_watch():
 
 
 class ExplosiveFeishuNotificationTest(unittest.TestCase):
-    def test_one_explosive_setup_sends_exactly_three_messages(self):
+    def test_one_explosive_setup_sends_exactly_one_message(self):
         calls = []
         notifier = ExplosiveFeishuNotifier(
             webhook="https://open.feishu.cn/example",
@@ -67,12 +67,13 @@ class ExplosiveFeishuNotificationTest(unittest.TestCase):
         queued = notifier.notify(explosive_result())
 
         self.assertTrue(queued)
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 1)
         self.assertTrue(all(call[1]["json"]["msg_type"] == "text" for call in calls))
         self.assertIn("BTRUSDT", calls[0][1]["json"]["content"]["text"])
-        self.assertIn("1/3", calls[0][1]["json"]["content"]["text"])
+        self.assertIn("【爆发行情提醒】", calls[0][1]["json"]["content"]["text"])
+        self.assertNotIn("1/3", calls[0][1]["json"]["content"]["text"])
 
-    def test_duplicate_setup_is_not_sent_another_three_times(self):
+    def test_duplicate_setup_is_not_sent_again(self):
         calls = []
         notifier = ExplosiveFeishuNotifier(
             webhook="https://open.feishu.cn/example",
@@ -83,7 +84,7 @@ class ExplosiveFeishuNotificationTest(unittest.TestCase):
 
         self.assertTrue(notifier.notify(explosive_result()))
         self.assertFalse(notifier.notify(explosive_result()))
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 1)
 
     def test_watch_candidate_alerts_before_it_is_allowed_to_open(self):
         calls = []
@@ -95,7 +96,7 @@ class ExplosiveFeishuNotificationTest(unittest.TestCase):
         )
 
         self.assertTrue(notifier.notify(explosive_watch()))
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 1)
         text = calls[0]["json"]["content"]["text"]
         self.assertIn("等待严格入场确认", text)
         self.assertIn("explosive_volume_watch", text)

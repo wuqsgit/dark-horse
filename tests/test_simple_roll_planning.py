@@ -123,7 +123,7 @@ class SimpleRollPlanningTest(unittest.TestCase):
         self.assertEqual(row["initial_quantity"], 10)
         self.assertEqual(row["quantity"], 5)
         self.assertEqual(row["tp1_hit"], 1)
-        self.assertEqual(row["tp2_hit"], 1)
+        self.assertEqual(row["tp2_hit"], 0)
         self.assertEqual(row["signal_source"], "bluechip_trend")
         self.assertAlmostEqual(row["initial_stop_loss"], 96)
 
@@ -167,8 +167,8 @@ class SimpleRollPlanningTest(unittest.TestCase):
 
         self.assertEqual(recovered, ["ETHUSDT"])
         self.assertEqual(row["initial_quantity"], 2)
-        self.assertEqual(row["tp1_hit"], 1)
-        self.assertEqual(row["tp2_hit"], 1)
+        self.assertEqual(row["tp1_hit"], 0)
+        self.assertEqual(row["tp2_hit"], 0)
         self.assertIsNone(row["signal_source"])
 
     def test_builds_one_roll_from_twenty_five_percent_of_initial_quantity(self):
