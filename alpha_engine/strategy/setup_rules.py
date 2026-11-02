@@ -44,6 +44,7 @@ def detect_setup(features: Mapping) -> SetupEvaluation:
         "continuation": 0.0,
         "reclaim": 0.0,
         "sentiment_reversal": 0.0,
+        "distribution_short": 0.0,
     }
     reasons = {name: [] for name in scores}
 
@@ -166,6 +167,42 @@ def detect_setup(features: Mapping) -> SetupEvaluation:
                 "no_substantive_project_risk",
             )
         )
+
+    # A short watch is earned by persistent Alpha spot distribution, not by
+    # one red futures candle.  This is intentionally broad; the trigger layer
+    # still requires a closed-candle support break before any entry event.
+    spot_sell_ratio = _num(features, "spot_taker_sell_quote_ratio")
+    spot_sell_bars = _num(features, "spot_sell_pressure_bars_2h")
+    award(
+        "distribution_short",
+        spot_sell_ratio is not None and spot_sell_ratio >= 0.55,
+        25,
+        "alpha_spot_sellers_dominant",
+    )
+    award(
+        "distribution_short",
+        spot_sell_bars is not None and spot_sell_bars >= 5,
+        25,
+        "alpha_spot_selling_persistent",
+    )
+    award(
+        "distribution_short",
+        volume_15m is not None and volume_15m >= 1.5,
+        15,
+        "distribution_volume_expanded",
+    )
+    award(
+        "distribution_short",
+        ret_2h is not None and ret_2h <= -4.0,
+        20,
+        "price_failed_under_distribution",
+    )
+    award(
+        "distribution_short",
+        ema_distance_15m is not None and ema_distance_15m < 0,
+        15,
+        "price_below_short_ema",
+    )
 
     setup_type = (
         "sentiment_reversal"

@@ -6,6 +6,73 @@ from alpha_engine.strategy.trigger_rules import evaluate_trigger
 
 
 class AlphaStrategyRulesTest(unittest.TestCase):
+    def test_persistent_alpha_spot_distribution_detects_short_setup(self):
+        features = {
+            "spot_taker_sell_quote_ratio": 0.68,
+            "spot_sell_pressure_bars_2h": 7,
+            "quote_volume_ratio_15m": 2.8,
+            "ret_2h": -7.0,
+            "ema20_distance_15m": -4.0,
+            "ret_15m": -3.4,
+            "ret_1h": -8.0,
+            "ret_6h": -12.0,
+            "close_location": 0.18,
+            "lower_wick_ratio": 0.12,
+            "breakdown_distance_pct": -1.3,
+            "price_efficiency_score": 76,
+        }
+
+        setup = detect_setup(features)
+        trigger = evaluate_trigger(features, setup_type=setup.setup_type)
+
+        self.assertTrue(setup.detected)
+        self.assertEqual(setup.setup_type, "distribution_short")
+        self.assertTrue(trigger.trigger_detected)
+        self.assertFalse(trigger.overheated)
+
+    def test_overheated_distribution_breakdown_waits_instead_of_chasing(self):
+        trigger = evaluate_trigger(
+            {
+                "ret_15m": -10.0,
+                "ret_1h": -16.0,
+                "ret_6h": -25.0,
+                "quote_volume_ratio_15m": 5.0,
+                "close_location": 0.10,
+                "lower_wick_ratio": 0.10,
+                "breakdown_distance_pct": -5.0,
+                "price_efficiency_score": 80,
+            },
+            setup_type="distribution_short",
+        )
+
+        self.assertTrue(trigger.trigger_detected)
+        self.assertTrue(trigger.overheated)
+        self.assertIn("overheated_breakdown_detected", trigger.reasons)
+
+    def test_spot_led_hard_distribution_can_ignore_lower_wick(self):
+        trigger = evaluate_trigger(
+            {
+                "ret_15m": -6.24,
+                "ret_1h": -7.0,
+                "ret_2h": -5.08,
+                "ret_6h": -10.0,
+                "quote_volume_ratio_15m": 13.1,
+                "close_location": 0.58,
+                "lower_wick_ratio": 0.42,
+                "breakdown_distance_pct": -3.93,
+                "price_efficiency_score": 42,
+                "spot_taker_sell_quote_ratio": 0.75,
+                "spot_sell_pressure_bars_2h": 4,
+                "spot_volume_ratio_15m": 9.27,
+                "futures_volume_ratio_15m": 13.1,
+            },
+            setup_type="distribution_short",
+        )
+
+        self.assertTrue(trigger.trigger_detected)
+        self.assertFalse(trigger.overheated)
+        self.assertIn("spot_led_hard_distribution_breakdown", trigger.reasons)
+
     def test_detects_ake_style_accumulation(self):
         result = detect_setup(
             {

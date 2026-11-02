@@ -119,6 +119,7 @@ class AlphaStrategyWorker:
             "continuation": 2.0,
             "reclaim": 3.0,
             "sentiment_reversal": 4.0,
+            "distribution_short": -1.0,
         }.get(str(setup_name or "").lower(), 0.0)
         enriched_quality = dict(snapshot.quality)
         missing = [
@@ -219,9 +220,16 @@ class AlphaStrategyWorker:
         projection = build_strategy_projection(features, setup_type=setup_name)
         base_low = features.get("base_low_2h")
         base_high = features.get("base_high_2h")
-        breakout_level = features.get("breakout_level") or base_high
+        short_setup = str(setup_name or "").lower() == "distribution_short"
+        breakout_level = (
+            features.get("breakdown_level") or base_low
+            if short_setup
+            else features.get("breakout_level") or base_high
+        )
         invalidation_price = (
-            float(base_low) * 0.99 if base_low is not None else None
+            float(base_high) * 1.01 if short_setup and base_high is not None
+            else float(base_low) * 0.99 if base_low is not None
+            else None
         )
         observation = StrategyObservation(
             snapshot_id=snapshot.snapshot_id,
@@ -277,7 +285,14 @@ class AlphaStrategyWorker:
         if (
             recovery
             and transition.action_type
-            in {ActionType.PROBE_LONG, ActionType.CONFIRM_LONG, ActionType.RETEST_ADD}
+            in {
+                ActionType.PROBE_LONG,
+                ActionType.CONFIRM_LONG,
+                ActionType.RETEST_ADD,
+                ActionType.PROBE_SHORT,
+                ActionType.CONFIRM_SHORT,
+                ActionType.RETEST_SHORT_ADD,
+            }
         ):
             transition = replace(
                 transition,

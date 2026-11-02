@@ -35,15 +35,122 @@ def evaluate_trigger(
 ) -> TriggerEvaluation:
     ret_15m = _num(features, "ret_15m", 0.0)
     ret_1h = _num(features, "ret_1h", 0.0)
+    ret_2h = _num(features, "ret_2h", 0.0)
     ret_6h = _num(features, "ret_6h", 0.0)
     volume_ratio = _num(features, "quote_volume_ratio_15m", 0.0)
     close_location = _num(features, "close_location", 0.0)
     upper_wick = _num(features, "upper_wick_ratio", 1.0)
+    lower_wick = _num(features, "lower_wick_ratio", 1.0)
     breakout_distance = _num(features, "breakout_distance_pct", -999.0)
+    breakdown_distance = _num(features, "breakdown_distance_pct", 999.0)
     price_efficiency = _num(features, "price_efficiency_score")
     current_price = _num(features, "current_price")
     contraction = _num(features, "pre_breakout_volume_contraction")
     reasons = []
+
+    short_setup = str(setup_type or "").lower() == "distribution_short"
+    if short_setup:
+        spot_sell_ratio = _num(features, "spot_taker_sell_quote_ratio", 0.0)
+        spot_sell_bars = _num(features, "spot_sell_pressure_bars_2h", 0.0)
+        spot_volume = _num(features, "spot_volume_ratio_15m", 0.0)
+        futures_volume = _num(features, "futures_volume_ratio_15m", 0.0)
+        overheated = ret_15m < -8 or ret_1h < -15 or ret_6h < -30
+        if overheated:
+            reasons.append("short_term_selloff_overheated")
+        if close_location > 0.35:
+            reasons.append("weak_breakdown_close_location")
+        if lower_wick > 0.35:
+            reasons.append("lower_wick_rejection")
+        if volume_ratio < 1.8:
+            reasons.append("trigger_volume_insufficient")
+        if breakdown_distance >= 0:
+            reasons.append("price_not_below_distribution_support")
+        if price_efficiency is not None and price_efficiency < 60:
+            reasons.append("price_efficiency_too_low")
+
+        technical_breakdown = bool(
+            ret_15m <= -2.5
+            and volume_ratio >= 1.8
+            and close_location <= 0.35
+            and lower_wick <= 0.35
+            and breakdown_distance < 0
+            and (price_efficiency is None or price_efficiency >= 60)
+        )
+        # AKE-style spot-led distribution often leaves a lower wick and poor
+        # generic price-efficiency score on the first real break.  Permit a
+        # small probe when both venues expand violently and Alpha spot keeps
+        # selling; this is stronger evidence than candle shape alone.
+        hard_distribution_breakdown = bool(
+            -8.0 <= ret_15m <= -4.0
+            and ret_2h <= -4.0
+            and breakdown_distance <= -1.0
+            and spot_sell_ratio >= 0.65
+            and spot_sell_bars >= 4
+            and spot_volume >= 2.0
+            and futures_volume >= 2.0
+        )
+        ignition = technical_breakdown or hard_distribution_breakdown
+        near_ignition = bool(
+            not ignition
+            and not overheated
+            and -8.0 <= ret_15m <= -2.0
+            and volume_ratio >= 1.5
+            and close_location <= 0.42
+            and lower_wick <= 0.42
+            and breakdown_distance < 0
+            and (price_efficiency is None or price_efficiency >= 50)
+        )
+        if near_ignition:
+            reasons.append("near_short_trigger_detected")
+        if ignition and not overheated:
+            reasons.append(
+                "spot_led_hard_distribution_breakdown"
+                if hard_distribution_breakdown
+                else "distribution_breakdown_confirmed"
+            )
+        elif ignition:
+            reasons.append("overheated_breakdown_detected")
+
+        invalidated = bool(
+            state
+            and state.invalidation_price is not None
+            and current_price is not None
+            and current_price > float(state.invalidation_price)
+        )
+        if invalidated:
+            reasons.append("price_above_short_invalidation")
+        acceptance = bool(
+            state
+            and state.breakout_level is not None
+            and current_price is not None
+            and current_price <= float(state.breakout_level)
+            and volume_ratio >= 1.5
+            and close_location <= 0.45
+            and lower_wick <= 0.45
+            and (price_efficiency is None or price_efficiency >= 55)
+        )
+        if acceptance:
+            reasons.append("breakdown_level_held")
+        retest = bool(
+            state
+            and state.breakout_level is not None
+            and current_price is not None
+            and current_price <= float(state.breakout_level)
+            and contraction is not None
+            and contraction <= 1.0
+            and ret_15m <= 0
+        )
+        if retest:
+            reasons.append("short_retest_rejected_on_contracted_volume")
+        return TriggerEvaluation(
+            trigger_detected=ignition,
+            near_trigger_detected=near_ignition,
+            overheated=overheated,
+            acceptance_confirmed=acceptance,
+            retest_confirmed=retest,
+            invalidated=invalidated,
+            reasons=tuple(reasons),
+        )
 
     overheated = ret_15m > 8 or ret_1h > 15 or ret_6h > 30
     if overheated:

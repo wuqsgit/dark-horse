@@ -100,6 +100,11 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         action_type=ActionType.PROBE_LONG,
     ):
         now = datetime.now(timezone.utc)
+        short = action_type in {
+            ActionType.PROBE_SHORT,
+            ActionType.CONFIRM_SHORT,
+            ActionType.RETEST_SHORT_ADD,
+        }
         conn = db.get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO alpha_feature_snapshots
@@ -119,18 +124,24 @@ class AlphaSignalConsumerTest(unittest.TestCase):
                     "spot_volume_ratio_15m": 2.0,
                     "futures_volume_ratio_15m": 2.1,
                     "volume_sync_score": 80,
-                    "ret_15m": 1.2,
-                    "ret_1h": 2.5,
+                    "ret_15m": -1.2 if short else 1.2,
+                    "ret_1h": -2.5 if short else 2.5,
                     "oi_change_1h": 0.01,
                     "oi_change_4h": 0.02,
                     "quote_volume_ratio_15m": 2.1,
+                    "spot_taker_sell_quote_ratio": 0.68,
+                    "spot_sell_pressure_bars_2h": 7,
+                    "breakdown_distance_pct": -1.2,
                 }),
                 now.isoformat().replace("+00:00", "Z"),
             ),
         )
         conn.commit()
         conn.close()
-        confirmed = action_type == ActionType.CONFIRM_LONG
+        confirmed = action_type in {
+            ActionType.CONFIRM_LONG,
+            ActionType.CONFIRM_SHORT,
+        }
         transition = TransitionResult(
             from_state=AlphaSignalState.ARMED,
             to_state=(
@@ -142,7 +153,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             changed=True,
             candle_close_time=now,
             snapshot_id=f"snap-{symbol}",
-            setup_type="accumulation",
+            setup_type="distribution_short" if short else "accumulation",
             setup_id=f"setup-{symbol}",
             started_at=now,
             expires_at=now + timedelta(hours=1),
@@ -150,7 +161,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
             base_low=0.95,
             base_high=1.01,
             breakout_level=1.01,
-            invalidation_price=0.95,
+            invalidation_price=1.05 if short else 0.95,
             setup_probability=0.75,
             followthrough_probability=0.78,
             fakeout_probability=0.18,
@@ -228,6 +239,40 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         )
         self.assertTrue(actions[0]["client_order_id"].startswith("DH-A2-7-"))
         self.assertEqual(duplicate, [])
+
+    def test_confirmed_short_builds_sell_action_with_stop_above_entry(self):
+        self._event(
+            action_type=ActionType.CONFIRM_SHORT,
+            max_position_factor=0.6,
+        )
+        consumer = AlphaSignalConsumer(
+            FakeExchange(),
+            config={
+                "risk_per_trade_pct": 0.015,
+                "alpha_strategy_v2": {
+                    "enabled": True,
+                    "mode": "testnet_live",
+                    "market_env": "mainnet",
+                    "max_alpha_positions": 2,
+                    "confirmed_short_stage_cap": 0.60,
+                },
+            },
+            repository=self.repo,
+        )
+
+        actions = consumer.build_actions(
+            account=self._account(),
+            positions=[],
+            balance=1000,
+            engine=FakeEngine(),
+            run_id="run-short",
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["side"], "SELL")
+        self.assertEqual(actions[0]["position_side"], "SHORT")
+        self.assertGreater(actions[0]["stop_loss"], actions[0]["entry_price"])
+        self.assertLess(actions[0]["tp1_price"], actions[0]["entry_price"])
 
     def test_signal_mode_records_without_building_order(self):
         self._event(

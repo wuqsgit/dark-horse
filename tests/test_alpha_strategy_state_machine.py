@@ -42,6 +42,28 @@ def _observation(**overrides):
 
 
 class AlphaStrategyStateMachineTest(unittest.TestCase):
+    def test_distribution_breakdown_emits_short_probe(self):
+        result = AlphaStrategyStateMachine().transition(
+            None,
+            _observation(
+                setup_type="distribution_short",
+                setup_probability=0.75,
+                followthrough_probability=0.72,
+                fakeout_probability=0.20,
+                trigger_detected=True,
+                reference_price=0.75,
+                base_low=0.74,
+                base_high=0.90,
+                breakout_level=0.78,
+                invalidation_price=0.91,
+                max_position_factor=0.25,
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual(result.to_state, AlphaSignalState.PROBE_READY)
+        self.assertEqual(result.action_type, ActionType.PROBE_SHORT)
+
     def test_enforced_setup_does_not_move_breakout_and_invalidation_levels(self):
         machine = AlphaStrategyStateMachine(StateMachineConfig(freeze_trigger_levels=True))
         watch = machine.transition(None, _observation(), now=NOW)

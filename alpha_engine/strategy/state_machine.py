@@ -35,6 +35,7 @@ WATCH_STATES = {
     AlphaSignalState.WATCH_ACCUMULATION,
     AlphaSignalState.WATCH_CONTINUATION,
     AlphaSignalState.WATCH_RECLAIM,
+    AlphaSignalState.WATCH_DISTRIBUTION,
 }
 
 ACTIVE_SETUP_STATES = WATCH_STATES | {
@@ -58,6 +59,7 @@ def _watch_state(setup_type: str | None) -> AlphaSignalState:
     return {
         "continuation": AlphaSignalState.WATCH_CONTINUATION,
         "reclaim": AlphaSignalState.WATCH_RECLAIM,
+        "distribution_short": AlphaSignalState.WATCH_DISTRIBUTION,
     }.get(str(setup_type or "").lower(), AlphaSignalState.WATCH_ACCUMULATION)
 
 
@@ -87,6 +89,14 @@ class AlphaStrategyStateMachine:
         previous_version = current.state_version if current else 0
         setup_id = current.setup_id if current else None
         setup_type = observation.setup_type or (current.setup_type if current else None)
+        short_setup = str(setup_type or "").lower() == "distribution_short"
+        probe_action = ActionType.PROBE_SHORT if short_setup else ActionType.PROBE_LONG
+        confirm_action = (
+            ActionType.CONFIRM_SHORT if short_setup else ActionType.CONFIRM_LONG
+        )
+        retest_action = (
+            ActionType.RETEST_SHORT_ADD if short_setup else ActionType.RETEST_ADD
+        )
         started_at = current.started_at if current else now
         expires_at = current.expires_at if current else None
 
@@ -114,7 +124,7 @@ class AlphaStrategyStateMachine:
             position_factor = observation.max_position_factor
             if (
                 from_state == AlphaSignalState.TRIGGER_PENDING
-                and action == ActionType.PROBE_LONG
+                and action in {ActionType.PROBE_LONG, ActionType.PROBE_SHORT}
             ):
                 position_factor = min(
                     max(0.0, float(position_factor or 0.0)),
@@ -232,7 +242,7 @@ class AlphaStrategyStateMachine:
                 setup_id = _setup_id(observation)
                 return result(
                     AlphaSignalState.PROBE_READY,
-                    action=ActionType.PROBE_LONG,
+                    action=probe_action,
                     ttl_hours=0.25,
                     reasons=tuple(observation.reasons)
                     + ("sentiment_reversal_probe_confirmed",),
@@ -253,7 +263,7 @@ class AlphaStrategyStateMachine:
                     )
                 return result(
                     AlphaSignalState.PROBE_READY,
-                    action=ActionType.PROBE_LONG,
+                    action=probe_action,
                     ttl_hours=max(
                         1,
                         int(self.config.acceptance_ttl_bars),
@@ -285,7 +295,7 @@ class AlphaStrategyStateMachine:
                     )
                 return result(
                     AlphaSignalState.PROBE_READY,
-                    action=ActionType.PROBE_LONG,
+                    action=probe_action,
                     ttl_hours=max(
                         1,
                         int(self.config.acceptance_ttl_bars),
@@ -318,7 +328,7 @@ class AlphaStrategyStateMachine:
                 ):
                     return result(
                         AlphaSignalState.PROBE_READY,
-                        action=ActionType.PROBE_LONG,
+                        action=probe_action,
                         ttl_hours=max(
                             1,
                             int(self.config.acceptance_ttl_bars),
@@ -348,7 +358,7 @@ class AlphaStrategyStateMachine:
             if observation.trigger_detected and trigger_quality_ready:
                 return result(
                     AlphaSignalState.PROBE_READY,
-                    action=ActionType.PROBE_LONG,
+                    action=probe_action,
                     ttl_hours=max(1, int(self.config.acceptance_ttl_bars)) * 0.25,
                     reasons=tuple(observation.reasons)
                     + ("pending_trigger_strictly_confirmed",),
@@ -362,7 +372,7 @@ class AlphaStrategyStateMachine:
             ):
                 return result(
                     AlphaSignalState.PROBE_READY,
-                    action=ActionType.PROBE_LONG,
+                    action=probe_action,
                     ttl_hours=max(1, int(self.config.acceptance_ttl_bars)) * 0.25,
                     reasons=tuple(observation.reasons)
                     + ("multi_bar_trigger_confirmed",),
@@ -373,7 +383,7 @@ class AlphaStrategyStateMachine:
             if self._acceptance_ready(observation):
                 return result(
                     AlphaSignalState.CONFIRMED,
-                    action=ActionType.CONFIRM_LONG,
+                    action=confirm_action,
                     clear_expiry=True,
                     reasons=tuple(observation.reasons) + ("breakout_accepted",),
                 )
@@ -389,7 +399,7 @@ class AlphaStrategyStateMachine:
             if self._acceptance_ready(observation):
                 return result(
                     AlphaSignalState.CONFIRMED,
-                    action=ActionType.CONFIRM_LONG,
+                    action=confirm_action,
                     clear_expiry=True,
                     reasons=tuple(observation.reasons) + ("breakout_accepted",),
                 )
@@ -399,7 +409,7 @@ class AlphaStrategyStateMachine:
             if observation.retest_confirmed:
                 return result(
                     AlphaSignalState.RETEST_READY,
-                    action=ActionType.RETEST_ADD,
+                    action=retest_action,
                     reasons=tuple(observation.reasons) + ("first_retest_confirmed",),
                 )
             return result(from_state, force_changed=False)

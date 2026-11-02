@@ -39,6 +39,9 @@ def _client_order_id(account_id: int, event_id: str, action_type: str) -> str:
         "PROBE_LONG": "P",
         "CONFIRM_LONG": "C",
         "RETEST_ADD": "R",
+        "PROBE_SHORT": "SP",
+        "CONFIRM_SHORT": "SC",
+        "RETEST_SHORT_ADD": "SR",
         "INVALIDATE_PROBE": "X",
     }.get(action_type, "A")
     digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:16]
@@ -146,12 +149,48 @@ class AlphaSignalConsumer:
         if age_minutes < -2 or age_minutes > max_age:
             return False, f"alpha_v2_snapshot_stale:{age_minutes:.1f}m", features
 
-        if action_type == "RETEST_ADD":
+        if action_type in {"RETEST_ADD", "RETEST_SHORT_ADD"}:
             volume_ratio = float(features.get("quote_volume_ratio_15m") or 0)
             ret_15m = float(features.get("ret_15m") or 0)
-            if volume_ratio < 0.8 or ret_15m < 0:
+            direction_ok = (
+                ret_15m <= 0
+                if action_type == "RETEST_SHORT_ADD"
+                else ret_15m >= 0
+            )
+            if volume_ratio < 0.8 or not direction_ok:
                 return False, "alpha_v2_retest_not_supported", features
             return True, "alpha_v2_retest_revalidated", features
+
+        if action_type in {"PROBE_SHORT", "CONFIRM_SHORT"}:
+            checks = {
+                "spot_sellers_dominant": float(
+                    features.get("spot_taker_sell_quote_ratio") or 0
+                ) >= 0.55,
+                "spot_selling_persistent": float(
+                    features.get("spot_sell_pressure_bars_2h") or 0
+                ) >= 5,
+                "spot_volume_expanded": float(
+                    features.get("spot_volume_ratio_15m") or 0
+                ) >= 1.5,
+                "futures_volume_expanded": float(
+                    features.get("futures_volume_ratio_15m") or 0
+                ) >= 1.5,
+                "markets_synchronized": float(
+                    features.get("volume_sync_score") or 0
+                ) >= 0.65,
+                "support_broken": float(
+                    features.get("breakdown_distance_pct") or 0
+                ) < 0,
+                "price_weak_15m": float(features.get("ret_15m") or 0) <= -0.5,
+            }
+            missing = [name for name, passed in checks.items() if not passed]
+            if missing:
+                return (
+                    False,
+                    "alpha_v2_short_missing:" + ",".join(missing),
+                    features,
+                )
+            return True, "alpha_v2_short_distribution_confirmed", features
 
         from shared.db import fetch_latest_alpha_position_context
         context = fetch_latest_alpha_position_context(symbol=symbol, alpha_symbol=event.get("alpha_symbol"))
@@ -233,6 +272,14 @@ class AlphaSignalConsumer:
 
         for event in events:
             action_type = str(event["action_type"])
+            is_short = action_type in {
+                "PROBE_SHORT",
+                "CONFIRM_SHORT",
+                "RETEST_SHORT_ADD",
+            }
+            is_probe = action_type in {"PROBE_LONG", "PROBE_SHORT"}
+            is_retest = action_type in {"RETEST_ADD", "RETEST_SHORT_ADD"}
+            position_side = "SHORT" if is_short else "LONG"
             try:
                 action_enum = ActionType(action_type)
             except ValueError:
@@ -252,7 +299,7 @@ class AlphaSignalConsumer:
                 )
                 continue
             if not should_execute_entry_mode(
-                "probe" if action_type == "PROBE_LONG" else "strong"
+                "probe" if is_probe else "strong"
             ):
                 self._reject(
                     account_id=account_id,
@@ -262,8 +309,12 @@ class AlphaSignalConsumer:
                 )
                 continue
             symbol = str(event["futures_symbol"]).upper()
+            position = position_map.get(symbol)
             from shared.db import set_position_context
-            set_position_context(symbol, "LONG")
+            set_position_context(
+                symbol,
+                position.get("side") if action_type == "INVALIDATE_PROBE" and position else position_side,
+            )
             if any(
                 action.get("symbol") == symbol
                 for action in [*preplanned, *actions]
@@ -274,7 +325,6 @@ class AlphaSignalConsumer:
                     reason="conflicting_planned_action",
                 )
                 continue
-            position = position_map.get(symbol)
             if symbol not in trading_symbols and action_type != "INVALIDATE_PROBE":
                 self._reject(
                     account_id=account_id,
@@ -305,7 +355,7 @@ class AlphaSignalConsumer:
                     )
                     continue
                 hist = get_position_history(symbol) or {}
-                if (hist.get("strategy_source") or "") != "alpha" or position.get("side") != "LONG":
+                if (hist.get("strategy_source") or "") != "alpha":
                     self._reject(
                         account_id=account_id,
                         event=event,
@@ -338,27 +388,27 @@ class AlphaSignalConsumer:
                 self._reject(account_id=account_id, event=event, reason="account_entry_disabled")
                 continue
 
-            if action_type == "PROBE_LONG" and position:
+            if is_probe and position:
                 self._reject(
                     account_id=account_id,
                     event=event,
                     reason="probe_requires_no_existing_position",
                 )
                 continue
-            if action_type == "RETEST_ADD" and not position:
+            if is_retest and not position:
                 self._reject(
                     account_id=account_id,
                     event=event,
                     reason="retest_requires_existing_position",
                 )
                 continue
-            if action_type == "RETEST_ADD" and float((position or {}).get("unrealized_pnl") or 0) <= 0:
+            if is_retest and float((position or {}).get("unrealized_pnl") or 0) <= 0:
                 self._reject(account_id=account_id, event=event, reason="retest_add_requires_profit")
                 continue
             if position:
                 hist = get_position_history(symbol) or {}
                 if (
-                    position.get("side") != "LONG"
+                    position.get("side") != position_side
                     or (hist.get("strategy_source") or "") != "alpha"
                 ):
                     self._reject(
@@ -442,7 +492,7 @@ class AlphaSignalConsumer:
             try:
                 ob_ok, ob_reason, ob_info = engine._check_live_orderbook(
                     symbol,
-                    "LONG",
+                    position_side,
                     {"status": "probe", "template": "alpha_strategy_v2"},
                 )
             except Exception as exc:
@@ -472,7 +522,10 @@ class AlphaSignalConsumer:
 
             price = float(self.exchange.get_mark_price(symbol) or 0)
             invalidation = float(event.get("invalidation_price") or 0)
-            if price <= 0 or invalidation <= 0 or invalidation >= price:
+            invalid_structure = (
+                invalidation <= price if is_short else invalidation >= price
+            )
+            if price <= 0 or invalidation <= 0 or invalid_structure:
                 self._reject(
                     account_id=account_id,
                     event=event,
@@ -488,6 +541,15 @@ class AlphaSignalConsumer:
                 ),
                 "RETEST_ADD": float(
                     self.strategy.get("retest_stage_cap") or 1.00
+                ),
+                "PROBE_SHORT": float(
+                    self.strategy.get("probe_short_stage_cap") or 0.25
+                ),
+                "CONFIRM_SHORT": float(
+                    self.strategy.get("confirmed_short_stage_cap") or 0.60
+                ),
+                "RETEST_SHORT_ADD": float(
+                    self.strategy.get("retest_short_stage_cap") or 0.85
                 ),
             }[action_type]
             event_reasons = _json(event.get("reason_codes_json"), [])
@@ -514,7 +576,7 @@ class AlphaSignalConsumer:
                     reason="zero_bounded_position_factor",
                 )
                 continue
-            entry_mode = "probe" if action_type == "PROBE_LONG" else "strong"
+            entry_mode = "probe" if is_probe else "strong"
             pos_info = calculate_position(
                 self.exchange,
                 symbol,
@@ -537,7 +599,7 @@ class AlphaSignalConsumer:
                 configured_risk_budget,
                 float(pos_info.get("risk_budget") or configured_risk_budget),
             )
-            structural_risk = price - invalidation
+            structural_risk = abs(price - invalidation)
             risk_qty = risk_budget / structural_risk if structural_risk > 0 else 0
             target_qty = min(float(pos_info["quantity"]), risk_qty)
             existing_qty = float(position.get("quantity") or 0) if position else 0.0
@@ -616,11 +678,13 @@ class AlphaSignalConsumer:
                 continue
 
             stop_distance = min(
-                price - invalidation,
+                structural_risk,
                 float(pos_info.get("stop_loss") or structural_risk),
             )
-            stop_price = price - stop_distance
-            tp = calc_tp_levels(price, "LONG", stop_distance / price)
+            stop_price = (
+                price + stop_distance if is_short else price - stop_distance
+            )
+            tp = calc_tp_levels(price, position_side, stop_distance / price)
             client_id = _client_order_id(
                 account_id,
                 event["event_id"],
@@ -628,8 +692,8 @@ class AlphaSignalConsumer:
             )
             common = {
                 "symbol": symbol,
-                "side": "BUY",
-                "position_side": "LONG",
+                "side": "SELL" if is_short else "BUY",
+                "position_side": position_side,
                 "quantity": quantity,
                 "entry_price": price,
                 "leverage": int(pos_info["leverage"]),
@@ -670,7 +734,7 @@ class AlphaSignalConsumer:
                 "run_id": run_id,
                 "reason": (
                     f"explosive_breakout alpha_strategy_v2:{action_type.lower()}"
-                    if action_type == "CONFIRM_LONG"
+                    if action_type in {"CONFIRM_LONG", "CONFIRM_SHORT"}
                     else f"alpha_strategy_v2:{action_type.lower()}"
                 ),
                 "category": symbol_risk_category(symbol),

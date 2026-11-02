@@ -354,9 +354,20 @@ def build_alpha_feature_snapshot(
         if value is not None
     ]
     breakout_level = max(prior_highs) if prior_highs else None
+    prior_lows = [
+        value
+        for value in (_number(row.get("low")) for row in prior_breakout_rows)
+        if value is not None
+    ]
+    breakdown_level = min(prior_lows) if prior_lows else None
     breakout_distance = (
         (current_price / breakout_level - 1) * 100
         if current_price is not None and breakout_level
+        else None
+    )
+    breakdown_distance = (
+        (current_price / breakdown_level - 1) * 100
+        if current_price is not None and breakdown_level
         else None
     )
     closes_above_breakout = (
@@ -486,6 +497,22 @@ def build_alpha_feature_snapshot(
     if spot_volume_ratio is not None and futures_volume_ratio is not None:
         denominator = max(spot_volume_ratio, futures_volume_ratio, 1e-9)
         volume_sync_score = min(spot_volume_ratio, futures_volume_ratio) / denominator
+    spot_taker_buy_ratios = []
+    for row in spot15[-8:]:
+        spot_quote = _number(row.get("quote_vol"))
+        spot_buy = _number(row.get("taker_buy_quote_vol"))
+        if spot_quote and spot_buy is not None:
+            spot_taker_buy_ratios.append(
+                min(1.0, max(0.0, spot_buy / spot_quote))
+            )
+    spot_taker_buy_ratio = (
+        spot_taker_buy_ratios[-1] if spot_taker_buy_ratios else None
+    )
+    spot_sell_pressure_bars = (
+        float(sum(ratio <= 0.45 for ratio in spot_taker_buy_ratios))
+        if spot_taker_buy_ratios
+        else None
+    )
 
     spreads = [
         value
@@ -590,6 +617,8 @@ def build_alpha_feature_snapshot(
         "distance_from_high_24h": _distance_from_high(c1h, 24),
         "breakout_level": breakout_level,
         "breakout_distance_pct": breakout_distance,
+        "breakdown_level": breakdown_level,
+        "breakdown_distance_pct": breakdown_distance,
         "closes_above_breakout_level": closes_above_breakout,
         "gap_from_previous_close": gap_from_previous_close,
         "retest_depth_pct": retest_depth,
@@ -633,6 +662,13 @@ def build_alpha_feature_snapshot(
         "futures_return_15m": futures_ret_15m,
         "spot_futures_return_diff": return_diff,
         "spot_volume_ratio_15m": spot_volume_ratio,
+        "spot_taker_buy_quote_ratio": spot_taker_buy_ratio,
+        "spot_taker_sell_quote_ratio": (
+            1.0 - spot_taker_buy_ratio
+            if spot_taker_buy_ratio is not None
+            else None
+        ),
+        "spot_sell_pressure_bars_2h": spot_sell_pressure_bars,
         "futures_volume_ratio_15m": futures_volume_ratio,
         "volume_sync_score": volume_sync_score,
         "spot_leads_futures": (
