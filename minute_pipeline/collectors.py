@@ -22,6 +22,37 @@ logger = logging.getLogger("minute_pipeline.collectors")
 ALPHA_KLINES_PATH = "/bapi/defi/v1/public/alpha-trade/klines"
 
 
+def _alpha_taker_buy_quote_vol(row) -> tuple[float, bool]:
+    """Return Alpha buy quote volume and whether it had to be estimated.
+
+    Binance Alpha REST occasionally mirrors total quote volume into the
+    documented taker-buy field.  Treating that value literally turns every
+    trade into a buy and makes derived sell volume zero.  When that invariant
+    is violated, use a bounded candle-body proxy instead.  The proxy is
+    deliberately conservative and the row source is marked by the caller so
+    consumers can distinguish it from exchange-provided order flow.
+    """
+    quote_volume = float(row[7] or 0)
+    reported = float(row[10] or 0) if len(row) > 10 else 0.0
+    tolerance = max(1e-9, abs(quote_volume) * 1e-9)
+    if 0 <= reported < quote_volume - tolerance:
+        return reported, False
+    if quote_volume <= 0:
+        return 0.0, reported != 0
+
+    open_price = float(row[1])
+    high_price = float(row[2])
+    low_price = float(row[3])
+    close_price = float(row[4])
+    price_range = high_price - low_price
+    if price_range <= 0:
+        buy_share = 0.5
+    else:
+        buy_share = 0.5 + 0.5 * (close_price - open_price) / price_range
+        buy_share = min(0.9, max(0.1, buy_share))
+    return quote_volume * buy_share, True
+
+
 def subscription_batches(symbols, max_streams_per_connection=180):
     """Split a universe so each WebSocket stays below Binance stream limits."""
     size = max(1, int(max_streams_per_connection))
@@ -32,7 +63,19 @@ def subscription_batches(symbols, max_streams_per_connection=180):
     )
 
 
-def normalize_rest_kline(symbol: str, row, source: str = "rest") -> dict:
+def normalize_rest_kline(
+    symbol: str,
+    row,
+    source: str = "rest",
+    market_kind: str | None = None,
+) -> dict:
+    if market_kind == "alpha":
+        taker_buy_quote_vol, flow_estimated = _alpha_taker_buy_quote_vol(row)
+    else:
+        taker_buy_quote_vol = (
+            float(row[10] or 0) if len(row) > 10 else 0.0
+        )
+        flow_estimated = False
     return {
         "time": format_utc(
             datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
@@ -45,12 +88,14 @@ def normalize_rest_kline(symbol: str, row, source: str = "rest") -> dict:
         "volume": float(row[5] or 0),
         "quote_vol": float(row[7] or 0),
         "trades": int(float(row[8] or 0)),
-        "taker_buy_quote_vol": float(row[10] or 0)
-        if len(row) > 10
-        else 0.0,
+        "taker_buy_quote_vol": taker_buy_quote_vol,
         "source_env": SOURCE_ENV,
         "is_closed": True,
-        "source": source,
+        "source": (
+            f"{source}:alpha-flow-estimated"
+            if flow_estimated
+            else source
+        ),
     }
 
 
@@ -160,7 +205,12 @@ class RestKlineClient:
                 raise RuntimeError(f"Alpha kline API error: {payload}")
             payload = payload.get("data") or []
         rows = [
-            normalize_rest_kline(symbol, row, source="backfill")
+            normalize_rest_kline(
+                symbol,
+                row,
+                source="backfill",
+                market_kind=market_kind,
+            )
             for row in payload or []
         ]
         now = datetime.now(timezone.utc)

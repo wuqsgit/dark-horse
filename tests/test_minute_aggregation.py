@@ -7,6 +7,7 @@ from minute_pipeline.aggregation import (
 )
 from minute_pipeline.collectors import (
     RestKlineClient,
+    normalize_rest_kline,
     normalize_ws_message,
     subscription_batches,
 )
@@ -35,6 +36,85 @@ def minute_row(index, start=None):
 
 
 class MinuteAggregationTest(unittest.TestCase):
+    def test_alpha_duplicate_taker_volume_uses_bounded_flow_estimate(self):
+        row = [
+            1786060800000,
+            "100",
+            "110",
+            "90",
+            "95",
+            "10",
+            1786060859999,
+            "1000",
+            5,
+            "10",
+            "1000",
+            "0",
+        ]
+
+        normalized = normalize_rest_kline(
+            "ALPHA_331USDT",
+            row,
+            source="backfill",
+            market_kind="alpha",
+        )
+
+        self.assertEqual(normalized["taker_buy_quote_vol"], 375)
+        self.assertEqual(
+            normalized["source"],
+            "backfill:alpha-flow-estimated",
+        )
+
+    def test_alpha_valid_taker_volume_is_preserved(self):
+        row = [
+            1786060800000,
+            "100",
+            "110",
+            "90",
+            "105",
+            "10",
+            1786060859999,
+            "1000",
+            5,
+            "6",
+            "600",
+            "0",
+        ]
+
+        normalized = normalize_rest_kline(
+            "ALPHA_331USDT",
+            row,
+            market_kind="alpha",
+        )
+
+        self.assertEqual(normalized["taker_buy_quote_vol"], 600)
+        self.assertEqual(normalized["source"], "rest")
+
+    def test_regular_market_keeps_exchange_taker_volume(self):
+        row = [
+            1786060800000,
+            "100",
+            "110",
+            "90",
+            "95",
+            "10",
+            1786060859999,
+            "1000",
+            5,
+            "10",
+            "1000",
+            "0",
+        ]
+
+        normalized = normalize_rest_kline(
+            "BTCUSDT",
+            row,
+            market_kind="spot",
+        )
+
+        self.assertEqual(normalized["taker_buy_quote_vol"], 1000)
+        self.assertEqual(normalized["source"], "rest")
+
     def test_aggregates_complete_15m_bucket(self):
         rows = [minute_row(index) for index in range(15)]
         result = aggregate_minutes(
