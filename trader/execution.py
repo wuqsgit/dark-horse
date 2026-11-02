@@ -770,11 +770,13 @@ def _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=No
         return {"r_multiple": 0.0, "stop_pct": 0.0, "trailing_enabled": False}
     side_u = str(side or "LONG").upper()
     mark = float(mark_price or 0)
-    price_ret = _price_return_pct(side_u, entry, mark)
-    r_multiple = price_ret / stop_pct if stop_pct > 0 else 0.0
+    risk_entry = float((hist or {}).get("risk_entry_price") or entry)
+    risk_distance = float((hist or {}).get("risk_distance") or risk_entry * stop_pct)
+    favorable_move = mark - risk_entry if side_u == "LONG" else risk_entry - mark
+    r_multiple = favorable_move / risk_distance if risk_distance > 0 else 0.0
     atr_v = float(atr or (entry * stop_pct / 2 if entry else 0))
     trail_mult = float((hist or {}).get("trailing_atr_multiplier") or (2.0 if (hist or {}).get("strategy_source") == "alpha" else 1.5))
-    current_stop = float((hist or {}).get("current_stop_loss") or (hist or {}).get("initial_stop_loss") or 0)
+    current_stop = float(_strongest_management_stop(side_u, entry, hist or {}) or 0)
     if entry > 0 and current_stop > 0 and not entry * 0.05 <= current_stop <= entry * 20:
         fallback_stop = float((hist or {}).get("initial_stop_loss") or 0)
         current_stop = (
@@ -851,6 +853,21 @@ def _ratchet_stop(side, existing_stop, candidate_stop, entry_price):
     if str(side or "").upper() == "SHORT":
         return min(existing or candidate, candidate)
     return max(existing, candidate)
+
+
+def _strongest_management_stop(side, entry_price, history, fallback=None):
+    candidates = []
+    for value in (history.get("current_stop_loss"), history.get("protected_stop"),
+                  history.get("initial_stop_loss"), fallback):
+        try:
+            value = float(value or 0)
+        except (ValueError, TypeError):
+            continue
+        if entry_price * 0.05 <= value <= entry_price * 20:
+            candidates.append(value)
+    if not candidates:
+        return None
+    return min(candidates) if str(side).upper() == "SHORT" else max(candidates)
 
 
 def _alpha_stall_detected(
@@ -1433,12 +1450,7 @@ class ExecutionEngine:
                 entry_price = float(position.get("entry_price") or 0)
                 mark_price = float(position.get("mark_price") or 0)
                 history = dict(get_position_history(symbol) or {})
-                stop_price = float(
-                    history.get("protected_stop")
-                    or history.get("current_stop_loss")
-                    or history.get("initial_stop_loss")
-                    or 0
-                )
+                stop_price = float(_strongest_management_stop(side, entry_price, history) or 0)
                 if history.get("tp1_hit"):
                     break_even_stop = calculate_protected_stop(
                         side,
@@ -2520,6 +2532,7 @@ class ExecutionEngine:
         from shared.db import get_position_history
 
         actions = []
+        policy_observations = []
         latest_map = _latest_by_symbol(top_symbols)
         for pos in current_positions:
             sym = pos["symbol"]
@@ -2531,7 +2544,7 @@ class ExecutionEngine:
             alpha = raw.get("alpha") or {}
             tech = raw.get("technical") or {}
             depth = raw.get("depth") or {}
-            hist = get_position_history(sym) or {}
+            hist = self._with_initial_risk_plan(get_position_history(sym) or {})
 
             entry_price = float(pos.get("entry_price") or 0)
             mark_price = float(pos.get("mark_price") or 0)
@@ -2600,6 +2613,22 @@ class ExecutionEngine:
             highest_price = float(tracker.get("highest_price") or mark_price)
             lowest_price = float(tracker.get("lowest_price") or mark_price)
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
+            lifecycle_cfg = self.cfg.get("strategy_lifecycle") or {}
+            if getattr(self.ex, "account_id", None) is not None and lifecycle_cfg.get("mode") in {"shadow", "enforce"}:
+                from trader.lifecycle_policy import evaluate_management
+                from shared.trading_journal import TradingJournal
+                proposed, updates, outcome = evaluate_management(
+                    pos, {**self._with_initial_risk_plan(hist, force=True),
+                          "highest_price": highest_price, "lowest_price": lowest_price},
+                    {**self.cfg, **lifecycle_cfg}, now=datetime.now(timezone.utc),
+                )
+                policy_observations.append((sym, side, lifecycle_cfg["mode"], outcome, proposed, updates))
+                if lifecycle_cfg["mode"] == "enforce" and outcome != "initial_risk_state_missing":
+                    from shared.db import update_position_management
+                    update_position_management(sym, **updates)
+                    if proposed:
+                        actions.append(proposed)
+                    continue
             soft_exit_profit_pct = float(self.cfg.get("soft_exit_profit_pct", 2.0))
             soft_exit_loss_pct = -float(self.cfg.get("soft_exit_max_loss_pct", 3.5))
             r_state = _position_r_state(side, entry_price, mark_price, hist, atr, highest_price=highest_price, lowest_price=lowest_price)
@@ -2628,6 +2657,12 @@ class ExecutionEngine:
                     "score": score,
                     "strategy_source": hist.get("strategy_source") or "normal",
                     "signal_source": hist.get("signal_source"),
+                    "position_id": hist.get("position_id"),
+                    "management_stage": (
+                        "TP1" if "TP1" in reason else "TP2" if "TP2" in reason
+                        else "close" if action == "close"
+                        else f"{str(reason).split()[0]}:{datetime.now(timezone.utc).strftime('%Y%m%d%H')}"
+                    ),
                 }
                 if close_pct is not None:
                     item["close_pct"] = close_pct
@@ -2685,6 +2720,20 @@ class ExecutionEngine:
                     actions.append(alpha_action)
                 continue
 
+            # Risk exits must win over discretionary profit taking in the same cycle.
+            r_multiple = float(r_state.get("r_multiple") or 0)
+            if r_state.get("stop_triggered"):
+                add("close", f"structure_1r_stop r={r_multiple:.2f} "
+                    f"stop={float(r_state.get('current_stop_loss') or 0):.8f} "
+                    f"roi={pnl_pct:.2f}% pnl={pnl:.2f}", is_stop=True)
+                continue
+            emergency_stop_pct = float(self.cfg.get("emergency_margin_stop_pct", 0.20)) * 100
+            if pnl_pct <= -emergency_stop_pct:
+                add("close", f"emergency_margin_stop roi={pnl_pct:.2f}% "
+                    f"threshold=-{emergency_stop_pct:.2f}% margin={margin:.2f} "
+                    f"pnl={pnl:.2f} leverage={leverage:g}", is_stop=True)
+                continue
+
             profit_cfg = self.cfg.get("normal_profit_lock") or {}
             if bool(profit_cfg.get("enabled", True)):
                 peak_price = lowest_price if str(side).upper() == "SHORT" else highest_price
@@ -2721,7 +2770,7 @@ class ExecutionEngine:
                 )
                 protected_stop = _ratchet_stop(
                     side,
-                    hist.get("current_stop_loss"),
+                    r_state.get("current_stop_loss"),
                     locked_stop,
                     entry_price,
                 )
@@ -2768,27 +2817,6 @@ class ExecutionEngine:
                     )
                     continue
 
-            r_multiple = float(r_state.get("r_multiple") or 0)
-            if r_state.get("stop_triggered"):
-                add(
-                    "close",
-                    f"structure_1r_stop r={r_multiple:.2f} "
-                    f"stop={float(r_state.get('current_stop_loss') or 0):.8f} "
-                    f"roi={pnl_pct:.2f}% pnl={pnl:.2f}",
-                    is_stop=True,
-                )
-                continue
-
-            emergency_stop_pct = float(self.cfg.get("emergency_margin_stop_pct", 0.20)) * 100
-            if pnl_pct <= -emergency_stop_pct:
-                add(
-                    "close",
-                    f"emergency_margin_stop roi={pnl_pct:.2f}% threshold=-{emergency_stop_pct:.2f}% "
-                    f"margin={margin:.2f} pnl={pnl:.2f} leverage={leverage:g}",
-                    is_stop=True,
-                )
-                continue
-
             # A weak trend after half of the planned 1R has been consumed is
             # structural invalidation, not a reason to wait for the full stop.
             if r_multiple <= -0.5 and soft_trend_state == "weak":
@@ -2800,6 +2828,10 @@ class ExecutionEngine:
                 )
                 continue
             if pnl_pct < 0:
+                time_cfg = _bluechip_cfg() if hist.get("signal_source") == "bluechip_trend" else self.cfg
+                if age_h is not None and age_h >= float(time_cfg.get("time_stop_hours", 12)):
+                    add("close", f"time_stop age={age_h:.1f}h pnl={pnl_pct:.1f}%")
+                    continue
                 self._record_decision(
                     latest,
                     run_id=run_id,
@@ -2915,6 +2947,17 @@ class ExecutionEngine:
             if category_exit:
                 actions.append(category_exit)
                 continue
+        for sym, side, mode, outcome, proposed, updates in policy_observations:
+            from trader.action_coordinator import position_side
+            actual = [a for a in actions if a.get("symbol") == sym and position_side(a) == side]
+            try:
+                TradingJournal(self.ex.account_id).event(
+                    {"symbol": sym, "position_side": side}, "management_comparison",
+                    {"mode": mode, "run_id": run_id, "outcome": outcome,
+                     "proposed_action": proposed, "actual_actions": actual, "proposed_state": updates},
+                )
+            except Exception:
+                logger.warning("Management shadow audit write failed", exc_info=True)
         return actions
 
     def _spread_limit_for_profile(self, entry_profile: dict | None = None) -> tuple[float, float, str, str]:
@@ -3522,6 +3565,7 @@ class ExecutionEngine:
                 "margin": float(pos_info.get("margin") or 0),
                 "run_id": run_id,
                 "scan_id": row.get("scan_id"),
+                "signal_time": row.get("time"),
                 "entry_mode": entry_profile.get("status"),
                 "strategy_source": "alpha",
                 "category": symbol_risk.get("class"),
@@ -3644,6 +3688,8 @@ class ExecutionEngine:
         from trader.roll_policy import calculate_protected_stop, calculate_roll_quantity, evaluate_roll
 
         cfg = self.cfg.get("roll_trading") or {}
+        lifecycle_mode = (self.cfg.get("strategy_lifecycle") or {}).get("mode", "shadow")
+        strict_roll = lifecycle_mode == "enforce"
         if not cfg.get("enabled", False):
             return []
 
@@ -3661,7 +3707,7 @@ class ExecutionEngine:
             if not sym or sym in blocked_symbols:
                 continue
 
-            hist = get_position_history(sym) or {}
+            hist = self._with_initial_risk_plan(get_position_history(sym) or {})
             latest = latest_map.get(sym) or {}
             raw = _raw_features(latest)
             tech = raw.get("technical") or {}
@@ -3704,19 +3750,30 @@ class ExecutionEngine:
                 hist, latest, raw,
             )
 
+            roll_position = {**pos, "strategy_source": strategy_source, "alpha_profile": hist.get("alpha_profile")}
+            if strict_roll:
+                bars = _fetch_closed_futures_15m(sym, limit=2)
+                if not bars or (_parse_time(bars[-1].get("time")) is None):
+                    block("roll_closed_candle_missing")
+                    continue
+                bar_time = _parse_time(bars[-1]["time"])
+                if (datetime.now(timezone.utc) - bar_time).total_seconds() > 35 * 60:
+                    block("roll_closed_candle_stale")
+                    continue
+                roll_position["mark_price"] = float(bars[-1]["close"])
             decision = evaluate_roll(
-                {**pos, "strategy_source": strategy_source, "alpha_profile": hist.get("alpha_profile")},
+                roll_position,
                 hist,
                 tech,
                 alpha_sync=alpha_sync,
-                config=cfg,
+                config={**cfg, "require_pullback_recovery": strict_roll},
                 continuation_confirmed=continuation_confirmed,
             )
             current_layer = int(hist.get("roll_layer") or 0)
-            if explosive_position and current_layer >= 1:
+            if explosive_position and current_layer >= 1 and not strict_roll:
                 block("explosive confirmation add already used")
                 continue
-            if current_layer >= 1:
+            if current_layer >= 1 or strict_roll:
                 update_position_management(
                     sym,
                     roll_cycle_peak_price=decision.cycle_peak_price or hist.get("roll_cycle_peak_price"),
@@ -4314,6 +4371,7 @@ class ExecutionEngine:
                     "run_id": run_id,
                     "scan_id": s.get("scan_id"),
                     "entry_mode": entry_profile.get("status"),
+                    "signal_time": s.get("time"),
                     "directional_entry_alpha": directional_alpha,
                     "short_setup": (v3_signals.get("short_setup") or {}).get("setup"),
                     "strategy_source": "normal",
@@ -4607,6 +4665,7 @@ class ExecutionEngine:
                     "run_id": run_id,
                     "scan_id": s.get("scan_id"),
                     "entry_mode": s.get("bluechip_entry_mode"),
+                    "signal_time": s.get("time"),
                     "strategy_source": "normal",
                     "signal_source": "bluechip_trend",
                     "category": "core_bluechip",
@@ -4662,8 +4721,10 @@ class ExecutionEngine:
 
     def execute(self, actions: list) -> list:
         """Execute planned actions."""
-        results = []
-        for act in actions:
+        from trader.action_coordinator import coordinate_actions
+        coordinated = coordinate_actions(actions)
+        results = list(coordinated.rejected)
+        for act in coordinated.accepted:
             try:
                 from shared.db import set_position_context
                 if not act.get("position_side"):
@@ -4750,6 +4811,9 @@ class ExecutionEngine:
                             if not existing or float(existing.get("unrealized_pnl") or 0) <= 0:
                                 results.append({**act, "status": "blocked", "error": "add_requires_profitable_position"})
                                 continue
+                if act.get("action") in {"open", "roll_add"} and not self._lifecycle_entry_gate(act):
+                    results.append({**act, "status": "blocked", "error": "lifecycle_policy_rejected"})
+                    continue
                 if act["action"] == "open":
                     live_positions = self.ex.get_positions()
                     category_ok, category_reason = check_category_position_limit(
@@ -4798,6 +4862,9 @@ class ExecutionEngine:
                 elif act["action"] == "partial_close":
                     if self._execute_partial_close(act, results):
                         self._mark_partial_close_state(act)
+                if act.get("intent_id") and any(r.get("status") == "ok" and r.get("intent_id") == act["intent_id"] for r in results):
+                    from shared.trading_journal import TradingJournal
+                    TradingJournal(self.ex.account_id).finish(act["intent_id"], "completed")
             except Exception as e:
                 self._record_decision(
                     act.get("symbol", "?"),
@@ -4815,6 +4882,38 @@ class ExecutionEngine:
                 results.append({"status": "error", "error": str(e), **act})
         return results
 
+    def _lifecycle_entry_gate(self, act):
+        config = self.cfg.get("strategy_lifecycle") or {}
+        mode = config.get("mode", "shadow")
+        if mode not in {"shadow", "enforce"} or getattr(self.ex, "account_id", None) is None:
+            return True
+        from shared.trading_journal import TradingJournal
+        from trader.lifecycle_policy import evaluate_entry, evaluate_add_risk
+        journal = TradingJournal(self.ex.account_id)
+        try:
+            if act["action"] == "open":
+                mark = self.ex.get_mark_price(act["symbol"])
+                allowed, reason, details = evaluate_entry(act, mark, config, now=datetime.now(timezone.utc))
+            else:
+                current = next((p for p in self.ex.get_positions() if self._position_matches_action(p, act)), {})
+                allowed, reason, details = evaluate_add_risk(current, act, journal.plan(act.get("position_id")), config)
+            journal.event(act, "lifecycle_gate", {"mode": mode, "allowed": allowed, "reason": reason, **details})
+            act["lifecycle_decision"] = {"allowed": allowed, "reason": reason, **details}
+            return allowed or mode == "shadow"
+        except Exception as exc:
+            logger.warning("Lifecycle gate unavailable for %s: %s", act.get("symbol"), exc)
+            return mode == "shadow"
+
+    def _with_initial_risk_plan(self, history, force=False):
+        if getattr(self.ex, "account_id", None) is None or (not force and (self.cfg.get("strategy_lifecycle") or {}).get("mode") != "enforce"):
+            return history
+        from shared.trading_journal import TradingJournal
+        plan = TradingJournal(self.ex.account_id).plan(history.get("position_id"))
+        if not plan:
+            return history
+        return {**history, "risk_entry_price": plan["initial_entry"],
+                "risk_distance": abs(plan["initial_entry"] - plan["initial_stop"])}
+
     def _place_market_action_order(
         self,
         act: dict,
@@ -4824,38 +4923,54 @@ class ExecutionEngine:
         position: dict | None = None,
     ):
         qty = float(quantity if quantity is not None else act["quantity"])
+        journal = None
+        claim = None
+        lifecycle = self.cfg.get("strategy_lifecycle") or {}
+        if getattr(self.ex, "account_id", None) is not None and lifecycle.get("mode") == "enforce":
+            from shared.trading_journal import TradingJournal, intent_id
+            from shared.db import get_position_history
+            journal = TradingJournal(self.ex.account_id)
+            pending_orders = self.ex.get_open_orders(act["symbol"]) if not reduce_only else []
+            if any(str(o.get("type") or o.get("orderType") or "").upper() in {"LIMIT", "MARKET"}
+                   and str(o.get("positionSide") or "BOTH") in {"BOTH", act["position_side"]}
+                   for o in pending_orders):
+                raise RuntimeError("position_has_pending_order")
+            if act.get("action") != "open" and not act.get("position_id"):
+                act["position_id"] = (get_position_history(act["symbol"]) or {}).get("position_id")
+            claimed, claim = journal.claim(act)
+            act["intent_id"] = claim["intent_id"]
+            act["client_order_id"] = claim["client_order_id"]
+            if not claimed:
+                if claim["status"] in {"completed", "aborted"}:
+                    raise RuntimeError("action_already_completed")
+                saved_action = json.loads(claim["action_json"])
+                if saved_action.get("position_id"):
+                    act["position_id"] = saved_action["position_id"]
+                act["original_quantity_before"] = saved_action.get("quantity_before")
+                act["original_position_before"] = saved_action.get("position_before")
+                act["recovered_action"] = saved_action
+                if claim["intent_id"] != intent_id(act):
+                    raise RuntimeError("prior_order_requires_reconciliation")
+                lookup = getattr(self.ex, "get_order_by_client_id", None)
+                existing = lookup(act["symbol"], claim["client_order_id"]) if callable(lookup) else None
+                if not existing:
+                    raise RuntimeError("order_status_unknown_no_resubmit")
+                if str(existing.get("status", "")).upper() != "FILLED":
+                    raise RuntimeError("order_not_fully_filled_no_resubmit")
+                return existing
         client_order_id = act.get("client_order_id")
 
         def submit():
-            try:
-                if reduce_only:
-                    return self.ex.close_position_market(
-                        act["symbol"],
-                        act["side"],
-                        qty,
-                        client_order_id=client_order_id,
-                        position_side=self._action_position_side(act, position),
-                    )
-                return self.ex.place_market_order(
-                    act["symbol"],
-                    act["side"],
-                    qty,
-                    client_order_id=client_order_id,
-                    position_side=self._action_position_side(act, position),
-                )
-            except TypeError:
-                # Compatibility for test doubles and legacy exchange adapters.
-                if reduce_only:
-                    return self.ex.close_position_market(
-                        act["symbol"],
-                        act["side"],
-                        qty,
-                    )
-                return self.ex.place_market_order(
-                    act["symbol"],
-                    act["side"],
-                    qty,
-                )
+            import inspect
+            method = self.ex.close_position_market if reduce_only else self.ex.place_market_order
+            parameters = inspect.signature(method).parameters
+            supports_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            options = {"client_order_id": client_order_id,
+                       "position_side": self._action_position_side(act, position)}
+            options = {k: v for k, v in options.items() if supports_kwargs or k in parameters}
+            # Adapt before submitting. Retrying a TypeError after submission can
+            # duplicate an order if it originated inside the exchange adapter.
+            return method(act["symbol"], act["side"], qty, **options)
 
         retryable_explosive = (
             act.get("event_type") == "explosive_breakout"
@@ -4865,8 +4980,18 @@ class ExecutionEngine:
         attempts = 3 if retryable_explosive else 1
         for attempt in range(1, attempts + 1):
             try:
-                return submit()
+                order = submit()
+                if journal:
+                    journal.finish(claim["intent_id"], "filled" if str((order or {}).get("status", "")).upper() == "FILLED" else "unknown", order)
+                    if str((order or {}).get("status", "")).upper() != "FILLED":
+                        raise RuntimeError("order_not_fully_filled_no_management_commit")
+                return order
             except Exception as exc:
+                if journal:
+                    journal.finish(claim["intent_id"], "unknown", error=exc)
+                    # Reconcile by the stable client id on the next cycle; never
+                    # repeat a request whose exchange outcome is uncertain.
+                    raise
                 if not retryable_explosive or not _is_transient_order_error(exc):
                     raise
                 lookup = getattr(self.ex, "get_order_by_client_id", None)
@@ -4969,12 +5094,7 @@ class ExecutionEngine:
             or act.get("strategy_source")
             or "normal"
         ).lower()
-        existing_stop = (
-            history.get("protected_stop")
-            or history.get("current_stop_loss")
-            or history.get("initial_stop_loss")
-            or act.get("stop_loss")
-        )
+        existing_stop = _strongest_management_stop(side, entry_price, history, act.get("stop_loss"))
         stop_price = float(existing_stop or 0)
         reason = str(act.get("reason") or "")
         profit_milestone = any(
@@ -5110,6 +5230,14 @@ class ExecutionEngine:
             act["position_id"] = act.get("position_id") or new_position_id(act["symbol"], act["position_side"])
         except Exception:
             pass
+        if getattr(self.ex, "account_id", None) is not None:
+            from shared.trading_journal import TradingJournal
+            try:
+                TradingJournal(self.ex.account_id).save_plan(act)
+            except Exception:
+                if (self.cfg.get("strategy_lifecycle") or {}).get("mode") == "enforce":
+                    raise
+                logger.warning("Unable to save shadow initial risk plan", exc_info=True)
         order = self._place_market_action_order(act)
         try:
             from shared.db import insert_order
@@ -5301,7 +5429,10 @@ class ExecutionEngine:
             None,
         )
         before_qty = float(before.get("quantity") or 0) if before else 0.0
+        act["quantity_before"] = before_qty
         order = self._place_market_action_order(act)
+        if act.get("original_quantity_before") is not None:
+            before_qty = float(act["original_quantity_before"])
         try:
             insert_order(
                 act["symbol"],
@@ -5497,6 +5628,7 @@ class ExecutionEngine:
         margin = pos["entry_price"] * pos["quantity"] / max(pos.get("leverage", 1), 1)
         pnl_pct = round(pnl / margin * 100, 2) if margin else 0
         record_trade(
+            execution_intent_id=act.get("intent_id"),
             symbol=act["symbol"], side=pos["side"],
             qty=pos["quantity"], entry_price=pos["entry_price"],
             exit_price=act.get("close_price", pos["mark_price"]),
@@ -5604,15 +5736,13 @@ class ExecutionEngine:
             close_qty,
             act.get("reason", ""),
         )
-        try:
-            order = self.ex.close_position_market(
-                act["symbol"],
-                act["side"],
-                close_qty,
-                position_side=self._action_position_side(act, pos),
-            )
-        except TypeError:
-            order = self.ex.close_position_market(act["symbol"], act["side"], close_qty)
+        act["position_before"] = dict(pos)
+        order = self._place_market_action_order(act, reduce_only=True, quantity=close_qty, position=pos)
+        if act.get("original_position_before"):
+            pos = act["original_position_before"]
+            saved = act["recovered_action"]
+            cleanup_residual = saved.get("reason") == "residual_position_cleanup"
+            act["reason"] = saved.get("reason", act.get("reason"))
         try:
             executed_qty = float((order or {}).get("executedQty") or 0)
         except Exception:
@@ -5692,7 +5822,8 @@ class ExecutionEngine:
             from shared.db import get_position_history, record_trade, update_position_management
 
             hist = get_position_history(act["symbol"]) or {}
-            record_trade(
+            recorded = record_trade(
+                execution_intent_id=act.get("intent_id"),
                 symbol=act["symbol"], side=pos["side"],
                 qty=executed_qty, entry_price=pos["entry_price"],
                 exit_price=exit_price,
@@ -5709,7 +5840,7 @@ class ExecutionEngine:
                 alpha_score=hist.get("alpha_score") or act.get("alpha_score"),
                 alpha_suggested_position_pct=hist.get("alpha_suggested_position_pct") or act.get("alpha_suggested_position_pct"),
             )
-            if (hist.get("strategy_source") or act.get("strategy_source")) == "alpha":
+            if recorded is not False and (hist.get("strategy_source") or act.get("strategy_source")) == "alpha":
                 update_position_management(
                     act["symbol"],
                     protected_profit=max(
@@ -5723,6 +5854,8 @@ class ExecutionEngine:
                 act["symbol"],
                 e,
             )
+            if act.get("intent_id"):
+                raise RuntimeError("partial_close_local_commit_requires_reconciliation") from e
 
         if not cleanup_residual:
             refreshed_positions = self.ex.get_positions()

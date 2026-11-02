@@ -666,6 +666,7 @@ class AlphaSignalConsumer:
                 "rule_entry_validated": True,
                 "entry_confirmation_reason": confirmation_reason,
                 "entry_confirmation_features": confirmation_features,
+                "signal_time": event.get("candle_close_time") or event.get("created_at"),
                 "run_id": run_id,
                 "reason": (
                     f"explosive_breakout alpha_strategy_v2:{action_type.lower()}"

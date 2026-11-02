@@ -23,6 +23,12 @@ _load_local_env()
 _DEFAULT_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
 
 TRADING_CONFIG = {
+    "strategy_lifecycle": {
+        "mode": os.getenv("STRATEGY_LIFECYCLE_MODE", "shadow").strip().lower(),
+        "max_chase_r": 0.5,
+        "signal_ttl_minutes": 75,
+        "max_add_risk_multiple": 1.0,
+    },
     # Live orders are rule-driven by default. AI services may continue training
     # independently, but are not called from the trading decision path.
     "entry_decision_mode": os.getenv(

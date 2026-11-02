@@ -1,3 +1,32 @@
+CREATE TABLE execution_effects (
+    account_id INTEGER NOT NULL, intent_id TEXT NOT NULL,
+    effect_type TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, intent_id, effect_type)
+);
+CREATE TABLE trade_plans (
+    account_id INTEGER NOT NULL, position_id TEXT NOT NULL,
+    symbol TEXT NOT NULL, side TEXT NOT NULL, strategy_version TEXT NOT NULL,
+    initial_entry REAL NOT NULL, initial_stop REAL NOT NULL,
+    initial_quantity REAL NOT NULL, initial_risk REAL NOT NULL,
+    plan_json TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, position_id)
+);
+CREATE TABLE execution_intents (
+    account_id INTEGER NOT NULL, intent_id TEXT NOT NULL,
+    symbol TEXT NOT NULL, position_side TEXT NOT NULL, action_type TEXT NOT NULL,
+    client_order_id TEXT NOT NULL, status TEXT NOT NULL,
+    action_json TEXT NOT NULL, order_json TEXT, error TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, intent_id)
+);
+CREATE INDEX idx_execution_intents_pending
+ON execution_intents(account_id, status, symbol, position_side);
+CREATE TABLE strategy_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL, side TEXT, event_type TEXT NOT NULL,
+    event_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX idx_strategy_events_time ON strategy_events(account_id, created_at);
 CREATE TABLE alpha_candles_15m (
             time TEXT, alpha_symbol TEXT,
             open REAL, high REAL, low REAL, close REAL,

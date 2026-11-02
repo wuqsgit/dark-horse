@@ -60,15 +60,26 @@ def evaluate_roll(
     entry = _number(position.get("entry_price"))
     mark = _number(position.get("mark_price"))
     stop = _number(state.get("initial_stop_loss"))
-    risk = abs(entry - stop)
+    risk_entry = _number(state.get("risk_entry_price")) or entry
+    risk = _number(state.get("risk_distance")) or abs(risk_entry - stop)
     if side not in {"LONG", "SHORT"} or entry <= 0 or mark <= 0 or risk <= 0:
         return RollDecision(False, "roll_state_incomplete")
 
-    favorable_move = mark - entry if side == "LONG" else entry - mark
+    favorable_move = mark - risk_entry if side == "LONG" else risk_entry - mark
     current_r = favorable_move / risk
     tp1_hit = bool(state.get("tp1_hit"))
     cycle_peak = _number(state.get("roll_cycle_peak_price"))
     pullback_armed = bool(state.get("roll_pullback_armed"))
+    if config.get("require_pullback_recovery", False):
+        atr = _number(state.get("atr_value"))
+        cycle_peak = cycle_peak or _number(state.get("roll_price")) or mark
+        cycle_peak = max(cycle_peak, mark) if side == "LONG" else min(cycle_peak, mark)
+        gap = (cycle_peak - mark) / atr if side == "LONG" else (mark - cycle_peak) / atr
+        pullback_armed = pullback_armed or gap >= (_number(config.get("repeat_pullback_atr")) or 0.75)
+        if not pullback_armed:
+            return RollDecision(False, "waiting_healthy_pullback", current_r, cycle_peak, False)
+        if gap > (_number(config.get("repeat_recover_to_peak_atr")) or 0.25):
+            return RollDecision(False, "waiting_pullback_recovery", current_r, cycle_peak, True)
     layer_triggers = config.get("layer_trigger_r") or []
     try:
         trigger_r = _number(layer_triggers[roll_layer])

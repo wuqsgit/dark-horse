@@ -70,7 +70,10 @@ class AlphaStrategyWorker:
         recovery_max_bars: int = 96,
     ):
         self.repository = repository or AlphaStrategyRepository()
-        self.machine = machine or AlphaStrategyStateMachine()
+        from trader.config import TRADING_CONFIG
+        self.machine = machine or AlphaStrategyStateMachine(StateMachineConfig(
+            freeze_trigger_levels=(TRADING_CONFIG.get("strategy_lifecycle") or {}).get("mode") == "enforce",
+        ))
         self.mode = str(mode or "shadow").lower()
         self.market_env = str(market_env or "mainnet").lower()
         self.decision_mode = str(decision_mode or "rules").lower()

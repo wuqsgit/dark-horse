@@ -6,7 +6,7 @@ from alpha_engine.strategy.models import (
     AlphaSignalState,
     StrategyObservation,
 )
-from alpha_engine.strategy.state_machine import AlphaStrategyStateMachine
+from alpha_engine.strategy.state_machine import AlphaStrategyStateMachine, StateMachineConfig
 
 
 NOW = datetime(2026, 7, 28, 4, 0, tzinfo=timezone.utc)
@@ -42,6 +42,23 @@ def _observation(**overrides):
 
 
 class AlphaStrategyStateMachineTest(unittest.TestCase):
+    def test_enforced_setup_does_not_move_breakout_and_invalidation_levels(self):
+        machine = AlphaStrategyStateMachine(StateMachineConfig(freeze_trigger_levels=True))
+        watch = machine.transition(None, _observation(), now=NOW)
+        armed = machine.transition(
+            watch.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(candle_close_time=NOW + timedelta(minutes=15), setup_probability=0.7),
+            now=NOW + timedelta(minutes=15),
+        )
+        next_result = machine.transition(
+            armed.as_state_record("mainnet", "AKEUSDT", "AKEALPHAUSDT"),
+            _observation(candle_close_time=NOW + timedelta(minutes=30), setup_probability=0.7,
+                         breakout_level=1.2, invalidation_price=1.1),
+            now=NOW + timedelta(minutes=30),
+        )
+        self.assertEqual(next_result.breakout_level, armed.breakout_level)
+        self.assertEqual(next_result.invalidation_price, armed.invalidation_price)
+
     def setUp(self):
         self.machine = AlphaStrategyStateMachine()
 

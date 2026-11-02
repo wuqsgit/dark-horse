@@ -16,6 +16,7 @@ from alpha_engine.strategy.models import (
 
 @dataclass(frozen=True)
 class StateMachineConfig:
+    freeze_trigger_levels: bool = False
     setup_watch_threshold: float = 0.55
     setup_arm_threshold: float = 0.62
     trigger_followthrough_threshold: float = 0.65
@@ -121,6 +122,10 @@ class AlphaStrategyStateMachine:
                 )
                 if position_factor <= 0:
                     position_factor = self.config.early_probe_stage_cap
+            freeze_levels = bool(
+                self.config.freeze_trigger_levels and current
+                and from_state in ACTIVE_SETUP_STATES - WATCH_STATES
+            )
             return TransitionResult(
                 from_state=from_state,
                 to_state=to_state,
@@ -133,10 +138,10 @@ class AlphaStrategyStateMachine:
                 started_at=next_started,
                 expires_at=next_expires,
                 reference_price=observation.reference_price,
-                base_low=observation.base_low,
-                base_high=observation.base_high,
-                breakout_level=observation.breakout_level,
-                invalidation_price=observation.invalidation_price,
+                base_low=current.base_low if freeze_levels else observation.base_low,
+                base_high=current.base_high if freeze_levels else observation.base_high,
+                breakout_level=current.breakout_level if freeze_levels else observation.breakout_level,
+                invalidation_price=current.invalidation_price if freeze_levels else observation.invalidation_price,
                 setup_probability=observation.setup_probability,
                 followthrough_probability=observation.followthrough_probability,
                 fakeout_probability=observation.fakeout_probability,

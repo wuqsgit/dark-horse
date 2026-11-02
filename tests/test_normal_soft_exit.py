@@ -39,6 +39,49 @@ def score(technical, hold_alpha=27, composite_score=60):
 
 
 class NormalSoftExitTest(unittest.TestCase):
+    def test_structural_stop_wins_over_pending_profit_reduction(self):
+        for side, mark, stop in [("LONG", 110, 111), ("SHORT", 90, 89)]:
+            with self.subTest(side=side):
+                pos = position(mark=mark, pnl=1000)
+                pos["side"] = side
+                actions = self._actions(
+                    {}, pos=pos, hist=state(current_stop_loss=stop),
+                )
+                self.assertEqual(actions[0]["action"], "close")
+                self.assertTrue(actions[0]["is_stop"])
+                self.assertIn("structure_1r_stop", actions[0]["reason"])
+
+    def test_profit_lock_never_overwrites_tighter_new_trailing_stop(self):
+        for side, mark, initial_stop in [("LONG", 125, 88), ("SHORT", 75, 112)]:
+            with self.subTest(side=side):
+                pos = position(mark=mark, pnl=2500)
+                pos["side"] = side
+                with patch("shared.db.update_position_management") as update:
+                    self._actions({}, pos=pos, hist=state(initial_stop_loss=initial_stop))
+                stops = [call.kwargs["current_stop_loss"] for call in update.call_args_list
+                         if call.kwargs.get("current_stop_loss") is not None]
+                self.assertGreaterEqual(len(stops), 2)
+                if side == "LONG":
+                    self.assertGreaterEqual(stops[-1], stops[0])
+                else:
+                    self.assertLessEqual(stops[-1], stops[0])
+
+    def test_losing_position_still_obeys_time_stop_without_latest_score(self):
+        engine = ExecutionEngine(SoftExitExchange())
+        engine._record_decision = lambda *args, **kwargs: None
+        with patch("shared.db.get_position_history", return_value=state()), \
+             patch("shared.db.update_position_management"), \
+             patch("trader.execution._age_hours", return_value=13), \
+             patch("trader.execution._normal_soft_exit_in_cooldown", return_value=True):
+            actions = engine._build_position_actions([], [position(mark=99, pnl=-100)])
+        self.assertEqual(actions[0]["action"], "close")
+        self.assertIn("time_stop", actions[0]["reason"])
+
+    def test_young_losing_position_is_not_closed_by_time_stop(self):
+        with patch("trader.execution._age_hours", return_value=1):
+            actions = self._actions({}, pos=position(mark=99, pnl=-100))
+        self.assertEqual(actions, [])
+
     def _actions(self, technical, *, hist=None, pos=None, cooldown=False, hold_alpha=27, composite_score=60):
         engine = ExecutionEngine(SoftExitExchange())
         engine._record_decision = lambda *args, **kwargs: None

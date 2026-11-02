@@ -298,6 +298,16 @@ async def _account_trading_loop(account, stop_event=None):
                     policy=engine.cfg.get("ai_entry_policy", "advisory"),
                 )
             actions.extend(alpha_actions)
+            from trader.action_coordinator import coordinate_actions
+            coordinated = coordinate_actions(actions)
+            actions = coordinated.accepted
+            for rejected in coordinated.rejected:
+                engine._record_decision(
+                    rejected.get("symbol", "?"), run_id=run_id,
+                    side=rejected.get("position_side"),
+                    decision_stage="action_coordination", decision_result="blocked",
+                    filter_reason=rejected.get("error"), reason=rejected,
+                )
 
             # 3.5 按类别打印评分排序 + 未开仓原因
             pending = [a.get('symbol') for a in actions if a.get('action') == 'open']

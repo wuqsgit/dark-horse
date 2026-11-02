@@ -30,6 +30,7 @@ STRATEGY_RETENTION_TABLES = {
 }
 
 OPERATIONAL_RETENTION_TABLES = {
+    "strategy_events": "created_at",
     "candles_15m": "time",
     "candles_1h": "time",
     "candles_6h": "time",
@@ -80,7 +81,7 @@ def _history_side(symbol, side=None):
 _init_lock = threading.RLock()
 _database_write_lock = threading.RLock()
 _initialized_databases = set()
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 
 def _serialized_write(function):
@@ -1683,6 +1684,8 @@ def init_db():
         """DELETE FROM alpha_scan_scores
            WHERE futures_symbol IS NULL OR futures_symbol = ''"""
     )
+    from shared.trading_journal import SCHEMA as trading_journal_schema
+    conn.executescript(trading_journal_schema)
     conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
     conn.commit()
     conn.close()
@@ -3517,8 +3520,19 @@ def record_trade(
     initial_stop_loss=None,
     stop_pct=None,
     trailing_atr_multiplier=None,
+    execution_intent_id=None,
 ):
     conn = get_conn()
+    if execution_intent_id:
+        conn.execute("BEGIN IMMEDIATE")
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO execution_effects VALUES(?,?,?,datetime('now'))",
+            (current_account_id(), execution_intent_id, "trade_record"),
+        ).rowcount
+        if not inserted:
+            conn.rollback()
+            conn.close()
+            return False
     conn.execute(
         """INSERT INTO trades
            (account_id, position_id, symbol, side, quantity, entry_price, exit_price, pnl, pnl_pct,
@@ -3550,6 +3564,8 @@ def record_trade(
         )
     )
     conn.commit()
+    conn.close()
+    return True
 
 
 def _mirror_default_position_history(conn, symbol):
