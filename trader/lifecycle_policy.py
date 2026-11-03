@@ -90,22 +90,30 @@ def evaluate_management(position, state, config, *, now):
         result = action("close", "lifecycle_structure_stop")
         result["is_stop"] = True
         return result, updates, "stop"
+    margin = entry * float(position.get("quantity") or 0) / max(float(position.get("leverage") or 1), 1)
+    if margin > 0 and float(position.get("unrealized_pnl") or 0) / margin <= -float(config.get("emergency_margin_stop_pct", 0.20)):
+        result = action("close", "lifecycle_emergency_stop")
+        result["is_stop"] = True
+        return result, updates, "stop"
+    runner = bool(config.get("runner_enabled"))
+    peak_key = "highest_price" if side == "LONG" else "lowest_price"
+    peak = float(state.get(peak_key) or mark)
+    peak = max(peak, mark) if side == "LONG" else min(peak, mark)
+    peak_r = direction * (peak - risk_entry) / risk
+    updates[peak_key] = peak
     try:
         age = (_time(now) - _time(state["entry_time"])).total_seconds() / 3600
     except (KeyError, ValueError, TypeError):
         age = 0
-    if age >= float(config.get("time_stop_hours", 12)) and current_r < float(config.get("time_stop_min_r", 0.25)):
+    if age >= float(config.get("time_stop_hours", 12)) and current_r < float(config.get("time_stop_min_r", 0.25)) and not (runner and peak_r >= 1):
         return action("close", "lifecycle_time_stop"), updates, "time_stop"
-    peak_key = "highest_price" if side == "LONG" else "lowest_price"
-    peak = float(state.get(peak_key) or mark)
-    peak = max(peak, mark) if side == "LONG" else min(peak, mark)
-    updates[peak_key] = peak
     atr = float(state.get("atr_value") or risk / 2)
-    if current_r >= 1:
+    if (peak_r if runner else current_r) >= 1:
         candidate = risk_entry + direction * risk_entry * float(config.get("break_even_buffer_pct", 0.002))
         stop = max(stop, candidate) if side == "LONG" else min(stop, candidate)
-    if current_r >= 2 or state.get("trailing_enabled"):
-        candidate = peak - direction * atr * float(state.get("trailing_atr_multiplier") or 2)
+    if (peak_r if runner else current_r) >= 2 or state.get("trailing_enabled"):
+        multiplier = float(config.get("trailing_atr_multiplier", 2.5)) if runner else float(state.get("trailing_atr_multiplier") or 2)
+        candidate = peak - direction * atr * multiplier
         stop = max(stop, candidate) if side == "LONG" else min(stop, candidate)
         updates["trailing_enabled"] = 1
     updates["current_stop_loss"] = stop
@@ -113,8 +121,16 @@ def evaluate_management(position, state, config, *, now):
         result = action("close", "lifecycle_trailing_stop")
         result["is_stop"] = True
         return result, updates, "stop"
-    if current_r >= 1 and not state.get("tp1_hit"):
+    if not runner and current_r >= 1 and not state.get("tp1_hit"):
         return action("partial_close", "lifecycle_TP1", 0.25), updates, "tp1"
     if current_r >= 2 and not state.get("tp2_hit"):
+        if runner:
+            initial_quantity = float(state.get("initial_quantity") or position.get("quantity") or 0)
+            if float(position.get("quantity") or 0) <= initial_quantity * 0.75:
+                return None, updates, "runner_floor_already_reached"
+            result = action("partial_close", "lifecycle_runner_TP2", 0.25)
+            result["initial_quantity"] = initial_quantity
+            result["min_remaining_fraction"] = 0.75
+            return result, updates, "tp2"
         return action("partial_close", "lifecycle_TP2", 0.25), updates, "tp2"
     return None, updates, "hold"

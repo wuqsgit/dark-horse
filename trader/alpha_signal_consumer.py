@@ -128,6 +128,9 @@ class AlphaSignalConsumer:
         action_type: str,
         symbol: str,
     ) -> tuple[bool, str, dict]:
+        if action_type in {"PROBE_SHORT", "CONFIRM_SHORT", "RETEST_SHORT_ADD"} and (self.strategy.get("spot_distribution_short") or {}).get("enabled"):
+            from trader.alpha_spot_short import load_spot_distribution
+            return load_spot_distribution(event.get("alpha_symbol"), now=datetime.now(timezone.utc))
         snapshot = self.repository.get_feature_snapshot(event.get("snapshot_id"), latest=True)
         if not snapshot:
             return False, "alpha_v2_snapshot_missing", {}
@@ -253,10 +256,15 @@ class AlphaSignalConsumer:
         data_env = str(
             self.strategy.get("market_env") or "mainnet"
         ).strip().lower()
+        direct_short = bool((self.strategy.get("spot_distribution_short") or {}).get("enabled"))
+        if direct_short:
+            from trader.alpha_spot_short import publish_spot_short_events
+            publish_spot_short_events(modes[0])
         events = self.repository.fetch_account_events(
             account_id=account_id,
             market_env=data_env,
             strategy_modes=modes,
+            direct_spot_short_only=direct_short,
         )
         if not events:
             return []
@@ -272,6 +280,10 @@ class AlphaSignalConsumer:
 
         for event in events:
             action_type = str(event["action_type"])
+            from trader.alpha_spot_short import MARKER
+            direct_event = MARKER in _json(event.get("reason_codes_json"), [])
+            if direct_short and action_type in {"PROBE_SHORT", "CONFIRM_SHORT", "RETEST_SHORT_ADD"} and not direct_event:
+                continue
             is_short = action_type in {
                 "PROBE_SHORT",
                 "CONFIRM_SHORT",
@@ -310,6 +322,9 @@ class AlphaSignalConsumer:
                 continue
             symbol = str(event["futures_symbol"]).upper()
             position = position_map.get(symbol)
+            if direct_event and position:
+                self._reject(account_id=account_id, event=event, reason="direct_short_requires_no_existing_position")
+                continue
             from shared.db import set_position_context
             set_position_context(
                 symbol,
@@ -355,6 +370,9 @@ class AlphaSignalConsumer:
                     )
                     continue
                 hist = get_position_history(symbol) or {}
+                if MARKER in str(hist.get("entry_reason") or ""):
+                    self._reject(account_id=account_id, event=event, reason="direct_short_managed_by_exchange_stop")
+                    continue
                 if (hist.get("strategy_source") or "") != "alpha":
                     self._reject(
                         account_id=account_id,
@@ -522,6 +540,10 @@ class AlphaSignalConsumer:
 
             price = float(self.exchange.get_mark_price(symbol) or 0)
             invalidation = float(event.get("invalidation_price") or 0)
+            if direct_event and price > 0:
+                base_risk = calculate_position(self.exchange, symbol, price, balance,
+                                               category="alpha", entry_mode="strong")
+                invalidation = price + float(base_risk["stop_loss"])
             invalid_structure = (
                 invalidation <= price if is_short else invalidation >= price
             )
@@ -728,12 +750,13 @@ class AlphaSignalConsumer:
                 ).get("model_versions") or {},
                 "client_order_id": client_id,
                 "rule_entry_validated": True,
+                "alpha_entry_rule": MARKER if direct_event else None,
                 "entry_confirmation_reason": confirmation_reason,
                 "entry_confirmation_features": confirmation_features,
                 "signal_time": event.get("candle_close_time") or event.get("created_at"),
                 "run_id": run_id,
                 "reason": (
-                    f"explosive_breakout alpha_strategy_v2:{action_type.lower()}"
+                    MARKER if direct_event else f"explosive_breakout alpha_strategy_v2:{action_type.lower()}"
                     if action_type in {"CONFIRM_LONG", "CONFIRM_SHORT"}
                     else f"alpha_strategy_v2:{action_type.lower()}"
                 ),

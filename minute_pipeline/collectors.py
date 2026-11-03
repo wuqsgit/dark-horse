@@ -33,12 +33,12 @@ def _alpha_taker_buy_quote_vol(row) -> tuple[float, bool]:
     consumers can distinguish it from exchange-provided order flow.
     """
     quote_volume = float(row[7] or 0)
-    reported = float(row[10] or 0) if len(row) > 10 else 0.0
+    reported = float(row[10]) if len(row) > 10 and row[10] is not None else None
     tolerance = max(1e-9, abs(quote_volume) * 1e-9)
-    if 0 <= reported < quote_volume - tolerance:
+    if reported is not None and 0 <= reported < quote_volume - tolerance:
         return reported, False
     if quote_volume <= 0:
-        return 0.0, reported != 0
+        return 0.0, reported not in (None, 0)
 
     open_price = float(row[1])
     high_price = float(row[2])

@@ -506,6 +506,7 @@ class AlphaStrategyRepository:
         market_env: str,
         strategy_modes: tuple[str, ...],
         limit: int = 100,
+        direct_spot_short_only: bool = False,
     ) -> list[dict]:
         modes = tuple(
             str(mode).strip().lower()
@@ -515,6 +516,11 @@ class AlphaStrategyRepository:
         if not modes:
             return []
         placeholders = ",".join("?" for _ in modes)
+        short_filter = (
+            "AND (e.action_type NOT IN ('PROBE_SHORT','CONFIRM_SHORT','RETEST_SHORT_ADD') "
+            "OR e.reason_codes_json LIKE '%alpha_spot_distribution_24h%')"
+            if direct_spot_short_only else ""
+        )
         conn = get_conn()
         try:
             rows = conn.execute(
@@ -526,6 +532,7 @@ class AlphaStrategyRepository:
                     WHERE e.market_env=?
                       AND e.strategy_mode IN ({placeholders})
                       AND e.action_type != 'NONE'
+                      {short_filter}
                       AND c.event_id IS NULL
                       AND (
                           e.expires_at IS NULL

@@ -2614,16 +2614,18 @@ class ExecutionEngine:
             lowest_price = float(tracker.get("lowest_price") or mark_price)
             atr = float(hist.get("atr_value") or pos.get("atr_value") or mark_price * 0.02)
             lifecycle_cfg = self.cfg.get("strategy_lifecycle") or {}
-            if getattr(self.ex, "account_id", None) is not None and lifecycle_cfg.get("mode") in {"shadow", "enforce"}:
+            runner_cfg = self.cfg.get("trend_runner") or {}
+            runner_enabled = bool(runner_cfg.get("enabled"))
+            if getattr(self.ex, "account_id", None) is not None and (runner_enabled or lifecycle_cfg.get("mode") in {"shadow", "enforce"}):
                 from trader.lifecycle_policy import evaluate_management
                 from shared.trading_journal import TradingJournal
                 proposed, updates, outcome = evaluate_management(
                     pos, {**self._with_initial_risk_plan(hist, force=True),
                           "highest_price": highest_price, "lowest_price": lowest_price},
-                    {**self.cfg, **lifecycle_cfg}, now=datetime.now(timezone.utc),
+                    {**self.cfg, **lifecycle_cfg, **runner_cfg, "runner_enabled": runner_enabled}, now=datetime.now(timezone.utc),
                 )
                 policy_observations.append((sym, side, lifecycle_cfg["mode"], outcome, proposed, updates))
-                if lifecycle_cfg["mode"] == "enforce" and outcome != "initial_risk_state_missing":
+                if (runner_enabled or lifecycle_cfg.get("mode") == "enforce") and outcome != "initial_risk_state_missing":
                     from shared.db import update_position_management
                     update_position_management(sym, **updates)
                     if proposed:

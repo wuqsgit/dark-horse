@@ -23,6 +23,8 @@ _load_local_env()
 _DEFAULT_TESTNET = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes", "on")
 
 TRADING_CONFIG = {
+    "trend_runner": {"enabled": True, "trailing_atr_multiplier": 2.5,
+                     "break_even_buffer_pct": 0.002, "time_stop_hours": 12},
     "strategy_lifecycle": {
         "mode": os.getenv("STRATEGY_LIFECYCLE_MODE", "shadow").strip().lower(),
         "max_chase_r": 0.5,
@@ -365,6 +367,7 @@ TRADING_CONFIG = {
         "allowed_entry_levels": ["probe", "candidate"],
     },
     "alpha_strategy_v2": {
+        "spot_distribution_short": {"enabled": True},
         "enabled": os.getenv("ALPHA_STRATEGY_V2_ENABLED", "false").lower()
         in ("1", "true", "yes", "on"),
         "mode": os.getenv("ALPHA_STRATEGY_V2_MODE", "shadow").strip().lower(),
