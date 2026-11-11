@@ -3011,17 +3011,19 @@ def fetch_market_data_health():
             spot_table = "alpha_candles_15m" if pool_type == "alpha" else "candles_15m"
             spot_column = "alpha_symbol" if pool_type == "alpha" else "symbol"
             latest_spot = conn.execute(
-                f"""SELECT MAX(c.time) AS latest FROM {spot_table} c
-                    JOIN market_universe u ON u.pool_type = ?
-                      AND u.source_symbol = c.{spot_column}
-                    WHERE u.selected = 1""",
+                f"""SELECT MAX((SELECT c.time FROM {spot_table} c
+                        WHERE c.{spot_column}=u.source_symbol
+                        ORDER BY c.time DESC LIMIT 1)) AS latest
+                    FROM market_universe u
+                    WHERE u.pool_type=? AND u.selected=1""",
                 (pool_type,),
             ).fetchone()["latest"]
             latest_futures = conn.execute(
-                """SELECT MAX(c.time) AS latest FROM futures_candles_15m c
-                   JOIN market_universe u ON u.pool_type = ?
-                     AND u.futures_symbol = c.symbol
-                   WHERE u.selected = 1""",
+                """SELECT MAX((SELECT c.time FROM futures_candles_15m c
+                        WHERE c.symbol=u.futures_symbol
+                        ORDER BY c.time DESC LIMIT 1)) AS latest
+                   FROM market_universe u
+                   WHERE u.pool_type=? AND u.selected=1""",
                 (pool_type,),
             ).fetchone()["latest"]
             errors = [dict(row) for row in conn.execute(

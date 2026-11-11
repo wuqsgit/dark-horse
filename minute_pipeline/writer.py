@@ -143,11 +143,18 @@ class CandleBatchWriter:
                 )
             except asyncio.TimeoutError:
                 continue
+            deadline = asyncio.get_running_loop().time() + self.flush_seconds
             while len(batch) < self.batch_size:
                 try:
                     batch.append(self.queue.get_nowait())
                 except asyncio.QueueEmpty:
-                    break
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0 or stop.is_set():
+                        break
+                    try:
+                        batch.append(await asyncio.wait_for(self.queue.get(), remaining))
+                    except asyncio.TimeoutError:
+                        break
             await self._write_batch_resilient(batch)
             for _ in batch:
                 self.queue.task_done()
@@ -204,7 +211,7 @@ class CandleBatchWriter:
             grouped[market_kind].append(row)
         for market_kind, rows in grouped.items():
             rows.sort(key=lambda item: (item["symbol"], item["time"]))
-            self._detect_gaps(market_kind, rows)
+            await asyncio.to_thread(self._detect_gaps, market_kind, rows)
             await asyncio.to_thread(
                 upsert_minute_candles,
                 market_kind,

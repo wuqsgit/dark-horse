@@ -725,7 +725,11 @@ def _slim_alpha_candidate(row):
 
 @app.get("/api/alpha/scan/latest")
 async def get_latest_alpha_scan(user=Depends(get_user)):
-    version = await asyncio.to_thread(_alpha_dashboard_version)
+    return await asyncio.to_thread(_get_latest_alpha_scan_sync)
+
+
+def _get_latest_alpha_scan_sync():
+    version = _alpha_dashboard_version()
     cached = versioned_response_get("alpha_scan_latest", version)
     if cached is not None:
         return cached
@@ -805,6 +809,10 @@ async def get_latest_alpha_scan(user=Depends(get_user)):
 
 @app.get("/api/alpha/scan/by_symbol/{alpha_symbol}")
 async def get_alpha_symbol_detail(alpha_symbol: str, user=Depends(get_user)):
+    return await asyncio.to_thread(_get_alpha_symbol_detail_sync, alpha_symbol)
+
+
+def _get_alpha_symbol_detail_sync(alpha_symbol):
     row = fetch_alpha_symbol_detail(alpha_symbol.upper())
     if not row:
         return {"error": "Not found", "symbol": alpha_symbol}
@@ -877,7 +885,11 @@ async def get_alpha_symbol_detail(alpha_symbol: str, user=Depends(get_user)):
 
 
 async def get_alpha_trade_candidates(user=Depends(get_user)):
-    version = await asyncio.to_thread(_alpha_dashboard_version)
+    return await asyncio.to_thread(_get_alpha_trade_candidates_sync)
+
+
+def _get_alpha_trade_candidates_sync():
+    version = _alpha_dashboard_version()
     cached = versioned_response_get("alpha_trade_candidates", version)
     if cached is not None:
         return cached
@@ -930,6 +942,10 @@ def compute_heat_score(tech: dict, row: dict, fut: dict | None = None) -> dict:
 
 @app.get("/api/scan/by_symbol/{symbol}")
 async def get_symbol_detail(symbol: str, user=Depends(get_user)):
+    return await asyncio.to_thread(_get_symbol_detail_sync, symbol)
+
+
+def _get_symbol_detail_sync(symbol):
     row = fetch_symbol_detail(symbol.upper())
     if not row:
         return {"error": "Not found", "symbol": symbol}
@@ -1022,6 +1038,10 @@ async def export_csv(user=Depends(get_user)):
 
 @app.get("/api/backtest/summary")
 async def get_backtest_summary(user=Depends(get_user)):
+    return await asyncio.to_thread(_get_backtest_summary_sync)
+
+
+def _get_backtest_summary_sync():
     cached = cache_get("policy_loop_summary", 30)
     if cached is not None:
         return cached
