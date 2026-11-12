@@ -123,7 +123,7 @@ class AlphaSignalConsumerTest(unittest.TestCase):
                     "alpha_discovery_score": 88,
                     "spot_volume_ratio_15m": 2.0,
                     "futures_volume_ratio_15m": 2.1,
-                    "volume_sync_score": 80,
+                    "volume_sync_score": 0.8,
                     "ret_15m": -1.2 if short else 1.2,
                     "ret_1h": -2.5 if short else 2.5,
                     "oi_change_1h": 0.01,
@@ -355,6 +355,115 @@ class AlphaSignalConsumerTest(unittest.TestCase):
         ).fetchone()["rejection_reason"]
         conn.close()
         self.assertIn("spot_volume_expanded", rejection)
+
+    def _live_consumer(self):
+        return AlphaSignalConsumer(FakeExchange(), config={
+            "alpha_strategy_v2": {"enabled": True, "mode": "testnet_live",
+                                  "market_env": "mainnet"},
+        }, repository=self.repo)
+
+    def _build(self, consumer):
+        return consumer.build_actions(account=self._account(), positions=[],
+                                      balance=1000, engine=FakeEngine(), run_id="regression")
+
+    def test_sync_score_uses_unit_interval_and_rejects_percent_scale(self):
+        self._event(action_type=ActionType.CONFIRM_LONG)
+        consumer = self._live_consumer()
+        event = self.repo.fetch_account_events(account_id=7, market_env="mainnet",
+                                             strategy_modes=("testnet_live",))[0]
+        for score, expected in ((0.65, True), (0.64, False), (65, False), (1.01, False)):
+            conn = db.get_conn()
+            features = json.loads(conn.execute("SELECT features_json FROM alpha_feature_snapshots").fetchone()[0])
+            features["volume_sync_score"] = score
+            conn.execute("UPDATE alpha_feature_snapshots SET features_json=?", (json.dumps(features),))
+            conn.commit()
+            conn.close()
+            ok, _, _ = consumer._strict_entry_confirmation(event=event, action_type="CONFIRM_LONG", symbol="AKEUSDT")
+            self.assertEqual(ok, expected, score)
+
+    def test_confirmed_v2_does_not_depend_on_legacy_candidate_state(self):
+        self._event(action_type=ActionType.CONFIRM_LONG)
+        with patch("shared.db.fetch_latest_alpha_position_context", return_value=None):
+            self.assertEqual(len(self._build(self._live_consumer())), 1)
+
+    def test_retest_without_position_opens_with_confirmation_size_cap(self):
+        self._event(action_type=ActionType.RETEST_ADD, max_position_factor=1.0)
+        actions = self._build(self._live_consumer())
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action"], "open")
+        self.assertLessEqual(actions[0]["alpha_suggested_position_pct"], 0.7)
+        self.assertEqual(actions[0]["notification_event_type"], "explosive_breakout")
+
+    def test_stale_data_waits_and_retries_once_after_cooldown(self):
+        self._event(action_type=ActionType.CONFIRM_LONG)
+        consumer = self._live_consumer()
+        with patch("trader.alpha_signal_consumer.is_market_entry_ready", return_value=(False, "futures_15m_age")):
+            self.assertEqual(self._build(consumer), [])
+        conn = db.get_conn()
+        row = conn.execute("SELECT status FROM alpha_signal_consumptions").fetchone()
+        self.assertEqual(row[0], "WAITING_DATA")
+        self.assertEqual(self._build(consumer), [])
+        conn.execute("UPDATE alpha_signal_consumptions SET updated_at=datetime('now','-31 seconds')")
+        conn.commit()
+        conn.close()
+        self.assertEqual(len(self._build(consumer)), 1)
+        self.assertEqual(self._build(consumer), [])
+
+    def test_waiting_signal_expiry_is_not_retried(self):
+        self._event(action_type=ActionType.CONFIRM_LONG)
+        consumer = self._live_consumer()
+        with patch("trader.alpha_signal_consumer.is_market_entry_ready", return_value=(False, "futures_15m_age")):
+            self._build(consumer)
+        conn = db.get_conn()
+        conn.execute("UPDATE alpha_signal_consumptions SET updated_at=datetime('now','-31 seconds')")
+        conn.execute("UPDATE alpha_signal_events SET expires_at=datetime('now','-1 second')")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self._build(consumer), [])
+
+    def test_execution_data_block_can_retry_without_replaying_submitted_order(self):
+        self._event(action_type=ActionType.CONFIRM_LONG)
+        consumer = self._live_consumer()
+        actions = self._build(consumer)
+        consumer.mark_submitted(7, actions)
+        consumer.finalize(7, [{**actions[0], "status": "blocked",
+                              "error": "market_data_not_ready", "data_error": "futures_15m_age"}])
+        conn = db.get_conn()
+        row = conn.execute("SELECT status,client_order_id FROM alpha_signal_consumptions").fetchone()
+        self.assertEqual(tuple(row), ("WAITING_DATA", None))
+        conn.close()
+
+    def test_waiting_signal_cannot_retry_after_structure_invalidated(self):
+        self._event(action_type=ActionType.CONFIRM_LONG)
+        consumer = self._live_consumer()
+        with patch("trader.alpha_signal_consumer.is_market_entry_ready", return_value=(False, "futures_15m_age")):
+            self._build(consumer)
+        conn = db.get_conn()
+        conn.execute("UPDATE alpha_signal_consumptions SET updated_at=datetime('now','-31 seconds')")
+        conn.execute("""INSERT INTO alpha_signal_events
+            (event_id,market_env,strategy_mode,futures_symbol,setup_id,to_state,state_version,
+             action_type,event_time,candle_close_time,reason_codes_json,created_at)
+            SELECT 'invalidated-event',market_env,strategy_mode,futures_symbol,setup_id,'FAILED',99,
+                   'NONE',strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 second'),candle_close_time,'[]',created_at
+            FROM alpha_signal_events LIMIT 1""")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self._build(consumer), [])
+
+    def test_waiting_event_claim_is_atomic_and_never_reclaims_planned_order(self):
+        applied = self._event(action_type=ActionType.CONFIRM_LONG)
+        self.assertTrue(self.repo.claim_event(7, applied.event_id, ActionType.CONFIRM_LONG))
+        self.repo.update_consumption(account_id=7, event_id=applied.event_id,
+                                     action_type=ActionType.CONFIRM_LONG, status="WAITING_DATA")
+        conn = db.get_conn()
+        conn.execute("UPDATE alpha_signal_consumptions SET updated_at=datetime('now','-31 seconds')")
+        conn.commit()
+        conn.close()
+        self.assertTrue(self.repo.claim_event(7, applied.event_id, ActionType.CONFIRM_LONG))
+        self.assertFalse(self.repo.claim_event(7, applied.event_id, ActionType.CONFIRM_LONG))
+        self.repo.update_consumption(account_id=7, event_id=applied.event_id,
+                                     action_type=ActionType.CONFIRM_LONG, status="PLANNED", client_order_id="stable")
+        self.assertFalse(self.repo.claim_event(7, applied.event_id, ActionType.CONFIRM_LONG))
 
     def test_probe_signal_is_observation_only(self):
         self._event(

@@ -3199,7 +3199,11 @@ class ExecutionEngine:
                 self.explosive_alerts.append(
                     {
                         "action": "observe",
-                        "event_type": "explosive_watch",
+                        "event_type": (
+                            "explosive_risk" if volume_price_state in {
+                                "overheated_climax", "overheated_chase", "alpha_oi_collapse"
+                            } else "explosive_watch"
+                        ),
                         "setup_id": f"watch:{symbol}:{bucket}",
                         "symbol": symbol,
                         "position_side": "LONG",

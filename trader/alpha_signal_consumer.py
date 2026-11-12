@@ -113,6 +113,11 @@ class AlphaSignalConsumer:
         reason: str,
         status: str = "RISK_REJECTED",
     ) -> None:
+        if status == "RISK_REJECTED" and reason.startswith((
+            "market_data_not_ready:", "alpha_v2_snapshot_missing",
+            "alpha_v2_snapshot_not_ready", "alpha_v2_snapshot_stale:",
+        )):
+            status = "WAITING_DATA"
         self.repository.update_consumption(
             account_id=account_id,
             event_id=event["event_id"],
@@ -195,25 +200,12 @@ class AlphaSignalConsumer:
                 )
             return True, "alpha_v2_short_distribution_confirmed", features
 
-        from shared.db import fetch_latest_alpha_position_context
-        context = fetch_latest_alpha_position_context(symbol=symbol, alpha_symbol=event.get("alpha_symbol"))
-        if not context or context.get("volume_price_state") != "explosive_breakout_pending":
-            return False, "alpha_v2_canonical_volume_price_not_confirmed", features
-        context_time = context.get("candidate_time") or context.get("time")
-        try:
-            parsed = datetime.fromisoformat(str(context_time).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - parsed).total_seconds() > max_age * 60:
-                return False, "alpha_v2_canonical_context_stale", features
-        except (TypeError, ValueError):
-            return False, "alpha_v2_canonical_context_time_missing", features
-
+        # V2 validates the latest snapshot, not the legacy scanner's cached state.
         checks = {
             "alpha_score_80": float(features.get("alpha_discovery_score") or 0) >= 80,
             "spot_volume_expanded": float(features.get("spot_volume_ratio_15m") or 0) >= 1.5,
             "futures_volume_expanded": float(features.get("futures_volume_ratio_15m") or 0) >= 1.5,
-            "markets_synchronized": float(features.get("volume_sync_score") or 0) >= 65,
+            "markets_synchronized": 0.65 <= float(features.get("volume_sync_score") or 0) <= 1.0,
             "price_strong_15m": float(features.get("ret_15m") or 0) >= 0.5,
             "price_strong_1h": float(features.get("ret_1h") or 0) >= 1.0,
             "oi_expanded": (
@@ -413,14 +405,7 @@ class AlphaSignalConsumer:
                     reason="probe_requires_no_existing_position",
                 )
                 continue
-            if is_retest and not position:
-                self._reject(
-                    account_id=account_id,
-                    event=event,
-                    reason="retest_requires_existing_position",
-                )
-                continue
-            if is_retest and float((position or {}).get("unrealized_pnl") or 0) <= 0:
+            if is_retest and position and float(position.get("unrealized_pnl") or 0) <= 0:
                 self._reject(account_id=account_id, event=event, reason="retest_add_requires_profit")
                 continue
             if position:
@@ -574,6 +559,10 @@ class AlphaSignalConsumer:
                     self.strategy.get("retest_short_stage_cap") or 0.85
                 ),
             }[action_type]
+            if is_retest and not position:
+                stage_cap = min(stage_cap, float(self.strategy.get(
+                    "confirmed_short_stage_cap" if is_short else "confirmed_stage_cap"
+                ) or (0.60 if is_short else 0.70)))
             event_reasons = _json(event.get("reason_codes_json"), [])
             sentiment_reversal = (
                 action_type == "PROBE_LONG"
@@ -713,6 +702,8 @@ class AlphaSignalConsumer:
                 action_type,
             )
             common = {
+                "notification_event_type": "explosive_breakout" if not is_short else None,
+                "setup_id": event.get("setup_id"),
                 "symbol": symbol,
                 "side": "SELL" if is_short else "BUY",
                 "position_side": position_side,
@@ -830,6 +821,13 @@ class AlphaSignalConsumer:
         for result in results:
             event_id = result.get("alpha_signal_event_id")
             if not event_id:
+                continue
+            if (result.get("status") == "blocked"
+                    and result.get("error") == "market_data_not_ready"
+                    and not result.get("exchange_order_id")):
+                self._reject(account_id=account_id, event={
+                    "event_id": event_id, "action_type": result["alpha_action_type"],
+                }, reason=f"market_data_not_ready:{result.get('data_error') or 'unknown'}")
                 continue
             status = "FILLED" if result.get("status") == "ok" else "FAILED"
             self.repository.update_consumption(

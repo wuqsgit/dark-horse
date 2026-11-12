@@ -484,9 +484,15 @@ class AlphaStrategyRepository:
         conn = get_conn()
         try:
             cursor = conn.execute(
-                """INSERT OR IGNORE INTO alpha_signal_consumptions
+                """INSERT INTO alpha_signal_consumptions
                    (account_id, event_id, action_type, status, updated_at)
-                   VALUES (?, ?, ?, 'PENDING', ?)""",
+                   VALUES (?, ?, ?, 'PENDING', ?)
+                   ON CONFLICT(account_id, event_id, action_type) DO UPDATE
+                   SET status='PENDING', rejection_reason=NULL, updated_at=excluded.updated_at
+                   WHERE alpha_signal_consumptions.status='WAITING_DATA'
+                     AND datetime(alpha_signal_consumptions.updated_at) <= datetime('now', '-30 seconds')
+                     AND alpha_signal_consumptions.client_order_id IS NULL
+                     AND alpha_signal_consumptions.order_id IS NULL""",
                 (
                     int(account_id),
                     event_id,
@@ -533,11 +539,24 @@ class AlphaStrategyRepository:
                       AND e.strategy_mode IN ({placeholders})
                       AND e.action_type != 'NONE'
                       {short_filter}
-                      AND c.event_id IS NULL
+                      AND (c.event_id IS NULL OR (
+                          c.status='WAITING_DATA'
+                          AND datetime(c.updated_at) <= datetime('now', '-30 seconds')
+                          AND c.client_order_id IS NULL AND c.order_id IS NULL
+                      ))
                       AND (
-                          e.expires_at IS NULL
+                          (e.expires_at IS NULL AND datetime(e.event_time) > datetime('now', '-90 minutes'))
                           OR datetime(e.expires_at) > datetime('now')
                       )
+                      AND (e.action_type='INVALIDATE_PROBE' OR NOT EXISTS (
+                          SELECT 1 FROM alpha_signal_events newer
+                          WHERE newer.market_env=e.market_env
+                            AND newer.strategy_mode=e.strategy_mode
+                            AND newer.futures_symbol=e.futures_symbol
+                            AND newer.setup_id=e.setup_id
+                            AND newer.event_time > e.event_time
+                            AND newer.to_state IN ('FAILED','EXPIRED','COOLDOWN')
+                      ))
                     ORDER BY datetime(e.event_time), e.event_id
                     LIMIT ?""",
                 (int(account_id), market_env, *modes, int(limit)),

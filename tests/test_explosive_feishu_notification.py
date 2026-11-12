@@ -99,8 +99,17 @@ class ExplosiveFeishuNotificationTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         text = calls[0]["json"]["content"]["text"]
         self.assertIn("等待严格入场确认", text)
+        self.assertIn("【放量观察提醒】", text)
+        self.assertIn("不是开仓指令", text)
         self.assertIn("explosive_volume_watch", text)
         self.assertNotIn("数量：", text)
+
+    def test_overheated_alert_is_risk_not_long_recommendation(self):
+        result = {**explosive_watch(), "event_type": "explosive_risk", "signal_state": "overheated_chase"}
+        text = notifications._message_text(result, 1, 1)
+        self.assertIn("【异常波动风险提醒】", text)
+        self.assertNotIn("方向：做多", text)
+        self.assertNotIn("已检测爆发候选", text)
 
     def test_missing_webhook_and_post_failures_do_not_raise(self):
         missing = ExplosiveFeishuNotifier(webhook="", thread_factory=ImmediateThread)
